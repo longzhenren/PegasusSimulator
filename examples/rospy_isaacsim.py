@@ -1,52 +1,118 @@
 #!/usr/bin/env python3
 """
-Pegasus ROS2 Socket 控制接口文档
+Pegasus ROS2 Socket 控制接口文档（详细版）
 
--概述
-- 本脚本启动后保持悬停，并通过 TCP Socket 接收按行 JSON 命令。
-- 同步保存传感器/图像/状态数据到会话目录（根目录为 `PEGASUS_OUTPUT_DIR` 或 `PEGASUS_SAVE_DIR`）：
+概述
+- 启动后自动拉起 MAVROS 并阻塞等待 FCU 连接成功；随后切换 OFFBOARD、解锁、自动起飞到初始高度，进入“悬停 + Socket 命令循环”。
+- 通过 TCP Socket 接收按行 JSON 命令（每行一条，换行分隔）。脚本不向 Socket 回写结果，所有响应统一写入磁盘状态目录。
+- 数据按照会话时间戳分目录保存。根目录取 `PEGASUS_OUTPUT_DIR`（若未设置则为 `PEGASUS_SAVE_DIR`，默认 `sensor_data`）。
   - 传感器：`<GLOBAL_OUTPUT_DIR>/sensors_{session_ts}/...`
   - 相机：`<GLOBAL_OUTPUT_DIR>/camera_{session_ts}/...`
   - 状态：`<GLOBAL_OUTPUT_DIR>/status_{session_ts}/...`
+- 内置速度桥：订阅 `/nav/velocity`（`mavros_msgs/PositionTarget`）并以 30Hz 转发到 `/mavros/setpoint_raw/local`，与主循环频率一致。
 
-环境变量
-- `PEGASUS_SAVE_DIR`：保存根目录，默认 `sensor_data`
-- `PEGASUS_OUTPUT_DIR`：全局保存根目录（优先级高于 `PEGASUS_SAVE_DIR`）
-- `PEGASUS_CMD_HOST`：命令 socket 监听地址，默认 `127.0.0.1`
-- `PEGASUS_CMD_PORT`：命令 socket 监听端口，默认 `8989`
-- `PEGASUS_CAMERA_RGB`：RGB 图像话题，默认 `/camera/color/image_raw`
-- `PEGASUS_CAMERA_DEPTH`：深度图像话题，默认 `/camera/depth/image_raw`
- - `PEGASUS_SESSION_TS`：会话时间戳（覆盖内部自动生成）；也可用 CLI `--session-ts`
+运行时序（启动到退出）
+- 创建 ROS2 节点并初始化保存目录（基于会话时间戳）。
+- 启动 MAVROS：`ros2 launch mavros px4.launch fcu_url:=udp://:14540@`。
+- 阻塞等待 FCU 连接：`/mavros/state.connected == True`。
+- 发布初始 setpoints、防止 RTL → 切换 OFFBOARD → 解锁 → 起飞到初始高度。
+- 进入悬停循环，初始化并监听 Socket，按行处理外部命令。
+- 收到 `shutdown` 命令后优雅退出，清理 MAVROS 进程与 ROS 资源。
 
-命令格式（每行一个 JSON，通过 TCP socket 发送）
-- 通用：可指定 `filename`（写入状态/结果 JSON 到状态目录）
-- `{"cmd":"set_session_ts","ts":1234567890,"filename":"set_session_ok.json"}`
-  - 通过 socket 外部设定会话时间戳，立即切换保存路径为 `<GLOBAL_OUTPUT_DIR>/*_{ts}`，并将状态写入新的 `status_{ts}` 目录
-- `{"cmd":"move_to","x":0.0,"y":0.0,"z":2.0,"filename":"move_to_ok.json"}`
-- `{"cmd":"move_to_many","points":[[0,0,2],[1,0,2],[1,1,2]],"filename":"multi_ok.json"}`
-- `{"cmd":"land","filename":"land_ok.json"}`
-- `{"cmd":"get_position","filename":"position.json"}`
-- `{"cmd":"get_status","filename":"status.json"}`
-- `{"cmd":"get_sensors","filename":"my_sensors.json"}`
-  - 若提供 `filename`，快照保存为 `sensor_data/sensors_{session_ts}/my_sensors.json`
-- `{"cmd":"get_images","filename":"frame001"}`
-  - 若提供 `filename`，RGB 保存为 `sensor_data/camera_{session_ts}/frame001.png`；深度保存为 `sensor_data/camera_{session_ts}/frame001_depth.png`
-  - 也可分别指定：`filename_rgb`、`filename_depth`
-- `{"cmd":"save_snapshot","filename":"snapshot_status.json"}`
-  - 立即以当前时间戳保存一次传感器与图像快照，并写状态到 `filename`
-- `{"cmd":"shutdown","filename":"shutdown_ok.json"}`
-  - 请求优雅退出：停止悬停循环后写状态 JSON，再关闭节点
+网络与协议
+- 监听地址与端口：`PEGASUS_CMD_HOST`（默认 `0.0.0.0`）、`PEGASUS_CMD_PORT`（默认 `8989`）。
+- 允许多个客户端同时连接；服务器使用非阻塞 `select` 循环，按行（`\n`）读取命令。
+- 命令为 JSON 文本对象，需包含 `cmd`（或 `type`）字段。无返回写回 Socket；如需持久化响应，请在命令中提供 `filename`，结果将写入状态目录对应 JSON 文件。
+- 无效 JSON 行会忽略并在日志警告。
 
-使用示例
-1) 启动脚本（可选外部会话时间戳）：
+目录结构与会话管理
+- 根目录：`GLOBAL_OUTPUT_DIR = PEGASUS_OUTPUT_DIR 或 PEGASUS_SAVE_DIR(sensor_data)`。
+- 会话目录：`sensors_{session_ts}`、`camera_{session_ts}`、`status_{session_ts}`。
+- 会话切换：发送 `set_session_ts` 会立即重建并切换所有保存目录，同时更新全局 `SESSION_TS_GLOBAL`。随后所有状态与数据均写入新的会话目录。
+
+命令列表（请求/响应/保存路径）
+- set_session_ts
+  - 请求：`{"cmd":"set_session_ts","ts":1234567890,"filename":"set_session_ok.json"}`（或使用 `session_ts` 字段）。
+  - 行为：立刻切换保存路径到新会话；写状态文件到新 `status_{ts}` 目录。
+  - 响应：`{"ok":true,"message":"session updated","session_ts":1234567890}`。
+  - 状态文件：`<GLOBAL_OUTPUT_DIR>/status_{ts}/set_session_ok.json`。
+
+- move_to
+  - 请求：`{"cmd":"move_to","x":0.0,"y":0.0,"z":2.0,"filename":"move_to_ok.json"}`。
+  - 行为：发布位置期望并将悬停点设为目标；自动保存一次快照（传感器+图像，文件名包含统一时间戳）。
+  - 响应：`{"ok":true,"position":{"x":...,"y":...,"z":...}}`。
+  - 自动快照：`sensors_{ts}/sensors_data_{tag}.json`、`camera_{ts}/camera_image_{tag}.png`、`camera_{ts}/depth_image_{tag}.png`（如有深度）。
+  - 状态文件：`status_{session_ts}/move_to_ok.json`。
+
+- move_to_many
+  - 请求：`{"cmd":"move_to_many","points":[[0,0,2],[1,0,2],[1,1,2]],"filename":"multi_ok.json"}`。
+  - 行为：逐点移动（默认收敛阈值 0.1m），每到达一个点都会保存一次快照；结束后悬停在最后一点。
+  - 响应：`{"ok":true,"position":{...}}`（返回最终位置）。
+  - 状态文件：`status_{session_ts}/multi_ok.json`。
+
+- land
+  - 请求：`{"cmd":"land","filename":"land_ok.json"}`。
+  - 行为：以固定速率下降至起飞基线高度，随后尝试解锁关闭（disarm）；过程结束保存一次快照。
+  - 响应：`{"ok":true,"status":{"connected":...,"armed":...,"mode":"..."}}`。
+  - 状态文件：`status_{session_ts}/land_ok.json`。
+
+- get_position
+  - 请求：`{"cmd":"get_position","filename":"position.json"}`（`filename` 可选）。
+  - 响应：`{"ok":true,"position":{"x":...,"y":...,"z":...}}`。
+  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/position.json`。
+
+- get_status
+  - 请求：`{"cmd":"get_status","filename":"status.json"}`（`filename` 可选）。
+  - 响应：`{"ok":true,"status":{"connected":bool,"armed":bool,"mode":str}}`。
+  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/status.json`。
+
+- get_sensors
+  - 请求：`{"cmd":"get_sensors","filename":"my_sensors.json"}`（`filename` 可选）。
+  - 响应：`{"ok":true,"sensors":{...}}`，其中包含：`state/pose/imu/gps/pressure/magnetic/temperature/twist` 等字段；若保存成功，附加 `saved.sensors` 路径。
+  - 传感器保存：`sensors_{session_ts}/my_sensors.json`。
+  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/my_sensors.json`（与传感器 JSON 同名但不同目录）。
+
+- get_images
+  - 请求：`{"cmd":"get_images","filename":"frame001"}`，或分别指定 `filename_rgb`、`filename_depth`。
+  - 响应：`{"ok":true,"images":{"rgb":{"width":..,"height":..,"encoding":".."},"depth":{...},"saved":{"rgb":"...","depth":"..."}}}`。
+  - 图像保存：`camera_{session_ts}/frame001.png` 与 `camera_{session_ts}/frame001_depth.png`（若无 PIL 则保存 `.npy`）。
+  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/frame001.json`。
+
+- save_snapshot
+  - 请求：`{"cmd":"save_snapshot","filename":"snapshot_status.json"}`（`filename` 可选）。
+  - 行为：以当前时间戳保存一次传感器与图像快照。
+  - 响应：`{"ok":true,"saved_at":<unix_ts>}`。
+  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/snapshot_status.json`。
+
+- shutdown
+  - 请求：`{"cmd":"shutdown","filename":"shutdown_ok.json"}`。
+  - 行为：请求优雅退出；主循环将置位后停止，随后清理资源与 MAVROS。
+  - 响应：`{"ok":true,"message":"Shutdown requested"}`。
+  - 状态文件：`status_{session_ts}/shutdown_ok.json`。
+
+响应与状态写入说明
+- 所有命令都会在内存中构造一个响应对象 `resp`，包含至少：`ok:true/false`，失败时 `error:"..."`；部分命令附带 `position/status/images/sensors/saved_at/message` 等字段。
+- 如命令包含 `filename`，将把该 `resp` 以 `<filename>.json` 写入 `status_{session_ts}`。注：对于 `get_sensors/get_images`，同名 `filename` 也用于各自的数据保存（在 `sensors_*/camera_*` 目录），因此会产生两个同名 JSON（内容不同，位于不同目录）。
+- `set_session_ts` 响应与状态写入均在新目录下生效（会话切换为 `ts` 后立即写入）。
+
+使用示例（推荐顺序）
+1) 启动（可选外部会话时间戳）：
    - `python3 examples/rospy_isaacsim.py --session-ts 1234567890`
-2) 使用 `nc` 发送命令（所有状态 JSON 写入 `status_{session_ts}` 子目录）：
-   - `nc 127.0.0.1 8989` 后逐行输入：
+2) 连接并发送命令（默认监听 `0.0.0.0:8989`，本机可用 `127.0.0.1`）：
+   - `nc 127.0.0.1 8989`，逐行输入：
      - `{"cmd":"set_session_ts","ts":1234567890,"filename":"set_session_ok.json"}`
+     - `{"cmd":"get_status","filename":"status.json"}`
      - `{"cmd":"move_to","x":0,"y":0,"z":2,"filename":"move_to_ok.json"}`
-     - `{"cmd":"get_sensors","filename":"test.json"}`
+     - `{"cmd":"get_sensors","filename":"my_sensors.json"}`
      - `{"cmd":"get_images","filename":"frame001"}`
      - `{"cmd":"shutdown","filename":"shutdown_ok.json"}`
+
+先后顺序建议与注意事项
+- 建议顺序：`set_session_ts`（可选）→ `get_status` → 运动控制（`move_to`/`move_to_many`/`land`）→ 数据采集（`get_sensors`/`get_images`/`save_snapshot`）→ `shutdown`。
+- 可在运行中多次发送 `set_session_ts` 实现会话切换；切换后立即生效，新的状态与数据写入新目录。
+- `move_to/move_to_many/land` 会自动保存快照；图像保存需要 RGB/深度话题存在，且无 PIL 时将保存为 `.npy`。
+- Socket 不返回响应到客户端；如需结果，请设置 `filename` 以在 `status_{session_ts}` 中查看。
+- 需要正确的 ROS2 环境与 MAVROS 安装；默认 `fcu_url:=udp://:14540@` 适用于 PX4 SITL。
 """
 # --- ROS 2 & System Imports ---
 import rclpy

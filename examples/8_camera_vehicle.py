@@ -65,7 +65,8 @@ class PegasusApp:
         self.world = self.pg.world
 
         # Launch one of the worlds provided by NVIDIA
-        self.pg.load_environment(SIMULATION_ENVIRONMENTS["Curved Gridroom"])
+        # self.pg.load_environment(SIMULATION_ENVIRONMENTS["Curved Gridroom"])
+        self.pg.load_environment("/home/user/SimulatorSetup/submodules/PegasusSimulator/export4/Demo_Environment.usd")
 
         # cube_2 = self.world.scene.add(
         #     DynamicCuboid(
