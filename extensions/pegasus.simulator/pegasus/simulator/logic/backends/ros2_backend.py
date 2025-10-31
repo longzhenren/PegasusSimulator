@@ -17,6 +17,13 @@ from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import Imu, MagneticField, NavSatFix, NavSatStatus
 from geometry_msgs.msg import PoseStamped, TwistStamped, AccelStamped
 
+# MAVROS message imports (optional bridge)
+try:
+    from mavros_msgs.msg import PositionTarget
+    mavros_loaded = True
+except ImportError:
+    mavros_loaded = False
+
 # TF imports
 # Check if these libraries exist in the system
 try:
@@ -70,6 +77,8 @@ class ROS2Backend(Backend):
             >>>  "pub_state": True,                             # Publish the state of the vehicle
             >>>  "pub_tf": False,                               # Publish the TF of the vehicle
             >>>  "sub_control": True,                           # Subscribe to the control topics
+            >>>  "bridge_nav_velocity": False,                  # Bridge /nav/velocity -> /mavros/setpoint_raw/local
+            >>>  "bridge_rate_hz": 30.0,                       # Rate at which to publish the velocity commands to MAVROS (if enabled)
         """
 
         # Save the configurations for this backend
@@ -82,6 +91,10 @@ class ROS2Backend(Backend):
         self._pub_sensors = config.get("pub_sensors", True)
         self._pub_state = config.get("pub_state", True)
         self._sub_control = config.get("sub_control", True)
+
+        # Optional: bridge /nav/velocity -> /mavros/setpoint_raw/local
+        self._bridge_nav_velocity = config.get("bridge_nav_velocity", False) and mavros_loaded
+        self._bridge_rate_hz = float(config.get("bridge_rate_hz", 30.0)) if self._bridge_nav_velocity else 0.0
 
         # Check if the tf2_ros library is loaded and if the flag is set to True
         self._pub_tf = config.get("pub_tf", False) and tf2_ros_loaded
@@ -98,6 +111,16 @@ class ROS2Backend(Backend):
         # Initialize the publishers and subscribers
         self.initialize_publishers(config)
         self.initialize_subscribers()
+
+        # Internal buffer for velocity bridge
+        self._last_velocity_cmd = None
+
+        # Initialize bridge timer if enabled
+        if self._bridge_nav_velocity:
+            try:
+                self.bridge_timer = self.node.create_timer(1.0 / max(self._bridge_rate_hz, 1.0), self.publish_velocity)
+            except Exception as e:
+                carb.log_warn(f"Failed to create MAVROS bridge timer: {e}")
 
         # Create a dictionary that will store the writers for the graphical sensors
         # NOTE: this is done this way, because the writers move data from the GPU->CPU and then publish it to ROS2
@@ -155,7 +178,14 @@ class ROS2Backend(Backend):
             
             if config.get("pub_gps_vel", True):
                 self.gps_vel_pub = self.node.create_publisher(TwistStamped, self._namespace + str(self._id) + "/" + config.get("gps_vel_topic", "sensors/gps_twist"), rclpy.qos.qos_profile_sensor_data)
-        
+
+        # Bridge publisher to MAVROS setpoint_raw/local
+        if self._bridge_nav_velocity:
+            try:
+                self.mavros_setpoint_pub = self.node.create_publisher(PositionTarget, "/mavros/setpoint_raw/local", 10)
+            except Exception as e:
+                carb.log_warn(f"Failed to create MAVROS publisher: {e}")
+
 
     def initialize_subscribers(self):
 
@@ -166,6 +196,13 @@ class ROS2Backend(Backend):
             self.rotor_subs = []
             for i in range(self._num_rotors):
                 self.rotor_subs.append(self.node.create_subscription(Float64, self._namespace + str(self._id) + "/control/rotor" + str(i) + "/ref", lambda x: self.rotor_callback(x, i),10))
+
+        # Bridge subscriber for /nav/velocity
+        if self._bridge_nav_velocity:
+            try:
+                self.nav_vel_sub = self.node.create_subscription(PositionTarget, "/nav/velocity", self.nav_velocity_cb, 10)
+            except Exception as e:
+                carb.log_warn(f"Failed to create /nav/velocity subscription: {e}")
 
 
     def send_static_transforms(self):
@@ -283,6 +320,21 @@ class ROS2Backend(Backend):
     def rotor_callback(self, ros_msg: Float64, rotor_id):
         # Update the reference for the rotor of the vehicle
         self.input_ref[rotor_id] = float(ros_msg.data)
+
+    # -------------------------
+    # MAVROS bridge callbacks
+    # -------------------------
+    def nav_velocity_cb(self, msg: 'PositionTarget'):
+        # Cache latest velocity command
+        self._last_velocity_cmd = msg
+
+    def publish_velocity(self):
+        # Periodically publish cached velocity to MAVROS
+        try:
+            if self._last_velocity_cmd is not None and hasattr(self, 'mavros_setpoint_pub'):
+                self.mavros_setpoint_pub.publish(self._last_velocity_cmd)
+        except Exception as e:
+            carb.log_warn(f"Failed to publish MAVROS velocity: {e}")
 
     def update_sensor(self, sensor_type: str, data):
         """

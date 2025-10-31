@@ -28,6 +28,8 @@ class PX4LaunchTool:
 
         # Attribute that will hold the px4 process once it is running
         self.px4_process = None
+        # Attribute that will hold the mavros process once it is running
+        self.mavros_process = None
 
         # The vehicle id (used for the mavlink port open in the system)
         self.vehicle_id = vehicle_id
@@ -63,6 +65,26 @@ class PX4LaunchTool:
             env=self.environment,
         )
 
+    def launch_mavros(self, fcu_url: str = "udp://:14540@"):
+        """
+        Method that will launch a MAVROS instance using ROS2 launch.
+
+        Args:
+            fcu_url (str): MAVLink connection URL. Defaults to "udp://:14540@".
+        """
+        self.mavros_process = subprocess.Popen(
+            [
+                "/opt/ros/humble/bin/ros2",
+                "launch",
+                "mavros",
+                "px4.launch",
+                f"fcu_url:={fcu_url}",
+            ],
+            cwd=self.root_fs.name,
+            shell=False,
+            env=self.environment,
+        )
+
     def kill_px4(self):
         """
         Method that will kill a px4 instance with the specified configuration
@@ -70,6 +92,14 @@ class PX4LaunchTool:
         if self.px4_process is not None:
             self.px4_process.kill()
             self.px4_process = None
+
+    def kill_mavros(self):
+        """
+        Method that will kill a MAVROS instance if it is running
+        """
+        if self.mavros_process is not None:
+            self.mavros_process.kill()
+            self.mavros_process = None
 
     def __del__(self):
         """
@@ -80,6 +110,9 @@ class PX4LaunchTool:
         # Make sure the PX4 process gets killed
         if self.px4_process:
             self.kill_px4()
+        # Make sure the MAVROS process gets killed
+        if self.mavros_process:
+            self.kill_mavros()
 
         # Make sure we clean the temporary filesystem used for the simulation
         self.root_fs.cleanup()
@@ -90,10 +123,14 @@ def main():
 
     px4_tool = PX4LaunchTool(os.environ["HOME"] + "/PX4-Autopilot")
     px4_tool.launch_px4()
+    # Uncomment to also launch MAVROS alongside PX4
+    px4_tool.launch_mavros()
 
     import time
 
-    time.sleep(60)
+    time.sleep(20)
+    px4_tool.kill_px4()
+    px4_tool.kill_mavros()
 
 
 if __name__ == "__main__":

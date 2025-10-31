@@ -41,3 +41,6 @@ _build
 build/
 install/
 log/
+
+export4/
+sensor_data/

@@ -22,23 +22,19 @@ simulation_app = SimulationApp({"headless": False})
 import omni.timeline
 from omni.isaac.core.world import World
 
-from omni.isaac.core.objects import DynamicCuboid
-import numpy as np
-
 
 import sys, os
 # 把 Pegasus 包所在的上级目录插到最前面
 sys.path.insert(0, os.path.expanduser("~/PegasusSimulator/extensions/pegasus.simulator/"))
 
-
 # Import the Pegasus API for simulating drones
 from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS
 from pegasus.simulator.logic.graphical_sensors.monocular_camera import MonocularCamera
-from pegasus.simulator.logic.graphical_sensors.lidar import Lidar
 from pegasus.simulator.logic.backends.px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
 from pegasus.simulator.logic.backends.ros2_backend import ROS2Backend
 from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
+from pegasus.simulator.logic.sensors import Barometer, IMU, Magnetometer, GPS
 
 # Auxiliary scipy and numpy modules
 from scipy.spatial.transform import Rotation
@@ -65,8 +61,12 @@ class PegasusApp:
         self.world = self.pg.world
 
         # Launch one of the worlds provided by NVIDIA
+        # self.pg.load_environment(SIMULATION_ENVIRONMENTS["Warehouse"])
         self.pg.load_environment(SIMULATION_ENVIRONMENTS["Curved Gridroom"])
-
+        # self.pg.load_environment("/home/user/SimulatorSetup/submodules/PegasusSimulator/export4/Demo_Environment.usd")
+        # sleep(30)
+        # from omni.isaac.core.objects import DynamicCuboid
+        # import numpy as np
         # cube_2 = self.world.scene.add(
         #     DynamicCuboid(
         #         prim_path="/new_cube_2",
@@ -77,20 +77,29 @@ class PegasusApp:
         #         color=np.array([255, 0, 0]),
         #     )
         # )
-
+        
         # Create the vehicle
         # Try to spawn the selected robot in the world to the specified namespace
         config_multirotor = MultirotorConfig()
+        
+        # Set sensors for the vehicle
+        config_multirotor.sensors = [
+            Barometer(config={"update_rate": 50.0}),
+            IMU(config={"update_rate": 100.0}),
+            Magnetometer(config={"update_rate": 50.0}),
+            GPS(config={"update_rate": 10.0})
+        ]
+        
         # Create the multirotor configuration
         mavlink_config = PX4MavlinkBackendConfig({
             "vehicle_id": 0,
             "px4_autolaunch": True,
-            "mavros_autolaunch": False,
-            "enable_lockstep": False,
-            "px4_dir": "/home/user/PX4-Autopilot"
+            "px4_dir": self.pg.px4_path,
+            "px4_vehicle_model": self.pg.px4_default_airframe # CHANGE this line to 'iris' if using PX4 version bellow v1.14
         })
+        self._PX4Backend = PX4MavlinkBackend(mavlink_config)
         config_multirotor.backends = [
-            PX4MavlinkBackend(mavlink_config), 
+            self._PX4Backend,
             ROS2Backend(vehicle_id=1, 
                         config={
                             "namespace": 'drone', 
@@ -99,11 +108,9 @@ class PegasusApp:
                             "pub_state": True,
                             "sub_control": False,})]
 
-        # Create a camera and lidar sensors
-        # config_multirotor.graphical_sensors = [MonocularCamera("camera", config={"update_rate": 60.0})]
-        self.camera = MonocularCamera("front_camera", config={"update_rate": 60.0})
-        config_multirotor.graphical_sensors = [self.camera]
-        
+        # Create a camera sensor
+        config_multirotor.graphical_sensors = [MonocularCamera("front_camera", config={"update_rate": 60.0,"resolution": [640, 480],"diagonal_fov": 173.0})] 
+
         Multirotor(
             "/World/quadrotor",
             ROBOTS['Iris'],
@@ -112,6 +119,7 @@ class PegasusApp:
             Rotation.from_euler("XYZ", [0.0, 0.0, 0.0], degrees=True).as_quat(),
             config=config_multirotor,
         )
+        
 
         # Reset the simulation environment so that all articulations (aka robots) are initialized
         self.world.reset()
@@ -131,6 +139,27 @@ class PegasusApp:
         while simulation_app.is_running() and not self.stop_sim:
             # Update the UI of the app and perform the physics step
             self.world.step(render=True)
+            carb.log_info("Camera image shape: {}".format(self.pg.get_vehicle("/World/quadrotor")._graphical_sensors[0]._camera.get_rgba().shape))
+            # exit(0)
+            # save sensors like gps, imu, barometer, magnetometer to json file every 300 iterations
+            if int(self.timeline.get_current_time() * 60) % 300 == 0:
+                import json
+                # sensors = self.pg.get_vehicle("/World/quadrotor")._sensors
+                data = self._PX4Backend._sensor_data
+                sensors_data = {}
+                sensors_data["imu"] = {"xacc":data.xacc, "yacc":data.yacc, "zacc":data.zacc,"xgyro":data.xgyro, "ygyro":data.ygyro, "zgyro":data.zgyro}
+                sensors_data["gps"] = {"fix_type": data.fix_type,"latitude_deg": data.latitude_deg,"longitude_deg": data.longitude_deg,"altitude": data.altitude,"eph": data.eph,"epv": data.epv,"velocity": data.velocity,"velocity_north": data.velocity_north,"velocity_east": data.velocity_east,"velocity_down": data.velocity_down,"cog": data.cog,"sim_lat": data.sim_lat,"sim_lon": data.sim_lon,"sim_alt": data.sim_alt}
+                sensors_data["barometer"] = {"abs_pressure": data.abs_pressure, "temperature": data.temperature, "pressure_alt": data.pressure_alt}
+                sensors_data["magnetometer"] = {"xmag": data.xmag, "ymag": data.ymag, "zmag": data.zmag}
+                sensors_data["sim"] = {"sim_attitude": data.sim_attitude, "sim_angular_vel": data.sim_angular_vel, "sim_acceleration": data.sim_acceleration, "sim_velocity_inertial": data.sim_velocity_inertial,"sim_ind_airspeed": data.sim_ind_airspeed, "sim_true_airspeed": data.sim_true_airspeed}
+                # write to json file
+                with open("sensor_data/sensors/sensors_data_{}.json".format(int(self.timeline.get_current_time())), "w") as f:
+                    json.dump(sensors_data, f)
+            # save the image to a file with filename indexed by the current timeline timestamp every 60 iterations
+            if int(self.timeline.get_current_time() * 60) % 60 == 0:
+                from PIL import Image
+                img = Image.fromarray(self.pg.get_vehicle("/World/quadrotor")._graphical_sensors[0]._camera.get_rgba()[:, :, :3])
+                img.save("sensor_data/camera/camera_image_{}.png".format(int(self.timeline.get_current_time())))
 
         # Cleanup and stop
         carb.log_warn("PegasusApp Simulation App is closing.")

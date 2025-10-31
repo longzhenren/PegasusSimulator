@@ -200,6 +200,7 @@ class PX4MavlinkBackendConfig(BackendConfig):
             >>>  "connection_ip": "localhost",
             >>>  "connection_baseport": 4560,
             >>>  "px4_autolaunch": True,
+            >>>  "mavros_autolaunch": True,
             >>>  "px4_dir": "PegasusInterface().px4_path",
             >>>  "px4_vehicle_model": "gazebo-classic_iris",
             >>>  "enable_lockstep": True,
@@ -221,6 +222,9 @@ class PX4MavlinkBackendConfig(BackendConfig):
 
         # Configure whether to launch px4 in the background automatically or not for every vehicle launched
         self.px4_autolaunch: bool = self.config.get("px4_autolaunch", True)
+        # Configure whether to launch mavlink in the background automatically or not for every vehicle launched
+        self.mavros_autolaunch: bool = self.config.get("mavros_autolaunch", True)
+        
         self.px4_dir: str = self.config.get("px4_dir", PegasusInterface().px4_path)
         self.px4_vehicle_model: str = self.config.get("px4_vehicle_model", "gazebo-classic_iris")
 
@@ -266,6 +270,9 @@ class PX4MavlinkBackend(Backend):
 
         # Check if we need to autolaunch px4 in the background or not
         self.px4_autolaunch: bool = self.config.px4_autolaunch
+        # Check if we need to autolaunch mavlink in the background or not
+        self.mavros_autolaunch: bool = self.config.mavros_autolaunch
+        
         self.px4_vehicle_model: str = self.config.px4_vehicle_model  # only needed if px4_autolaunch == True
         self.px4_tool: PX4LaunchTool = None
         self.px4_dir: str = self.config.px4_dir
@@ -507,10 +514,14 @@ class PX4MavlinkBackend(Backend):
         self._is_running = True
 
         # Launch the PX4 in the background if needed
-        if self.px4_autolaunch and self.px4_tool is None:
+        if self.px4_tool is None:
             carb.log_info("Attempting to launch PX4 in background process")
             self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model)
-            self.px4_tool.launch_px4()
+            if self.px4_autolaunch:
+                self.px4_tool.launch_px4()
+            if self.mavros_autolaunch:
+                self.px4_tool.launch_mavros()
+            
 
     def stop(self):
         """Method that when called will handle the stopping of the simulation of vehicle. It will make sure that any open
@@ -529,9 +540,12 @@ class PX4MavlinkBackend(Backend):
         self._connection = None
 
         # Close the PX4 if it was running
-        if self.px4_autolaunch and self.px4_autolaunch is not None:
+        if self.px4_tool is not None:
             carb.log_info("Attempting to kill PX4 background process")
-            self.px4_tool.kill_px4()
+            if self.px4_autolaunch:
+                self.px4_tool.kill_px4()
+            if self.mavros_autolaunch:
+                self.px4_tool.kill_mavros()
             self.px4_tool = None
 
     def reset(self):
