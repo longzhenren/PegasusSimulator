@@ -28,7 +28,7 @@ class PX4LaunchTool:
 
         # Attribute that will hold the px4 process once it is running
         self.px4_process = None
-        # Attribute that will hold the mavros process once it is running
+        # Attribute for MAVROS process (deprecated; managed externally)
         self.mavros_process = None
 
         # The vehicle id (used for the mavlink port open in the system)
@@ -65,25 +65,12 @@ class PX4LaunchTool:
             env=self.environment,
         )
 
-    def launch_mavros(self, fcu_url: str = "udp://:14540@"):
+    def launch_mavros(self, fcu_url: str = "udp://:14540@", namespace: str = None):
         """
-        Method that will launch a MAVROS instance using ROS2 launch.
-
-        Args:
-            fcu_url (str): MAVLink connection URL. Defaults to "udp://:14540@".
+        Deprecated: MAVROS is launched and configured externally via examples/rospy_isaacsim.py.
+        This method is now a no-op to prevent accidental internal launches.
         """
-        self.mavros_process = subprocess.Popen(
-            [
-                "/opt/ros/humble/bin/ros2",
-                "launch",
-                "mavros",
-                "px4.launch",
-                f"fcu_url:={fcu_url}",
-            ],
-            cwd=self.root_fs.name,
-            shell=False,
-            env=self.environment,
-        )
+        return None
 
     def kill_px4(self):
         """
@@ -95,11 +82,10 @@ class PX4LaunchTool:
 
     def kill_mavros(self):
         """
-        Method that will kill a MAVROS instance if it is running
+        Deprecated: MAVROS lifecycle is managed externally.
+        This method is now a no-op.
         """
-        if self.mavros_process is not None:
-            self.mavros_process.kill()
-            self.mavros_process = None
+        return None
 
     def __del__(self):
         """
@@ -124,13 +110,13 @@ def main():
     px4_tool = PX4LaunchTool(os.environ["HOME"] + "/PX4-Autopilot")
     px4_tool.launch_px4()
     # Uncomment to also launch MAVROS alongside PX4
-    px4_tool.launch_mavros()
+    # MAVROS is now managed externally; do not launch here
 
     import time
 
     time.sleep(20)
     px4_tool.kill_px4()
-    px4_tool.kill_mavros()
+    # MAVROS managed externally; nothing to kill here
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from mavros_msgs.msg import PositionTarget
+import os
 
 class VelocityController(Node):
     def __init__(self):
@@ -13,11 +14,14 @@ class VelocityController(Node):
         self.last_velocity = PositionTarget()
         self.last_velocity.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
 
+        # 读取环境中的命名空间，使话题变为 '/<ns>/mavros/...' 与 '/<ns>/nav/velocity'
+        ns = os.environ.get("MAVROS_NS", None)
+        ns_prefix = f"/{ns}" if ns else ""
         # Publisher for MAVROS velocity commands
-        self.pub = self.create_publisher(PositionTarget, "/mavros/setpoint_raw/local", 10)
+        self.pub = self.create_publisher(PositionTarget, f"{ns_prefix}/mavros/setpoint_raw/local", 10)
 
         # Subscriber for velocity commands
-        self.create_subscription(PositionTarget, "/nav/velocity", self.cmd_vel_callback, 10)
+        self.create_subscription(PositionTarget, f"{ns_prefix}/nav/velocity", self.cmd_vel_callback, 10)
 
         # Publish at a fixed rate (e.g., 10 Hz)
         self.timer = self.create_timer(1 / 30, self.publish_velocity)  # 30 Hz rate

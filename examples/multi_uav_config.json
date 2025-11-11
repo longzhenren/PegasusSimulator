@@ -1,0 +1,65 @@
+{
+  "environment": "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Environments/Grid/gridroom_curved.usd",
+  "vehicles": [
+    {
+      "vehicle_id": 0,
+      "initial_position": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "mavros_autolaunch": false,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_fcu_url": "udp://:14540@",
+      "mavros_namespace": "uav0",
+      "ros2_namespace": "uav0",
+      "publish_graphical_sensors": true
+    },
+    {
+      "vehicle_id": 1,
+      "initial_position": [
+        1.0,
+        0.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "mavros_autolaunch": false,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_fcu_url": "udp://:14541@",
+      "mavros_namespace": "uav1",
+      "ros2_namespace": "uav1",
+      "publish_graphical_sensors": true
+    },
+    {
+      "vehicle_id": 2,
+      "initial_position": [
+        2.0,
+        0.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "mavros_autolaunch": false,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_fcu_url": "udp://:14542@",
+      "mavros_namespace": "uav2",
+      "ros2_namespace": "uav2",
+      "publish_graphical_sensors": true
+    }
+  ]
+}

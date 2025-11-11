@@ -222,8 +222,8 @@ class PX4MavlinkBackendConfig(BackendConfig):
 
         # Configure whether to launch px4 in the background automatically or not for every vehicle launched
         self.px4_autolaunch: bool = self.config.get("px4_autolaunch", True)
-        # Configure whether to launch mavlink in the background automatically or not for every vehicle launched
-        self.mavros_autolaunch: bool = self.config.get("mavros_autolaunch", True)
+        # MAVROS 自动启动已弃用：由外部脚本管理（examples/rospy_isaacsim.py）
+        self.mavros_autolaunch: bool = False
         
         self.px4_dir: str = self.config.get("px4_dir", PegasusInterface().px4_path)
         self.px4_vehicle_model: str = self.config.get("px4_vehicle_model", "gazebo-classic_iris")
@@ -238,6 +238,10 @@ class PX4MavlinkBackendConfig(BackendConfig):
         # The update rate at which we will be sending data to mavlink (TODO - remove this from here in the future
         # and infer directly from the function calls)
         self.update_rate: float = self.config.get("update_rate", 250.0)  # [Hz]
+
+        # MAVROS 配置已迁移到外部脚本；此处不再使用
+        self.mavros_fcu_url: str = None
+        self.mavros_namespace: str = None
 
 
 class PX4MavlinkBackend(Backend):
@@ -260,6 +264,7 @@ class PX4MavlinkBackend(Backend):
         self.config: PX4MavlinkBackendConfig = config
         self._vehicle_id = self.config.vehicle_id
         self._connection = None
+        # Build PyMAVLink URL. For TCP, prefer tcpin; for UDP, prefer udpin.
         self._connection_port = (
             self.config.connection_type
             + ":"
@@ -271,11 +276,15 @@ class PX4MavlinkBackend(Backend):
         # Check if we need to autolaunch px4 in the background or not
         self.px4_autolaunch: bool = self.config.px4_autolaunch
         # Check if we need to autolaunch mavlink in the background or not
-        self.mavros_autolaunch: bool = self.config.mavros_autolaunch
+        # Disabled: MAVROS is now managed externally by examples/rospy_isaacsim.py
+        self.mavros_autolaunch: bool = False
         
         self.px4_vehicle_model: str = self.config.px4_vehicle_model  # only needed if px4_autolaunch == True
         self.px4_tool: PX4LaunchTool = None
         self.px4_dir: str = self.config.px4_dir
+
+        # MAVROS settings are no longer handled inside Pegasus (pgsim)
+        # They are configured and launched by the external control script.
 
         # Set the update rate used for sending the messages (TODO - remove this hardcoded value from here)
         self._update_rate: float = self.config.update_rate
@@ -312,8 +321,15 @@ class PX4MavlinkBackend(Backend):
 
         self._last_heartbeat_sent_time = 0
 
+        # Throttle 'Waiting for first hearbeat' log to reduce spam
+        self._last_waiting_heartbeat_log_time = 0
+        self._waiting_heartbeat_log_interval = 3.0  # seconds
+
         # Auxiliar variables for setting the u_time when sending sensor data to px4
         self._current_utime: int = 0
+
+        # Log 前缀（不依赖 MAVROS 命名空间）
+        self._log_prefix = f"[uav{self._vehicle_id}]"
 
     def update_sensor(self, sensor_type: str, data):
         """Method that is used as callback for the vehicle for every iteration that a sensor produces new data. 
@@ -495,7 +511,7 @@ class PX4MavlinkBackend(Backend):
             self._connection.close()
             self._connection = None
         except:
-            carb.log_info("Mavlink connection was not closed, because it was never opened")
+            carb.log_info(f"{self._log_prefix} Mavlink connection was not closed, because it was never opened")
 
     def start(self):
         """Method that handles the begining of the simulation of vehicle. It will try to open the mavlink connection 
@@ -515,12 +531,11 @@ class PX4MavlinkBackend(Backend):
 
         # Launch the PX4 in the background if needed
         if self.px4_tool is None:
-            carb.log_info("Attempting to launch PX4 in background process")
+            carb.log_info(f"{self._log_prefix} Attempting to launch PX4 in background process")
             self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model)
             if self.px4_autolaunch:
                 self.px4_tool.launch_px4()
-            if self.mavros_autolaunch:
-                self.px4_tool.launch_mavros()
+            # Internal MAVROS launch disabled
             
 
     def stop(self):
@@ -541,11 +556,10 @@ class PX4MavlinkBackend(Backend):
 
         # Close the PX4 if it was running
         if self.px4_tool is not None:
-            carb.log_info("Attempting to kill PX4 background process")
+            carb.log_info(f"{self._log_prefix} Attempting to kill PX4 background process")
             if self.px4_autolaunch:
                 self.px4_tool.kill_px4()
-            if self.mavros_autolaunch:
-                self.px4_tool.kill_mavros()
+            # Internal MAVROS termination disabled
             self.px4_tool = None
 
     def reset(self):
@@ -563,7 +577,7 @@ class PX4MavlinkBackend(Backend):
         self._sensor_data = SensorMsg()
 
         # Restart the connection
-        carb.log_info(f"Connection to backend at {self._connection_port}")
+        carb.log_info(f"{self._log_prefix} Connection to backend at {self._connection_port}")
         self._connection = mavutil.mavlink_connection(self._connection_port)
 
         # Auxiliar variables to handle the lockstep between receiving sensor data and actuator control
@@ -574,6 +588,8 @@ class PX4MavlinkBackend(Backend):
         self._received_first_hearbeat: bool = False
 
         self._last_heartbeat_sent_time = 0
+        # Reset throttle for waiting heartbeat log
+        self._last_waiting_heartbeat_log_time = 0
 
     def wait_for_first_hearbeat(self):
         """
@@ -585,12 +601,16 @@ class PX4MavlinkBackend(Backend):
         if self._connection is None:
             return 
 
-        carb.log_warn("Waiting for first hearbeat")
+        # Throttle waiting heartbeat logs
+        now = time.time()
+        if (now - self._last_waiting_heartbeat_log_time) >= self._waiting_heartbeat_log_interval:
+            carb.log_warn(f"{self._log_prefix} Waiting for first hearbeat")
+            self._last_waiting_heartbeat_log_time = now
         result = self._connection.wait_heartbeat(blocking=False)
 
         if result is not None:
             self._received_first_hearbeat = True
-            carb.log_warn("Received first hearbeat")
+            carb.log_warn(f"{self._log_prefix} Received first hearbeat")
 
     def update(self, dt):
         """
@@ -675,7 +695,7 @@ class PX4MavlinkBackend(Backend):
             mav_type (int): The ID that indicates the type of vehicle. Defaults to MAV_TYPE_GENERIC=0 
         """
 
-        carb.log_info("Sending heartbeat")
+        carb.log_info(f"{self._log_prefix} Sending heartbeat")
 
         # Note: to know more about these functions, go to pymavlink->dialects->v20->standard.py
         # This contains the definitions for sending the hearbeat and simulated sensor messages
@@ -688,7 +708,7 @@ class PX4MavlinkBackend(Backend):
         Args:
             time_usec (int): The total time elapsed since the simulation started
         """
-        carb.log_info("Sending sensor msgs")
+        carb.log_info(f"{self._log_prefix} Sending sensor msgs")
 
         # Check which sensors have new data to send
         fields_updated: int = 0
@@ -732,7 +752,7 @@ class PX4MavlinkBackend(Backend):
                 fields_updated,
             )
         except:
-            carb.log_warn("Could not send sensor data through mavlink")
+            carb.log_warn(f"{self._log_prefix} Could not send sensor data through mavlink")
 
     def send_gps_msgs(self, time_usec: int):
         """
@@ -767,7 +787,7 @@ class PX4MavlinkBackend(Backend):
                 self._sensor_data.satellites_visible,
             )
         except:
-            carb.log_warn("Could not send gps data through mavlink")
+            carb.log_warn(f"{self._log_prefix} Could not send gps data through mavlink")
 
     def send_vision_msgs(self, time_usec: int):
         """
@@ -776,7 +796,7 @@ class PX4MavlinkBackend(Backend):
         Args:
             time_usec (int): The total time elapsed since the simulation started
         """
-        carb.log_info("Sending vision/mocap msgs")
+        carb.log_info(f"{self._log_prefix} Sending vision/mocap msgs")
 
         # Do not send vision/mocap data, if not new data was received
         if not self._sensor_data.new_vision_data:
@@ -796,7 +816,7 @@ class PX4MavlinkBackend(Backend):
                 self._sensor_data.vision_covariance,
             )
         except:
-            carb.log_warn("Could not send vision/mocap data through mavlink")
+            carb.log_warn(f"{self._log_prefix} Could not send vision/mocap data through mavlink")
 
     def send_ground_truth(self, time_usec: int):
         """
@@ -806,7 +826,7 @@ class PX4MavlinkBackend(Backend):
             time_usec (int): The total time elapsed since the simulation started
         """
 
-        carb.log_info("Sending groundtruth msgs")
+        carb.log_info(f"{self._log_prefix} Sending groundtruth msgs")
 
         # Do not send vision/mocap data, if not new data was received
         if not self._sensor_data.new_sim_state or self._sensor_data.sim_alt == 0:
@@ -834,7 +854,7 @@ class PX4MavlinkBackend(Backend):
                 self._sensor_data.sim_acceleration[2],
             )
         except:
-            carb.log_warn("Could not send groundtruth through mavlink")
+            carb.log_warn(f"{self._log_prefix} Could not send groundtruth through mavlink")
 
     def handle_control(self, time_usec, controls, mode, flags):
         """
@@ -851,7 +871,7 @@ class PX4MavlinkBackend(Backend):
         # pymavlink is return 129 (the end of the buffer)
         if mode == mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED + 1:
 
-            carb.log_info("Parsing control input")
+            carb.log_info(f"{self._log_prefix} Parsing control input")
 
             # Set the rotor target speeds
             self._rotor_data.update_input_reference(controls)

@@ -14,7 +14,7 @@ from isaacsim import SimulationApp
 # Start Isaac Sim's simulation environment
 # Note: this simulation app must be instantiated right after the SimulationApp import, otherwise the simulator will crash
 # as this is the object that will load all the extensions and load the actual simulator.
-simulation_app = SimulationApp({"headless": False})
+simulation_app = SimulationApp({"headless": True})
 
 # -----------------------------------
 # The actual script should start here
@@ -27,6 +27,7 @@ import numpy as np
 
 
 import sys, os
+import json
 # 把 Pegasus 包所在的上级目录插到最前面
 sys.path.insert(0, os.path.expanduser("~/PegasusSimulator/extensions/pegasus.simulator/"))
 
@@ -42,6 +43,91 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 
 # Auxiliary scipy and numpy modules
 from scipy.spatial.transform import Rotation
+
+
+# -------------------------
+# Multi-UAV Config (JSON only)
+# -------------------------
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "multi_uav_config.json")
+
+def load_config_strict(path: str = CONFIG_PATH):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Multi-UAV config not found: {path}")
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+class CommStatusManager:
+    """
+    Deprecated lightweight communication manager (removed).
+    """
+    pass
+
+
+class MultiUAVManager:
+    """
+    Read JSON config and spawn multiple multirotors with per-vehicle PX4/MAVROS/ROS2 settings.
+    """
+    def __init__(self, pg: PegasusInterface, world: World, config: dict):
+        self.pg = pg
+        self.world = world
+        self.config = config
+        self.vehicles = []
+
+    def spawn(self):
+        env = self.config.get("environment", SIMULATION_ENVIRONMENTS.get("Curved Gridroom"))
+        self.pg.load_environment(env)
+
+        for v in self.config.get("vehicles", []):
+            vid = int(v.get("vehicle_id", 0))
+            init_pos = v.get("initial_position", [0.0, 0.0, 0.07])
+            euler = v.get("initial_orientation_euler_deg", [0.0, 0.0, 0.0])
+            quat = Rotation.from_euler("XYZ", euler, degrees=True).as_quat()
+
+            # PX4 backend config per vehicle (MAVROS handled externally)
+            px4_cfg_dict = {
+                "vehicle_id": vid,
+                "px4_autolaunch": bool(v.get("px4_autolaunch", True)),
+                "px4_dir": v.get("px4_dir", self.pg.px4_path),
+                "px4_vehicle_model": getattr(self.pg, "px4_default_airframe", "gazebo-classic_iris"),
+                # Use backend defaults for MAVLink connection (PX4 rcS offboard → UDP 14540+id)
+            }
+            mavlink_config = PX4MavlinkBackendConfig(px4_cfg_dict)
+
+            # ROS2 backend (namespaced) for sensors/graphical
+            ros2_ns = v.get("ros2_namespace", f"uav{vid}")
+            ros2_backend = ROS2Backend(vehicle_id=vid, config={
+                "namespace": ros2_ns,
+                "pub_sensors": False,
+                "pub_graphical_sensors": bool(v.get("publish_graphical_sensors", True)),
+                "pub_state": True,
+                "sub_control": False,
+            })
+
+            # No communication manager: rely on backend logs and external tools
+
+            # Configure vehicle sensors
+            camera = MonocularCamera(f"front_camera_{vid}", config={"update_rate": 60.0})
+            config_multirotor = MultirotorConfig()
+            config_multirotor.graphical_sensors = [camera]
+            config_multirotor.backends = [PX4MavlinkBackend(mavlink_config), ros2_backend]
+
+            # Spawn vehicle with consistent prim path namespace (/World/<ros2_ns>)
+            prim_path = f"/World/{ros2_ns}"
+            m = Multirotor(
+                prim_path,
+                ROBOTS['Iris'],
+                vid,
+                init_pos,
+                quat,
+                config=config_multirotor,
+            )
+            self.vehicles.append(m)
+
+        # Reset simulation to initialize assets
+        self.world.reset()
+
+    # Communication status tracking removed for simplicity
 
 class PegasusApp:
     """
@@ -64,9 +150,10 @@ class PegasusApp:
         self.pg._world = World(**self.pg._world_settings)
         self.world = self.pg.world
 
-        # Launch one of the worlds provided by NVIDIA
-        # self.pg.load_environment(SIMULATION_ENVIRONMENTS["Curved Gridroom"])
-        self.pg.load_environment("/home/user/SimulatorSetup/submodules/PegasusSimulator/export4/Demo_Environment.usd")
+        # Load environment and vehicles from local JSON config (strict, no defaults)
+        cfg = load_config_strict()
+        self.manager = MultiUAVManager(self.pg, self.world, cfg)
+        self.manager.spawn()
 
         # cube_2 = self.world.scene.add(
         #     DynamicCuboid(
@@ -79,43 +166,8 @@ class PegasusApp:
         #     )
         # )
 
-        # Create the vehicle
-        # Try to spawn the selected robot in the world to the specified namespace
-        config_multirotor = MultirotorConfig()
-        # Create the multirotor configuration
-        mavlink_config = PX4MavlinkBackendConfig({
-            "vehicle_id": 0,
-            "px4_autolaunch": True,
-            "mavros_autolaunch": False,
-            "enable_lockstep": False,
-            "px4_dir": "/home/user/PX4-Autopilot"
-        })
-        config_multirotor.backends = [
-            PX4MavlinkBackend(mavlink_config), 
-            ROS2Backend(vehicle_id=1, 
-                        config={
-                            "namespace": 'drone', 
-                            "pub_sensors": False,
-                            "pub_graphical_sensors": True,
-                            "pub_state": True,
-                            "sub_control": False,})]
-
-        # Create a camera and lidar sensors
-        # config_multirotor.graphical_sensors = [MonocularCamera("camera", config={"update_rate": 60.0})]
-        self.camera = MonocularCamera("front_camera", config={"update_rate": 60.0})
-        config_multirotor.graphical_sensors = [self.camera]
-        
-        Multirotor(
-            "/World/quadrotor",
-            ROBOTS['Iris'],
-            0,
-            [0.0, 0.0, 0.07],
-            Rotation.from_euler("XYZ", [0.0, 0.0, 0.0], degrees=True).as_quat(),
-            config=config_multirotor,
-        )
-
-        # Reset the simulation environment so that all articulations (aka robots) are initialized
-        self.world.reset()
+        # Initial communication status snapshot
+        # (Removed) Communication status manager
 
         # Auxiliar variable for the timeline callback example
         self.stop_sim = False
@@ -132,6 +184,7 @@ class PegasusApp:
         while simulation_app.is_running() and not self.stop_sim:
             # Update the UI of the app and perform the physics step
             self.world.step(render=True)
+            # (Removed) Periodic communication status refresh
 
         # Cleanup and stop
         carb.log_warn("PegasusApp Simulation App is closing.")

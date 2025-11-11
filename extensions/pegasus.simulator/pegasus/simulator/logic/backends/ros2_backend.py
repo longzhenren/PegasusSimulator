@@ -84,7 +84,12 @@ class ROS2Backend(Backend):
         # Save the configurations for this backend
         self._id = vehicle_id
         self._num_rotors = num_rotors
-        self._namespace = config.get("namespace", "drone" + str(vehicle_id))
+        # Base namespace for all ROS topics and writers
+        base_ns = config.get("namespace", f"drone{vehicle_id}")
+        # Normalize to leading slash without trailing slash
+        if not base_ns.startswith("/"):
+            base_ns = "/" + base_ns
+        self._namespace = base_ns
 
         # Save what whould be published/subscribed
         self._pub_graphical_sensors = config.get("pub_graphical_sensors", True)
@@ -152,37 +157,37 @@ class ROS2Backend(Backend):
         # -----------------------------------------------------
         if self._pub_state:
             if config.get("pub_pose", True):
-                self.pose_pub = self.node.create_publisher(PoseStamped, self._namespace + str(self._id) + "/" + config.get("pose_topic", "state/pose"), rclpy.qos.qos_profile_sensor_data)
+                self.pose_pub = self.node.create_publisher(PoseStamped, self._namespace + "/" + config.get("pose_topic", "state/pose"), rclpy.qos.qos_profile_sensor_data)
             
             if config.get("pub_twist", True):
-                self.twist_pub = self.node.create_publisher(TwistStamped, self._namespace + str(self._id) + "/" + config.get("twist_topic", "state/twist"), rclpy.qos.qos_profile_sensor_data)
+                self.twist_pub = self.node.create_publisher(TwistStamped, self._namespace + "/" + config.get("twist_topic", "state/twist"), rclpy.qos.qos_profile_sensor_data)
 
             if config.get("pub_twist_inertial", True):
-                self.twist_inertial_pub = self.node.create_publisher(TwistStamped, self._namespace + str(self._id) + "/" + config.get("twist_inertial_topic", "state/twist_inertial"), rclpy.qos.qos_profile_sensor_data)
+                self.twist_inertial_pub = self.node.create_publisher(TwistStamped, self._namespace + "/" + config.get("twist_inertial_topic", "state/twist_inertial"), rclpy.qos.qos_profile_sensor_data)
 
             if config.get("pub_accel", True):
-                self.accel_pub = self.node.create_publisher(AccelStamped, self._namespace + str(self._id) + "/" + config.get("accel_topic", "state/accel"), rclpy.qos.qos_profile_sensor_data)
+                self.accel_pub = self.node.create_publisher(AccelStamped, self._namespace + "/" + config.get("accel_topic", "state/accel"), rclpy.qos.qos_profile_sensor_data)
 
         # -----------------------------------------------------
         # Create publishers for the sensors of the vehicle
         # -----------------------------------------------------
         if self._pub_sensors:
             if config.get("pub_imu", True):
-                self.imu_pub = self.node.create_publisher(Imu, self._namespace + str(self._id) + "/" + config.get("imu_topic", "sensors/imu"), rclpy.qos.qos_profile_sensor_data)
+                self.imu_pub = self.node.create_publisher(Imu, self._namespace + "/" + config.get("imu_topic", "sensors/imu"), rclpy.qos.qos_profile_sensor_data)
             
             if config.get("pub_mag", True):
-                self.mag_pub = self.node.create_publisher(MagneticField, self._namespace + str(self._id) + "/" + config.get("mag_topic", "sensors/mag"), rclpy.qos.qos_profile_sensor_data)
+                self.mag_pub = self.node.create_publisher(MagneticField, self._namespace + "/" + config.get("mag_topic", "sensors/mag"), rclpy.qos.qos_profile_sensor_data)
 
             if config.get("pub_gps", True):
-                self.gps_pub = self.node.create_publisher(NavSatFix, self._namespace + str(self._id) + "/" + config.get("gps_topic", "sensors/gps"), rclpy.qos.qos_profile_sensor_data)
+                self.gps_pub = self.node.create_publisher(NavSatFix, self._namespace + "/" + config.get("gps_topic", "sensors/gps"), rclpy.qos.qos_profile_sensor_data)
             
             if config.get("pub_gps_vel", True):
-                self.gps_vel_pub = self.node.create_publisher(TwistStamped, self._namespace + str(self._id) + "/" + config.get("gps_vel_topic", "sensors/gps_twist"), rclpy.qos.qos_profile_sensor_data)
+                self.gps_vel_pub = self.node.create_publisher(TwistStamped, self._namespace + "/" + config.get("gps_vel_topic", "sensors/gps_twist"), rclpy.qos.qos_profile_sensor_data)
 
         # Bridge publisher to MAVROS setpoint_raw/local
         if self._bridge_nav_velocity:
             try:
-                self.mavros_setpoint_pub = self.node.create_publisher(PositionTarget, "/mavros/setpoint_raw/local", 10)
+                self.mavros_setpoint_pub = self.node.create_publisher(PositionTarget, self._namespace + "/mavros/setpoint_raw/local", 10)
             except Exception as e:
                 carb.log_warn(f"Failed to create MAVROS publisher: {e}")
 
@@ -195,12 +200,12 @@ class ROS2Backend(Backend):
             # The current setup as it is.... its a pain!!!!
             self.rotor_subs = []
             for i in range(self._num_rotors):
-                self.rotor_subs.append(self.node.create_subscription(Float64, self._namespace + str(self._id) + "/control/rotor" + str(i) + "/ref", lambda x: self.rotor_callback(x, i),10))
+                self.rotor_subs.append(self.node.create_subscription(Float64, self._namespace + "/control/rotor" + str(i) + "/ref", lambda x: self.rotor_callback(x, i),10))
 
         # Bridge subscriber for /nav/velocity
         if self._bridge_nav_velocity:
             try:
-                self.nav_vel_sub = self.node.create_subscription(PositionTarget, "/nav/velocity", self.nav_velocity_cb, 10)
+                self.nav_vel_sub = self.node.create_subscription(PositionTarget, self._namespace + "/nav/velocity", self.nav_velocity_cb, 10)
             except Exception as e:
                 carb.log_warn(f"Failed to create /nav/velocity subscription: {e}")
 
@@ -451,7 +456,7 @@ class ROS2Backend(Backend):
 
         # Create the writer for the rgb camera
         writer = rep.writers.get("LdrColorSDROS2PublishImage")
-        writer.initialize(nodeNamespace=self._namespace + str(self._id), topicName=data["camera_name"] + "/color/image_raw", frameId=data["camera_name"], queueSize=1)
+        writer.initialize(nodeNamespace=self._namespace, topicName=data["camera_name"] + "/color/image_raw", frameId=data["camera_name"], queueSize=1)
         writer.attach([render_prod_path])
 
         # Add the writer to the dictionary
@@ -462,7 +467,7 @@ class ROS2Backend(Backend):
 
             # Create the writer for the depth camera
             writer_depth = rep.writers.get("DistanceToImagePlaneSDROS2PublishImage")
-            writer_depth.initialize(nodeNamespace=self._namespace + str(self._id), topicName=data["camera_name"] + "/depth", frameId=data["camera_name"], queueSize=1)
+            writer_depth.initialize(nodeNamespace=self._namespace, topicName=data["camera_name"] + "/depth", frameId=data["camera_name"], queueSize=1)
             writer_depth.attach([render_prod_path])
 
             # Add the writer to the dictionary
@@ -472,7 +477,7 @@ class ROS2Backend(Backend):
         writer_info = rep.writers.get("ROS2PublishCameraInfo")
         camera_info = read_camera_info(render_product_path=render_prod_path)
         writer_info.initialize(
-            nodeNamespace=self._namespace + str(self._id), 
+            nodeNamespace=self._namespace, 
             topicName=data["camera_name"] + "/color/camera_info", 
             frameId=data["camera_name"], 
             queueSize=1,
@@ -509,7 +514,7 @@ class ROS2Backend(Backend):
 
         # Create the writer for the lidar
         writer = rep.writers.get("RtxLidarROS2PublishPointCloud")
-        writer.initialize(nodeNamespace=self._namespace + str(self._id), topicName=data["lidar_name"] + "/pointcloud", frameId=data["lidar_name"])
+        writer.initialize(nodeNamespace=self._namespace, topicName=data["lidar_name"] + "/pointcloud", frameId=data["lidar_name"])
         writer.attach([render_prod_path])
 
         # Add the writer to the dictionary
@@ -517,7 +522,7 @@ class ROS2Backend(Backend):
 
         # Create the writer for publishing a laser scan message along with the point cloud
         writer = rep.writers.get("RtxLidarROS2PublishLaserScan")
-        writer.initialize(nodeNamespace=self._namespace + str(self._id), topicName=data["lidar_name"] + "/laserscan", frameId=data["lidar_name"])
+        writer.initialize(nodeNamespace=self._namespace, topicName=data["lidar_name"] + "/laserscan", frameId=data["lidar_name"])
         writer.attach([render_prod_path])
         self.graphical_sensors_writers[data["lidar_name"]].append(writer)
 

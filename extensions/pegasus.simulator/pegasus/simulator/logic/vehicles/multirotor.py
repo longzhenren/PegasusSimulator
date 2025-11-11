@@ -83,6 +83,10 @@ class Multirotor(Vehicle):
         # 1. Initiate the Vehicle object itself
         super().__init__(stage_prefix, usd_file, init_pos, init_orientation, config.sensors, config.graphical_sensors, config.graphs, config.backends)
 
+        # 1.5 Save configuration and vehicle id for external access
+        self._id = int(vehicle_id)
+        self._config = config
+
         # 2. Setup the dynamics of the system - get the thrust curve of the vehicle from the configuration
         self._thrusters = config.thrust_curve
         self._drag = config.drag
@@ -139,6 +143,24 @@ class Multirotor(Vehicle):
         # Call the update methods in all backends
         for backend in self._backends:
             backend.update(dt)
+
+    @property
+    def id(self) -> int:
+        """Vehicle numeric id.
+
+        Returns:
+            int: The id provided when constructing this vehicle.
+        """
+        return self._id
+
+    @property
+    def config(self):
+        """Multirotor configuration used to instantiate this vehicle.
+
+        Returns:
+            MultirotorConfig: The configuration object passed at construction.
+        """
+        return self._config
 
     def handle_propeller_visual(self, rotor_number, force: float, articulation):
         """

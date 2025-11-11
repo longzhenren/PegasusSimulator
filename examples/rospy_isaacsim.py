@@ -129,12 +129,15 @@ import signal
 import select
 import socket
 from typing import Optional, List, Dict, Any
+from tqdm import tqdm
 
 import numpy as np
 try:
     from PIL import Image as PILImage
 except Exception:
     PILImage = None
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import State, RCIn, PositionTarget
 from mavros_msgs.srv import CommandBool, SetMode, CommandLong
@@ -305,7 +308,7 @@ class IsaacSimEnv(Node):
     ROS2 + PX4 (MAVROS) compatible env.
     Mimics original RosEnv's reset()/step() ordering & semantics.
     """
-    def __init__(self, session_ts: Optional[int] = None):
+    def __init__(self, session_ts: Optional[int] = None, mavros_ns: Optional[str] = None):
         super().__init__("isaac_sim_nav_node")
 
         # --- params / buffers ---
@@ -346,6 +349,20 @@ class IsaacSimEnv(Node):
         self._last_action_tag = None  # int seconds used to name saved files
         self._shutdown_requested = False
 
+        # MAVROS namespace support: build topic/service prefix
+        self._mavros_ns = mavros_ns if mavros_ns is not None else os.environ.get("MAVROS_NS", None)
+        self._mavros_prefix = f"/{self._mavros_ns}" if self._mavros_ns else ""
+
+        # Resolve per-instance camera topics; if env not set, fall back to namespaced defaults
+        env_rgb = os.environ.get("PEGASUS_CAMERA_RGB")
+        env_depth = os.environ.get("PEGASUS_CAMERA_DEPTH")
+        self._camera_rgb_topic = env_rgb if env_rgb else (self._mavros_prefix + "/camera/color/image_raw" if self._mavros_prefix else "/camera/color/image_raw")
+        self._camera_depth_topic = env_depth if env_depth else (self._mavros_prefix + "/camera/depth/image_raw" if self._mavros_prefix else "/camera/depth/image_raw")
+        try:
+            self.get_logger().info(f"Using CAMERA topics: rgb={self._camera_rgb_topic}, depth={self._camera_depth_topic}")
+        except Exception:
+            pass
+
         # # --- subscribers (adjust topics to your bridge) ---
         best_effort_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -354,9 +371,9 @@ class IsaacSimEnv(Node):
         )
 
         # --- subscribers ---
-        self.create_subscription(State, "/mavros/state", self.state_cb, best_effort_qos)
-        self.create_subscription(PoseStamped, "/mavros/local_position/pose", self.pose_cb, best_effort_qos)
-        self.create_subscription(RCIn, "/mavros/rc/in", self.rc_in_callback, best_effort_qos)
+        self.create_subscription(State, self._mavros_prefix + "/mavros/state", self.state_cb, best_effort_qos)
+        self.create_subscription(PoseStamped, self._mavros_prefix + "/mavros/local_position/pose", self.pose_cb, best_effort_qos)
+        self.create_subscription(RCIn, self._mavros_prefix + "/mavros/rc/in", self.rc_in_callback, best_effort_qos)
 
         # Sensor topics
         self.last_imu: Optional[Imu] = None
@@ -365,34 +382,39 @@ class IsaacSimEnv(Node):
         self.last_mag: Optional[MagneticField] = None
         self.last_temp: Optional[Temperature] = None
         self.last_twist: Optional[TwistStamped] = None
-        self.create_subscription(Imu, "/mavros/imu/data", self.imu_cb, best_effort_qos)
-        self.create_subscription(NavSatFix, "/mavros/global_position/raw/fix", self.navsat_cb, best_effort_qos)
-        self.create_subscription(FluidPressure, "/mavros/imu/static_pressure", self.pressure_cb, best_effort_qos)
-        self.create_subscription(MagneticField, "/mavros/imu/mag", self.mag_cb, best_effort_qos)
-        self.create_subscription(Temperature, "/mavros/imu/temperature", self.temp_cb, best_effort_qos)
-        self.create_subscription(TwistStamped, "/mavros/local_position/velocity", self.twist_cb, best_effort_qos)
+        self.create_subscription(Imu, self._mavros_prefix + "/mavros/imu/data", self.imu_cb, best_effort_qos)
+        self.create_subscription(NavSatFix, self._mavros_prefix + "/mavros/global_position/raw/fix", self.navsat_cb, best_effort_qos)
+        self.create_subscription(FluidPressure, self._mavros_prefix + "/mavros/imu/static_pressure", self.pressure_cb, best_effort_qos)
+        self.create_subscription(MagneticField, self._mavros_prefix + "/mavros/imu/mag", self.mag_cb, best_effort_qos)
+        self.create_subscription(Temperature, self._mavros_prefix + "/mavros/imu/temperature", self.temp_cb, best_effort_qos)
+        self.create_subscription(TwistStamped, self._mavros_prefix + "/mavros/local_position/velocity", self.twist_cb, best_effort_qos)
 
         # Image topics (rgb + depth)
         self.last_rgb_img: Optional[Image] = None
         self.last_depth_img: Optional[Image] = None
         try:
-            self.create_subscription(Image, CAMERA_RGB_TOPIC, self.rgb_cb, best_effort_qos)
-            self.create_subscription(Image, CAMERA_DEPTH_TOPIC, self.depth_cb, best_effort_qos)
+            self.create_subscription(Image, self._camera_rgb_topic, self.rgb_cb, best_effort_qos)
+            self.create_subscription(Image, self._camera_depth_topic, self.depth_cb, best_effort_qos)
         except Exception:
             # Topics may not exist; keep subscribers optional
             pass
 
         # --- publishers ---
-        # 与原始代码一致：发布到 /nav/velocity，由 vel.py 转发到 /mavros/setpoint_raw/local
-        self.vel_pub = self.create_publisher(PositionTarget, "/nav/velocity", 10)
+        # 发布到 <ns>/nav/velocity，避免多机冲突；仍由本节点桥接到 <ns>/mavros/setpoint_raw/local
+        nav_vel_topic = (self._mavros_prefix + "/nav/velocity") if self._mavros_prefix else "/nav/velocity"
+        self.vel_pub = self.create_publisher(PositionTarget, nav_vel_topic, 10)
+        try:
+            self.get_logger().info(f"Velocity topic: {nav_vel_topic}")
+        except Exception:
+            pass
         # （若要直接控制 MAVROS，可以改成 /mavros/setpoint_raw/local，但你要求保持现状）
 
         # --- integrated velocity bridge (/nav/velocity -> /mavros/setpoint_raw/local) ---
         # 直接在本节点内实现原 examples/vel.py 的功能，保持完全一致（30Hz 发布）
-        self.mavros_vel_pub = self.create_publisher(PositionTarget, "/mavros/setpoint_raw/local", 10)
+        self.mavros_vel_pub = self.create_publisher(PositionTarget, self._mavros_prefix + "/mavros/setpoint_raw/local", 10)
         self._bridge_last_velocity = PositionTarget()
         self._bridge_last_velocity.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
-        self.create_subscription(PositionTarget, "/nav/velocity", self._bridge_nav_velocity_cb, 10)
+        self.create_subscription(PositionTarget, nav_vel_topic, self._bridge_nav_velocity_cb, 10)
         self._bridge_timer = self.create_timer(1.0 / 30.0, self._bridge_publish_velocity)
         try:
             self.get_logger().info("Integrated velocity bridge active (30 Hz)")
@@ -400,9 +422,9 @@ class IsaacSimEnv(Node):
             pass
 
         # --- services ---
-        self.arming_client    = self.create_client(CommandBool, "/mavros/cmd/arming")
-        self.set_mode_client  = self.create_client(SetMode,    "/mavros/set_mode")
-        self.cmdlong_client   = self.create_client(CommandLong,"/mavros/cmd/command")
+        self.arming_client    = self.create_client(CommandBool, self._mavros_prefix + "/mavros/cmd/arming")
+        self.set_mode_client  = self.create_client(SetMode,    self._mavros_prefix + "/mavros/set_mode")
+        self.cmdlong_client   = self.create_client(CommandLong,self._mavros_prefix + "/mavros/cmd/command")
 
         # FCU 连接等待改为外部方法，在启动 MAVROS 之后调用
 
@@ -415,10 +437,6 @@ class IsaacSimEnv(Node):
         self.offb_set_mode = SetMode.Request()
         self.arm_cmd       = CommandBool.Request()
         self.last_req_time = self.get_clock().now()
-
-        # # image buffers
-        # self.rgb_image   = np.zeros((480, 640, 3), dtype=np.uint8)
-        # self.depth_image = np.zeros((480, 640, 1), dtype=np.float32)
 
         # RC
         self.current_rc_in = None
@@ -433,6 +451,95 @@ class IsaacSimEnv(Node):
 
         # Setup Socket
         self._setup_socket()
+
+        # --- helper: configure MAVROS time sync after launch (as a method) ---
+        # Intention: reduce/disable TIMESYNC to avoid PX4 "RTT too high" warnings
+        # Tries setting params on '/<ns>/mavros/time', then falls back to '/<ns>/mavros'
+        # Safe to call multiple times; ignores missing services gracefully.
+        def _make_param(name: str, value):
+            p = Parameter()
+            p.name = name
+            pv = ParameterValue()
+            if isinstance(value, bool):
+                pv.type = ParameterType.PARAMETER_BOOL
+                pv.bool_value = value
+            elif isinstance(value, (float, int)):
+                pv.type = ParameterType.PARAMETER_DOUBLE
+                pv.double_value = float(value)
+            else:
+                pv.type = ParameterType.PARAMETER_STRING
+                pv.string_value = str(value)
+            p.value = pv
+            return p
+
+        def _set_params(node_path: str, params: dict, timeout_sec: float = 3.0) -> bool:
+            try:
+                client = self.create_client(SetParameters, f"{node_path}/set_parameters")
+            except Exception:
+                return False
+            if not client.wait_for_service(timeout_sec=timeout_sec):
+                return False
+            req = SetParameters.Request()
+            req.parameters = [_make_param(k, v) for k, v in params.items()]
+            try:
+                future = client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+                result = future.result()
+                ok = True
+                if result is None:
+                    ok = False
+                else:
+                    for r in result.results:
+                        if not r.successful:
+                            ok = False
+                            break
+                return ok
+            except Exception:
+                return False
+
+        def configure_mavros_time_plugin_method():
+            ns_prefix = self._mavros_prefix or ""
+            # Primary: set on dedicated time node
+            time_node = f"{ns_prefix}/mavros/time" if ns_prefix else "/mavros/time"
+            base_params = {
+                # Prefer SYSTEM_TIME only; disable TIMESYNC messages
+                "timesync_mode": "MAVLINK",
+                "timesync_rate": 0.0,
+                "system_time_rate": 1.0,
+                # Always use wall-clock in MAVROS
+                "use_sim_time": False,
+            }
+            ok = _set_params(time_node, base_params, timeout_sec=3.0)
+            if ok:
+                try:
+                    self.get_logger().info("Configured MAVROS time plugin (timesync disabled, system_time_rate=1Hz)")
+                except Exception:
+                    pass
+                return True
+
+            # Fallback: set on main mavros node with namespaced parameters
+            main_node = f"{ns_prefix}/mavros" if ns_prefix else "/mavros"
+            fallback_params = {
+                "time.timesync_mode": "MAVLINK",
+                "time.timesync_rate": 0.0,
+                "time.system_time_rate": 1.0,
+                "use_sim_time": False,
+            }
+            ok2 = _set_params(main_node, fallback_params, timeout_sec=3.0)
+            if ok2:
+                try:
+                    self.get_logger().info("Configured MAVROS (fallback on main node)")
+                except Exception:
+                    pass
+                return True
+            try:
+                self.get_logger().warn("Failed to configure MAVROS time sync parameters; proceeding anyway")
+            except Exception:
+                pass
+            return False
+
+        # expose as instance method
+        self.configure_mavros_time_plugin = configure_mavros_time_plugin_method
 
     # ---------- Callbacks ----------
     def state_cb(self, msg: State):
@@ -504,17 +611,35 @@ class IsaacSimEnv(Node):
         self.get_logger().info(f"Current height: {self.start_height}")
         target_x, target_y, target_z = 0.0, 0.0, self.start_height + self.init_height
         has_reached_initial_point = False
+        # Initialize tqdm for progress display
+        progress_bar = tqdm(total=100, desc="Takeoff Progress", unit="%")
         while not has_reached_initial_point:
-            self.get_logger().info(f"Publishing takeoff setpoint...{target_x}, {target_y}, {target_z}")
+            # Publishing takeoff setpoint
             self.pub_position(target_x, target_y, target_z)
             dx = self.current_pose.pose.position.x - target_x
             dy = self.current_pose.pose.position.y - target_y
-            dz = self.current_pose.pose.position.z - target_z
-            if math.sqrt(dx*dx + dy*dy + dz*dz) < 0.1:
+            dz = self.current_pose.pose.position.z - target_z  
+            # Calculate the distance to target
+            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+            # Assuming you want to update progress based on distance to the target
+            progress = max(0, min(100, (1 - distance / self.init_height) * 100))  # Progress percentage based on height change
+            progress_bar.n = progress
+            progress_bar.last_print_n = progress
+            progress_bar.update(0)  # Update the progress bar
+            # Check if reached the initial point
+            if distance < 0.1:
                 has_reached_initial_point = True
+                progress_bar.n = 100  # Set progress to 100% when the target is reached
+                progress_bar.last_print_n = 100
+                progress_bar.update(0)  # Force update to 100%
                 self.get_logger().info("***** Reached initial point *****")
             rclpy.spin_once(self, timeout_sec=0.05)
             time.sleep(0.05)
+        # When the loop is done, ensure the progress bar is completed
+        progress_bar.n = 100
+        progress_bar.last_print_n = 100
+        progress_bar.update(0)  # Complete the progress bar
         self.get_logger().info("Takeoff complete.")
 
         # set hover target to current pose after takeoff
@@ -555,7 +680,7 @@ class IsaacSimEnv(Node):
         timeout = Duration(seconds=20.0)
         while (self.get_clock().now() - start) < timeout:
             try:
-                state = wait_for_message(self, "/mavros/state", State, timeout=2.0)
+                state = wait_for_message(self, self._mavros_prefix + "/mavros/state", State, timeout=2.0)
                 if getattr(state, "connected", False):
                     break
             except Exception:
@@ -1082,7 +1207,14 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Pegasus ROS2 IsaacSimEnv")
     parser.add_argument("--session-ts", dest="session_ts", type=int, default=None, help="Override session timestamp (int)")
+    parser.add_argument("--mavros-url", dest="mavros_url", type=str, default=None, help="MAVROS FCU URL (e.g., udp://:14540@)")
+    parser.add_argument("--mavros-ns", dest="mavros_ns", type=str, default=None, help="ROS2 namespace for MAVROS (e.g., uav0)")
+    # 允许通过 --ros-args __ns:=uavX 的方式设置命名空间（由 launch_multi_rospy 传递）
+    parser.add_argument("--output-dir", dest="output_dir", type=str, default=None, help="Override output root dir (PEGASUS_OUTPUT_DIR)")
     args, unknown = parser.parse_known_args()
+    print("[INFO] Parsed arguments:")
+    for arg, value in vars(args).items():
+        print(f"{arg}: {value}")
     # Prefer env var if provided
     env_session = os.environ.get("PEGASUS_SESSION_TS")
     session_ts = None
@@ -1100,22 +1232,74 @@ def main():
             SESSION_TS_GLOBAL = int(session_ts)
     except Exception:
         SESSION_TS_GLOBAL = None
-    # Initialize ROS with remaining args so --ros-args still works
-    rclpy.init(args=unknown)
+    # 解析可能的 ROS2 命名空间参数，避免 rclpy 对未加 --ros-args 的全局参数报错
+    # 提取 CLI 命名空间（支持 __ns:= 与 --namespace 两种形式）并从传递给 rclpy 的参数中过滤掉这些标志
+    cli_ns = None
+    filtered_unknown = []
+    i = 0
+    while i < len(unknown):
+        tok = unknown[i]
+        if tok == '--ros-args':
+            # 由上层传递给 Python 的 --ros-args 在本节点中不需要，过滤掉
+            i += 1
+            continue
+        if tok == '--namespace':
+            if i + 1 < len(unknown):
+                cli_ns = unknown[i + 1].lstrip('/')
+            i += 2
+            continue
+        if tok.startswith('--namespace='):
+            cli_ns = tok.split('--namespace=', 1)[1].lstrip('/')
+            i += 1
+            continue
+        if tok == '__ns:=':
+            if i + 1 < len(unknown):
+                cli_ns = unknown[i + 1].lstrip('/')
+            i += 2
+            continue
+        if tok.startswith('__ns:='):
+            cli_ns = tok.split('__ns:=', 1)[1].lstrip('/')
+            i += 1
+            continue
+        # 其它未知参数保留传递给 rclpy（若不被识别，rclpy 会忽略）
+        filtered_unknown.append(tok)
+        i += 1
+    # 初始化 rcl，避免将命名空间标志直接传入导致 UnknownROSArgsError
+    rclpy.init(args=filtered_unknown)
     env = None
     vel_process = None  # 已废弃：不再外部启动 vel.py，保留变量仅作占位
     mavros_process = None
     try:
-        env = IsaacSimEnv(session_ts=session_ts)
+        # Resolve MAVROS URL and namespace from env or CLI
+        # Resolve MAVROS URL/NS and output directory (prefers env, falls back to CLI, then defaults)
+        env_mavros_url = os.environ.get("MAVROS_URL")
+        env_mavros_ns = os.environ.get("MAVROS_NS")
+        mavros_url = env_mavros_url if env_mavros_url else (args.mavros_url if args.mavros_url else "udp://:14540@")
+        mavros_ns = env_mavros_ns if env_mavros_ns else (cli_ns if cli_ns else args.mavros_ns)
+        if args.output_dir:
+            os.environ["PEGASUS_OUTPUT_DIR"] = args.output_dir
+
+        env = IsaacSimEnv(session_ts=session_ts, mavros_ns=mavros_ns)
         env.get_logger().info("IsaacSimEnv node started.")
 
         # 启动 MAVROS（确保在发送命令前已运行）
         try:
+            # 强制将 MAVROS 放入命名空间：同时使用 ROS_NAMESPACE 和 --ros-args __ns:=
+            child_env = os.environ.copy()
+            # 使用 ros2 launch 启动 px4.launch，并通过其定义的参数传递 fcu_url 与 namespace
             mavros_cmd = [
                 '/opt/ros/humble/bin/ros2', 'launch', 'mavros', 'px4.launch',
-                'fcu_url:=udp://:14540@'
+                f'fcu_url:={mavros_url}'
             ]
-            mavros_process = subprocess.Popen(mavros_cmd, env=os.environ.copy(), preexec_fn=os.setsid)
+            if mavros_ns:
+                # 将 MAVROS 放入 '/<ns>/mavros' 下，使所有话题形如 '/uavX/mavros/...'
+                mavros_cmd += [f'namespace:=/{mavros_ns}/mavros']
+                child_env['ROS_NAMESPACE'] = f'/{mavros_ns}'
+            try:
+                env.get_logger().info(f"MAVROS launch cmd: {' '.join(mavros_cmd)} | ROS_NAMESPACE={child_env.get('ROS_NAMESPACE')}")
+            except Exception:
+                pass
+            mavros_process = subprocess.Popen(mavros_cmd, env=child_env, preexec_fn=os.setsid)
             env.get_logger().info("MAVROS (px4.launch) started.")
         except Exception as e:
             env.get_logger().warn(f"Failed to start MAVROS: {e}")
@@ -1128,6 +1312,16 @@ def main():
 
         env.reset()
         env.get_logger().info("Environment reset complete; switching to hover+Socket mode.")
+
+        # Configure MAVROS time sync parameters to avoid PX4 timesync RTT warnings
+        try:
+            env.get_logger().info("Configuring MAVROS time sync parameters...")
+        except Exception:
+            pass
+        try:
+            env.configure_mavros_time_plugin()
+        except Exception:
+            pass
 
         # Hover + Socket commands loop (wait for external commands)
         env.hover_and_socket_loop()
