@@ -75,9 +75,9 @@ class MultiUAVManager:
         self.vehicles = []
 
     def spawn(self):
-        env = self.config.get("environment", SIMULATION_ENVIRONMENTS.get("Curved Gridroom"))
-        self.pg.load_environment(env)
-        # self.pg.load_environment("/home/user/export/Demo_Environment.usda")
+        # env = self.config.get("environment", SIMULATION_ENVIRONMENTS.get("Curved Gridroom"))
+        # self.pg.load_environment(env)
+        self.pg.load_environment("/home/user/export/Demo_Environment.usda")
 
         for v in self.config.get("vehicles", []):
             vid = int(v.get("vehicle_id", 0))
