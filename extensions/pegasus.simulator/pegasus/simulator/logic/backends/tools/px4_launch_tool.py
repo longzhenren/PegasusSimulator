@@ -28,8 +28,6 @@ class PX4LaunchTool:
 
         # Attribute that will hold the px4 process once it is running
         self.px4_process = None
-        # Attribute for MAVROS process (deprecated; managed externally)
-        self.mavros_process = None
 
         # The vehicle id (used for the mavlink port open in the system)
         self.vehicle_id = vehicle_id
@@ -45,6 +43,7 @@ class PX4LaunchTool:
         # Set the environement variables that let PX4 know which vehicle model to use internally
         self.environment = os.environ
         self.environment["PX4_SIM_MODEL"] = px4_model
+        self.environment["PX4_UXRCE_DDS_PORT"] = str(8888 + self.vehicle_id)
 
     def launch_px4(self):
         """
@@ -65,13 +64,6 @@ class PX4LaunchTool:
             env=self.environment,
         )
 
-    def launch_mavros(self, fcu_url: str = "udp://:14540@", namespace: str = None):
-        """
-        Deprecated: MAVROS is launched and configured externally via examples/rospy_isaacsim.py.
-        This method is now a no-op to prevent accidental internal launches.
-        """
-        return None
-
     def kill_px4(self):
         """
         Method that will kill a px4 instance with the specified configuration
@@ -79,13 +71,6 @@ class PX4LaunchTool:
         if self.px4_process is not None:
             self.px4_process.kill()
             self.px4_process = None
-
-    def kill_mavros(self):
-        """
-        Deprecated: MAVROS lifecycle is managed externally.
-        This method is now a no-op.
-        """
-        return None
 
     def __del__(self):
         """
@@ -96,9 +81,6 @@ class PX4LaunchTool:
         # Make sure the PX4 process gets killed
         if self.px4_process:
             self.kill_px4()
-        # Make sure the MAVROS process gets killed
-        if self.mavros_process:
-            self.kill_mavros()
 
         # Make sure we clean the temporary filesystem used for the simulation
         self.root_fs.cleanup()
@@ -109,9 +91,7 @@ def main():
 
     px4_tool = PX4LaunchTool(os.environ["HOME"] + "/PX4-Autopilot")
     px4_tool.launch_px4()
-    # Uncomment to also launch MAVROS alongside PX4
-    # MAVROS is now managed externally; do not launch here
-
+    
     import time
 
     time.sleep(20)

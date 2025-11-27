@@ -1,118 +1,99 @@
 #!/usr/bin/env python3
 """
-Pegasus ROS2 Socket 控制接口文档（详细版）
+Pegasus ROS2 控制器（rospy_isaacsim.py）
 
 概述
-- 启动后自动拉起 MAVROS 并阻塞等待 FCU 连接成功；随后切换 OFFBOARD、解锁、自动起飞到初始高度，进入“悬停 + Socket 命令循环”。
-- 通过 TCP Socket 接收按行 JSON 命令（每行一条，换行分隔）。脚本不向 Socket 回写结果，所有响应统一写入磁盘状态目录。
-- 数据按照会话时间戳分目录保存。根目录取 `PEGASUS_OUTPUT_DIR`（若未设置则为 `PEGASUS_SAVE_DIR`，默认 `sensor_data`）。
-  - 传感器：`<GLOBAL_OUTPUT_DIR>/sensors_{session_ts}/...`
-  - 相机：`<GLOBAL_OUTPUT_DIR>/camera_{session_ts}/...`
-  - 状态：`<GLOBAL_OUTPUT_DIR>/status_{session_ts}/...`
-- 内置速度桥：订阅 `/nav/velocity`（`mavros_msgs/PositionTarget`）并以 30Hz 转发到 `/mavros/setpoint_raw/local`，与主循环频率一致。
+- 提供 ROS2 + MAVROS 控制节点以及 HTTP 控制接口，用于在仿真（Isaac Sim）中以 OFFBOARD 控制多架载具。
+- 具备任务并发保护（互斥锁）：当一个任务未完成时拒绝新的请求，除非请求包含 `force:true`。
+- 在重置流程中，优先执行降落并确认着陆后再 `disarm`，随后进行（可选）PX4 重启与重新起飞。
 
-运行时序（启动到退出）
-- 创建 ROS2 节点并初始化保存目录（基于会话时间戳）。
-- 启动 MAVROS：`ros2 launch mavros px4.launch fcu_url:=udp://:14540@`。
-- 阻塞等待 FCU 连接：`/mavros/state.connected == True`。
-- 发布初始 setpoints、防止 RTL → 切换 OFFBOARD → 解锁 → 起飞到初始高度。
-- 进入悬停循环，初始化并监听 Socket，按行处理外部命令。
-- 收到 `shutdown` 命令后优雅退出，清理 MAVROS 进程与 ROS 资源。
+架构
+- 主要类：`IsaacSimEnv`（ROS2 Node）。
+  - 订阅：`/<ns>/mavros/state`、`/<ns>/mavros/local_position/pose`、`/<ns>/mavros/rc/in`、`/<ns>/mavros/extended_state`。
+  - 服务客户端：`/<ns>/mavros/cmd/arming`、`/<ns>/mavros/set_mode`、`/<ns>/mavros/cmd/command`（PX4 reboot；若服务不存在将自动跳过）。
+  - Setpoint 发布：`/<ns>/mavros/setpoint_raw/local`（`pub_position()` 和 `pub_velocity()`）。
+  - HTTP：内嵌 Flask，提供 `/reset`、`/command`、`/step`、`/step_http`、`/health`。
+  - 悬停控制环：`_http_hover_loop()`，以 `PEGASUS_HOVER_HZ` 维持当前位置的 setpoint 发布。
 
-网络与协议
-- 监听地址与端口：`PEGASUS_CMD_HOST`（默认 `0.0.0.0`）、`PEGASUS_CMD_PORT`（默认 `8989`）。
-- 允许多个客户端同时连接；服务器使用非阻塞 `select` 循环，按行（`\n`）读取命令。
-- 命令为 JSON 文本对象，需包含 `cmd`（或 `type`）字段。无返回写回 Socket；如需持久化响应，请在命令中提供 `filename`，结果将写入状态目录对应 JSON 文件。
-- 无效 JSON 行会忽略并在日志警告。
+启动流程
+- `main()`：解析 `--mavros-ns`，创建节点，`wait_for_fcu_connection()` 阻塞等待 FCU 连接；随后执行 `reset()` 完整起飞至 `INIT_HEIGHT`，开启 HTTP 服务并进入悬停循环。
+- `wait_for_fcu_connection()`：轮询 `State.connected`，连接成功后继续。
 
-目录结构与会话管理
-- 根目录：`GLOBAL_OUTPUT_DIR = PEGASUS_OUTPUT_DIR 或 PEGASUS_SAVE_DIR(sensor_data)`。
-- 会话目录：`sensors_{session_ts}`、`camera_{session_ts}`、`status_{session_ts}`。
-- 会话切换：发送 `set_session_ts` 会立即重建并切换所有保存目录，同时更新全局 `SESSION_TS_GLOBAL`。随后所有状态与数据均写入新的会话目录。
+控制流程（核心方法）
+- `reset()`：
+  1) 预热 setpoints（50 次），避免进入 RTL/FailSafe。
+  2) 切换 `OFFBOARD`（`SetMode`）。
+  3) `arm`（`CommandBool`）。
+  4) 起飞到 `start_height + INIT_HEIGHT`，使用 `tqdm` 进度；到达后设定 `hover_target`。
+- `move_to(x,y,z)` / `move_to_many(points)`：按位置目标发布 `PositionTarget` 并以 `REACH_THRESHOLD` 检查到达。
+- `land(descend_rate)`：
+  - 每步将高度向 `start_height` 下降，调用 `wait_until_landed()` 做窗口稳定检测；着陆后调用 `disarm` 并 `wait_until_disarmed()`。
+- `wait_until_landed(target_z, timeout_s, window_s, eps)`：
+  - 结合 `ExtendedState.landed_state == ON_GROUND` 与高度接近 `target_z` 的稳定窗口判定；若满足窗口时间返回 True。
+- `reboot_px4(position,yaw_deg)`：
+  - 若已 `armed`：先 `land()`，必要时 `disarm` 并等待解除。
+  - 可选移动仿真载具位置：向仿真端 `http://127.0.0.1:8080/uav/<vid>/reset` 提交位置与 yaw。
+  - 检查服务 `/<ns>/mavros/cmd/command` 是否存在；存在则下发 `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN (246)`、`param1=1.0` 重启 PX4。
+  - 若发起重启：等待 `/<ns>/mavros/state.connected` 恢复；随后重复预热、`OFFBOARD`、`arm`、起飞至 `INIT_HEIGHT` 并设定 `hover_target`。
 
-命令列表（请求/响应/保存路径）
-- set_session_ts
-  - 请求：`{"cmd":"set_session_ts","ts":1234567890,"filename":"set_session_ok.json"}`（或使用 `session_ts` 字段）。
-  - 行为：立刻切换保存路径到新会话；写状态文件到新 `status_{ts}` 目录。
-  - 响应：`{"ok":true,"message":"session updated","session_ts":1234567890}`。
-  - 状态文件：`<GLOBAL_OUTPUT_DIR>/status_{ts}/set_session_ok.json`。
+并发控制
+- `self._task_lock` 在所有 HTTP 路由上生效：当锁被占用时返回 `409 busy`，除非请求体包含 `force:true` 允许阻塞式获取锁。
+- 路由均在异常与结束时确保释放锁，防止死锁。
 
-- move_to
-  - 请求：`{"cmd":"move_to","x":0.0,"y":0.0,"z":2.0,"filename":"move_to_ok.json"}`。
-  - 行为：发布位置期望并将悬停点设为目标；自动保存一次快照（传感器+图像，文件名包含统一时间戳）。
-  - 响应：`{"ok":true,"position":{"x":...,"y":...,"z":...}}`。
-  - 自动快照：`sensors_{ts}/sensors_data_{tag}.json`、`camera_{ts}/camera_image_{tag}.png`、`camera_{ts}/depth_image_{tag}.png`（如有深度）。
-  - 状态文件：`status_{session_ts}/move_to_ok.json`。
+HTTP 接口与示例
+- `POST /reset`
+  - 请求体：`{"vid":0, "position":[x,y,z], "yaw_deg":0.0, "force":false}`
+  - 响应：`{"status":"success","message":"reset ok","vid":0,"position":[x,y,z]}` 或 `409 busy`
+- `POST /command`
+  - `{"cmd":"move_to","x":X,"y":Y,"z":Z}` → 移动并返回当前位姿
+  - `{"cmd":"move_to_many","points":[[x,y,z],...]}` → 批量移动
+  - `{"cmd":"land"}` → 执行降落并解除
+  - `{"cmd":"get_position"}` → 返回当前位姿 `{x,y,z}`
+  - `{"cmd":"get_status"}` → 返回连接、解锁、模式
+- `POST /step` / `POST /step_http`
+  - 请求体：`{"actions": [[[x,y,z],...]], "per_step": false, "force": false}`
+  - 响应体：`{"status":"success","images":[[b64...]],"dones":[false...],"message":"Step executed successfully","batch_size":N}`
+- `GET /health`：`{"status":"healthy","env_id":"<ns>:<port>"}`
 
-- move_to_many
-  - 请求：`{"cmd":"move_to_many","points":[[0,0,2],[1,0,2],[1,1,2]],"filename":"multi_ok.json"}`。
-  - 行为：逐点移动（默认收敛阈值 0.1m），每到达一个点都会保存一次快照；结束后悬停在最后一点。
-  - 响应：`{"ok":true,"position":{...}}`（返回最终位置）。
-  - 状态文件：`status_{session_ts}/multi_ok.json`。
+图像来源
+- ROS2：`ensure_camera_subscription()` 动态选择彩色图像主题；`_encode_image_msg_to_b64()` 编码。
+- 仿真 HTTP：读取 `http://127.0.0.1:8080/uav/<vid>/image` 的 JSON 并解析 `data` 字段。
 
-- land
-  - 请求：`{"cmd":"land","filename":"land_ok.json"}`。
-  - 行为：以固定速率下降至起飞基线高度，随后尝试解锁关闭（disarm）；过程结束保存一次快照。
-  - 响应：`{"ok":true,"status":{"connected":...,"armed":...,"mode":"..."}}`。
-  - 状态文件：`status_{session_ts}/land_ok.json`。
+端口与网关
+- 控制器端口：`PEGASUS_HTTP_PORT`（默认 `5009 + vid`）。
+- 网关端口：`5008`；统一将 `/uav/<vid>/...` 转发到对应控制器端口。
+- 仿真端口：`8080`（`8_camera_vehicle.py`）。
 
-- get_position
-  - 请求：`{"cmd":"get_position","filename":"position.json"}`（`filename` 可选）。
-  - 响应：`{"ok":true,"position":{"x":...,"y":...,"z":...}}`。
-  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/position.json`。
+时间同步与稳定性
+- 配置文件 `px4_config.yaml` 设置 `timesync_rate=0.0`、`system_time_rate=10.0`；本文件还提供 `configure_mavros_time_plugin()` 运行时调整（优先在 `/<ns>/mavros/time`，回退到 `/<ns>/mavros`）。
 
-- get_status
-  - 请求：`{"cmd":"get_status","filename":"status.json"}`（`filename` 可选）。
-  - 响应：`{"ok":true,"status":{"connected":bool,"armed":bool,"mode":str}}`。
-  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/status.json`。
+错误处理与返回码
+- 连接/服务不可用时返回 `504`（超时）或 `500`（执行错误）；并发占用返回 `409 busy`。
+- PX4 reboot 服务缺失时会记录告警并跳过重启，但继续执行起飞与悬停流程。
 
-- get_sensors
-  - 请求：`{"cmd":"get_sensors","filename":"my_sensors.json"}`（`filename` 可选）。
-  - 响应：`{"ok":true,"sensors":{...}}`，其中包含：`state/pose/imu/gps/pressure/magnetic/temperature/twist` 等字段；若保存成功，附加 `saved.sensors` 路径。
-  - 传感器保存：`sensors_{session_ts}/my_sensors.json`。
-  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/my_sensors.json`（与传感器 JSON 同名但不同目录）。
+日志与度量
+- 控制器会记录起飞进度、模式切换、解锁与降落事件；配套脚本 `tools/log_status_report.py` 可提取统计指标（连接延迟、RTT 警告次数、起飞完成时间等）。
 
-- get_images
-  - 请求：`{"cmd":"get_images","filename":"frame001"}`，或分别指定 `filename_rgb`、`filename_depth`。
-  - 响应：`{"ok":true,"images":{"rgb":{"width":..,"height":..,"encoding":".."},"depth":{...},"saved":{"rgb":"...","depth":"..."}}}`。
-  - 图像保存：`camera_{session_ts}/frame001.png` 与 `camera_{session_ts}/frame001_depth.png`（若无 PIL 则保存 `.npy`）。
-  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/frame001.json`。
+接口与路由
+- `POST /reset`：重置并（可选）移动仿真位置；起飞到设定高度；支持 `force:true`。
+- `POST /command`：支持 `move_to`、`move_to_many`、`land`、`get_position`、`get_status`、`shutdown`；支持 `force:true`。
+- `POST /step`：按批次执行 waypoints 并返回图像；`POST /step_http`：图像源切换为仿真 HTTP；支持 `force:true`。
 
-- save_snapshot
-  - 请求：`{"cmd":"save_snapshot","filename":"snapshot_status.json"}`（`filename` 可选）。
-  - 行为：以当前时间戳保存一次传感器与图像快照。
-  - 响应：`{"ok":true,"saved_at":<unix_ts>}`。
-  - 状态文件：如提供 `filename`，写入 `status_{session_ts}/snapshot_status.json`。
+数据格式
+- Step 请求体：`{"actions": [[[x,y,z],...]], "per_step": false}`；仅取三元坐标。
+- Step 返回体：`{"status":"success","images":[[b64...]],"dones":[false...],"message":"Step executed successfully","batch_size":N}`。
 
-- shutdown
-  - 请求：`{"cmd":"shutdown","filename":"shutdown_ok.json"}`。
-  - 行为：请求优雅退出；主循环将置位后停止，随后清理资源与 MAVROS。
-  - 响应：`{"ok":true,"message":"Shutdown requested"}`。
-  - 状态文件：`status_{session_ts}/shutdown_ok.json`。
+环境变量
+- `MAVROS_NS`：ROS2 命名空间（如 `uav0`），用于派生实例 `vid` 与构造 `/<ns>/mavros`。
+- `PEGASUS_HTTP_PORT`：控制器端口（默认 `5009 + vid`）。
+- `PEGASUS_IMAGE_FROM_ROS`：默认图像源；`PEGASUS_IMAGE_HTTP_URL`：仿真 HTTP 基地址（默认 `http://127.0.0.1:8080`）。
+- `PEGASUS_STEP_RETURN_EACH`：逐步返回图像；`PEGASUS_INIT_HEIGHT`、`PEGASUS_REACH_THRESHOLD`、`PEGASUS_HOVER_HZ`：起飞高度、到达阈值、悬停频率。
 
-响应与状态写入说明
-- 所有命令都会在内存中构造一个响应对象 `resp`，包含至少：`ok:true/false`，失败时 `error:"..."`；部分命令附带 `position/status/images/sensors/saved_at/message` 等字段。
-- 如命令包含 `filename`，将把该 `resp` 以 `<filename>.json` 写入 `status_{session_ts}`。注：对于 `get_sensors/get_images`，同名 `filename` 也用于各自的数据保存（在 `sensors_*/camera_*` 目录），因此会产生两个同名 JSON（内容不同，位于不同目录）。
-- `set_session_ts` 响应与状态写入均在新目录下生效（会话切换为 `ts` 后立即写入）。
+稳定性与时间同步
+- 为避免 PX4 TIMESYNC RTT 过高导致不稳定：在 `px4_config.yaml` 中设置 `timesync_rate=0.0`、`system_time_rate=10.0`；控制器也提供运行时配置函数。
 
-使用示例（推荐顺序）
-1) 启动（可选外部会话时间戳）：
-   - `python3 examples/rospy_isaacsim.py --session-ts 1234567890`
-2) 连接并发送命令（默认监听 `0.0.0.0:8989`，本机可用 `127.0.0.1`）：
-   - `nc 127.0.0.1 8989`，逐行输入：
-     - `{"cmd":"set_session_ts","ts":1234567890,"filename":"set_session_ok.json"}`
-     - `{"cmd":"get_status","filename":"status.json"}`
-     - `{"cmd":"move_to","x":0,"y":0,"z":2,"filename":"move_to_ok.json"}`
-     - `{"cmd":"get_sensors","filename":"my_sensors.json"}`
-     - `{"cmd":"get_images","filename":"frame001"}`
-     - `{"cmd":"shutdown","filename":"shutdown_ok.json"}`
-
-先后顺序建议与注意事项
-- 建议顺序：`set_session_ts`（可选）→ `get_status` → 运动控制（`move_to`/`move_to_many`/`land`）→ 数据采集（`get_sensors`/`get_images`/`save_snapshot`）→ `shutdown`。
-- 可在运行中多次发送 `set_session_ts` 实现会话切换；切换后立即生效，新的状态与数据写入新目录。
-- `move_to/move_to_many/land` 会自动保存快照；图像保存需要 RGB/深度话题存在，且无 PIL 时将保存为 `.npy`。
-- Socket 不返回响应到客户端；如需结果，请设置 `filename` 以在 `status_{session_ts}` 中查看。
-- 需要正确的 ROS2 环境与 MAVROS 安装；默认 `fcu_url:=udp://:14540@` 适用于 PX4 SITL。
+端到端关系
+- 仿真端（`8_camera_vehicle.py`）在 `8080` 暴露 `/uav/<id>/all|image|pose|reset`；控制器在 `5009+id` 暴露控制接口；网关在 `5008` 统一转发。
 """
 # --- ROS 2 & System Imports ---
 import rclpy
@@ -124,27 +105,33 @@ import time
 import math
 import os
 import sys
-import subprocess
-import signal
-import select
-import socket
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from tqdm import tqdm
-
+import base64
+from io import BytesIO
 import numpy as np
 try:
     from PIL import Image as PILImage
 except Exception:
     PILImage = None
+
+# HTTP server (Flask) for exposing command endpoints
+try:
+    from flask import Flask, request, jsonify
+    _FLASK_AVAILABLE = True
+except Exception:
+    _FLASK_AVAILABLE = False
+if not _FLASK_AVAILABLE:
+    print("[ERROR] Flask not installed. Please 'pip install flask' and retry.")
+    sys.exit(2)
+from threading import Thread
+import threading
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from geometry_msgs.msg import PoseStamped
-from mavros_msgs.msg import State, RCIn, PositionTarget
+from mavros_msgs.msg import State, RCIn, PositionTarget, ExtendedState
+from sensor_msgs.msg import Image
 from mavros_msgs.srv import CommandBool, SetMode, CommandLong
-
-# Additional sensor/image message types (generic, not IsaacSim-specific)
-from sensor_msgs.msg import Image, Imu, NavSatFix, FluidPressure, MagneticField, Temperature
-from geometry_msgs.msg import TwistStamped
 
 # ---------------- Helper: spin rate ----------------
 def spin_sleep(node: Node, hz: float):
@@ -153,107 +140,14 @@ def spin_sleep(node: Node, hz: float):
     rclpy.spin_once(node, timeout_sec=0.0)
     time.sleep(period)
 
-# ---------------- Global saving toggles & defaults ----------------
-SAVE_ENABLED = True
-SAVE_SENSORS = True
-SAVE_IMAGES = True
-SAVE_DEPTH = True
-SAVE_DIR = os.environ.get("PEGASUS_SAVE_DIR", "sensor_data")
-GLOBAL_OUTPUT_DIR = os.environ.get("PEGASUS_OUTPUT_DIR", SAVE_DIR)
-SESSION_TS_GLOBAL: Optional[int] = None
-
-# Camera topics (can be overridden by env vars)
-CAMERA_RGB_TOPIC = os.environ.get("PEGASUS_CAMERA_RGB", "/camera/color/image_raw")
-CAMERA_DEPTH_TOPIC = os.environ.get("PEGASUS_CAMERA_DEPTH", "/camera/depth/image_raw")
-
-# Socket host/port (input commands). Commands may include a `filename` field to write status JSON.
-DEFAULT_CMD_HOST = os.environ.get("PEGASUS_CMD_HOST", "0.0.0.0")
-DEFAULT_CMD_PORT = int(os.environ.get("PEGASUS_CMD_PORT", "8989"))
-
-# Utility: current unix seconds as int
-def now_int() -> int:
-    return int(time.time())
-
-def ensure_dir(path: str):
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
-
-def _numpy_from_ros_image(msg: Image) -> Optional[np.ndarray]:
-    try:
-        dtype = None
-        channels = 1
-        enc = msg.encoding.lower() if msg.encoding else ""
-        if enc in ("rgb8", "bgr8"):
-            dtype = np.uint8
-            channels = 3
-        elif enc in ("mono8",):
-            dtype = np.uint8
-            channels = 1
-        elif enc in ("16uc1", "mono16"):
-            dtype = np.uint16
-            channels = 1
-        elif enc in ("32fc1",):
-            dtype = np.float32
-            channels = 1
-        else:
-            # Fallback assume 8-bit RGB if step matches width*3
-            if msg.step == msg.width * 3:
-                dtype = np.uint8
-                channels = 3
-            elif msg.step == msg.width * 2:
-                dtype = np.uint16
-                channels = 1
-            elif msg.step == msg.width * 4:
-                dtype = np.float32
-                channels = 1
-            else:
-                dtype = np.uint8
-                channels = 1
-        arr = np.frombuffer(msg.data, dtype=dtype)
-        if channels == 3:
-            arr = arr.reshape((msg.height, msg.width, 3))
-            if enc == "bgr8":
-                arr = arr[:, :, ::-1]
-        else:
-            arr = arr.reshape((msg.height, msg.width))
-        return arr
-    except Exception:
-        return None
-
-def _save_depth_png(depth: np.ndarray, out_path: str, depth_max: float = 10.0):
-    try:
-        # normalize to 16-bit PNG
-        arr = depth.copy()
-        if arr.dtype == np.float32 or arr.dtype == np.float64:
-            arr = np.nan_to_num(arr, nan=0.0, posinf=depth_max, neginf=0.0)
-            arr = np.clip(arr, 0.0, depth_max)
-            arr = (arr / depth_max * 65535.0).astype(np.uint16)
-        elif arr.dtype == np.uint16:
-            # assume millimeters; convert to meters based on plausible scale if values look large
-            # If max > 1000, consider mm and scale to meters then to 16-bit range
-            maxv = float(np.max(arr)) if arr.size else 0.0
-            if maxv > 1000.0:
-                arr_m = arr.astype(np.float32) / 1000.0
-                arr_m = np.clip(arr_m, 0.0, depth_max)
-                arr = (arr_m / depth_max * 65535.0).astype(np.uint16)
-            else:
-                arr = np.clip(arr, 0, 65535).astype(np.uint16)
-        else:
-            # unknown dtype; convert to 16-bit
-            arr = arr.astype(np.uint16)
-        if PILImage is not None:
-            img = PILImage.fromarray(arr, mode='I;16')
-            img.save(out_path)
-        else:
-            # Fallback: save as raw .npy if PIL missing
-            np.save(out_path.replace('.png', '.npy'), arr)
-    except Exception:
-        try:
-            np.save(out_path.replace('.png', '.npy'), depth)
-        except Exception:
-            pass
+DEFAULT_HTTP_PORT = int(os.environ.get("PEGASUS_HTTP_PORT", "5008"))
+# 图像来源开关：True=从ROS2 topic读取；False=从8_camera_vehicle的HTTP接口读取
+IMAGE_FROM_ROS = os.environ.get("PEGASUS_IMAGE_FROM_ROS", "1") not in ("0", "false", "False")
+IMAGE_HTTP_URL = os.environ.get("PEGASUS_IMAGE_HTTP_URL", "http://127.0.0.1:8080")
+STEP_RETURN_EACH = os.environ.get("PEGASUS_STEP_RETURN_EACH", "0") in ("1", "true", "True")
+INIT_HEIGHT = float(os.environ.get("PEGASUS_INIT_HEIGHT", "5.0"))
+REACH_THRESHOLD = float(os.environ.get("PEGASUS_REACH_THRESHOLD", "0.1"))
+CONTROL_LOOP_HZ = float(os.environ.get("PEGASUS_HOVER_HZ", "30.0"))
 
 # ---------------- Helper: wait for a single message ----------------
 def wait_for_message(node: Node, topic: str, msg_type, timeout: float = None):
@@ -265,8 +159,6 @@ def wait_for_message(node: Node, topic: str, msg_type, timeout: float = None):
 
     def _cb(msg):
         got_msg["msg"] = msg
-
-
 
     best_effort_qos = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -308,8 +200,17 @@ class IsaacSimEnv(Node):
     ROS2 + PX4 (MAVROS) compatible env.
     Mimics original RosEnv's reset()/step() ordering & semantics.
     """
-    def __init__(self, session_ts: Optional[int] = None, mavros_ns: Optional[str] = None):
-        super().__init__("isaac_sim_nav_node")
+    def __init__(self, mavros_ns: Optional[str] = None):
+        try:
+            ns = (mavros_ns or "").strip()
+            if ns.startswith("uav"):
+                self._vid = int(ns[3:])
+            else:
+                self._vid = 0
+        except Exception:
+            self._vid = 0
+        
+        super().__init__(f"isaac_sim_nav_node_{self._vid}")
 
         # --- params / buffers ---
         self.depth_max_dis = 10.0
@@ -317,52 +218,13 @@ class IsaacSimEnv(Node):
         self.current_pose = PoseStamped()
         self.current_state = State()
 
-        # saving/session context
-        # Allow external session timestamp override (env/CLI) or module global
-        global SESSION_TS_GLOBAL
-        if session_ts is not None:
-            self.session_ts = session_ts
-        elif SESSION_TS_GLOBAL is not None:
-            self.session_ts = SESSION_TS_GLOBAL
-        else:
-            self.session_ts = now_int()
-        # keep module global in sync
-        SESSION_TS_GLOBAL = self.session_ts
-        self.save_enabled = SAVE_ENABLED
-        self.save_sensors = SAVE_SENSORS
-        self.save_images = SAVE_IMAGES
-        self.save_depth = SAVE_DEPTH
-        self.save_root = GLOBAL_OUTPUT_DIR
-        self.sensors_dir = os.path.join(self.save_root, f"sensors_{self.session_ts}")
-        self.camera_dir = os.path.join(self.save_root, f"camera_{self.session_ts}")
-        self.status_dir = os.path.join(self.save_root, f"status_{self.session_ts}")
-        ensure_dir(self.sensors_dir)
-        ensure_dir(self.camera_dir)
-        ensure_dir(self.status_dir)
-
-        # Socket command processing
-        self.cmd_sock_host = DEFAULT_CMD_HOST
-        self.cmd_sock_port = DEFAULT_CMD_PORT
-        self.listen_sock = None
-        self.client_socks = []
-        self._sock_buffers = {}
-        self._last_action_tag = None  # int seconds used to name saved files
+        # HTTP 命令处理（通过 Flask 路由
         self._shutdown_requested = False
 
         # MAVROS namespace support: build topic/service prefix
         self._mavros_ns = mavros_ns if mavros_ns is not None else os.environ.get("MAVROS_NS", None)
         self._mavros_prefix = f"/{self._mavros_ns}" if self._mavros_ns else ""
-
-        # Resolve per-instance camera topics; if env not set, fall back to namespaced defaults
-        env_rgb = os.environ.get("PEGASUS_CAMERA_RGB")
-        env_depth = os.environ.get("PEGASUS_CAMERA_DEPTH")
-        self._camera_rgb_topic = env_rgb if env_rgb else (self._mavros_prefix + "/camera/color/image_raw" if self._mavros_prefix else "/camera/color/image_raw")
-        self._camera_depth_topic = env_depth if env_depth else (self._mavros_prefix + "/camera/depth/image_raw" if self._mavros_prefix else "/camera/depth/image_raw")
-        try:
-            self.get_logger().info(f"Using CAMERA topics: rgb={self._camera_rgb_topic}, depth={self._camera_depth_topic}")
-        except Exception:
-            pass
-
+        
         # # --- subscribers (adjust topics to your bridge) ---
         best_effort_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -374,52 +236,13 @@ class IsaacSimEnv(Node):
         self.create_subscription(State, self._mavros_prefix + "/mavros/state", self.state_cb, best_effort_qos)
         self.create_subscription(PoseStamped, self._mavros_prefix + "/mavros/local_position/pose", self.pose_cb, best_effort_qos)
         self.create_subscription(RCIn, self._mavros_prefix + "/mavros/rc/in", self.rc_in_callback, best_effort_qos)
-
-        # Sensor topics
-        self.last_imu: Optional[Imu] = None
-        self.last_navsat: Optional[NavSatFix] = None
-        self.last_pressure: Optional[FluidPressure] = None
-        self.last_mag: Optional[MagneticField] = None
-        self.last_temp: Optional[Temperature] = None
-        self.last_twist: Optional[TwistStamped] = None
-        self.create_subscription(Imu, self._mavros_prefix + "/mavros/imu/data", self.imu_cb, best_effort_qos)
-        self.create_subscription(NavSatFix, self._mavros_prefix + "/mavros/global_position/raw/fix", self.navsat_cb, best_effort_qos)
-        self.create_subscription(FluidPressure, self._mavros_prefix + "/mavros/imu/static_pressure", self.pressure_cb, best_effort_qos)
-        self.create_subscription(MagneticField, self._mavros_prefix + "/mavros/imu/mag", self.mag_cb, best_effort_qos)
-        self.create_subscription(Temperature, self._mavros_prefix + "/mavros/imu/temperature", self.temp_cb, best_effort_qos)
-        self.create_subscription(TwistStamped, self._mavros_prefix + "/mavros/local_position/velocity", self.twist_cb, best_effort_qos)
-
-        # Image topics (rgb + depth)
-        self.last_rgb_img: Optional[Image] = None
-        self.last_depth_img: Optional[Image] = None
-        try:
-            self.create_subscription(Image, self._camera_rgb_topic, self.rgb_cb, best_effort_qos)
-            self.create_subscription(Image, self._camera_depth_topic, self.depth_cb, best_effort_qos)
-        except Exception:
-            # Topics may not exist; keep subscribers optional
-            pass
+        self.extended_state = ExtendedState()
+        self.create_subscription(ExtendedState, self._mavros_prefix + "/mavros/extended_state", self.extended_state_cb, best_effort_qos)
 
         # --- publishers ---
-        # 发布到 <ns>/nav/velocity，避免多机冲突；仍由本节点桥接到 <ns>/mavros/setpoint_raw/local
-        nav_vel_topic = (self._mavros_prefix + "/nav/velocity") if self._mavros_prefix else "/nav/velocity"
-        self.vel_pub = self.create_publisher(PositionTarget, nav_vel_topic, 10)
-        try:
-            self.get_logger().info(f"Velocity topic: {nav_vel_topic}")
-        except Exception:
-            pass
-        # （若要直接控制 MAVROS，可以改成 /mavros/setpoint_raw/local，但你要求保持现状）
-
-        # --- integrated velocity bridge (/nav/velocity -> /mavros/setpoint_raw/local) ---
-        # 直接在本节点内实现原 examples/vel.py 的功能，保持完全一致（30Hz 发布）
-        self.mavros_vel_pub = self.create_publisher(PositionTarget, self._mavros_prefix + "/mavros/setpoint_raw/local", 10)
-        self._bridge_last_velocity = PositionTarget()
-        self._bridge_last_velocity.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
-        self.create_subscription(PositionTarget, nav_vel_topic, self._bridge_nav_velocity_cb, 10)
-        self._bridge_timer = self.create_timer(1.0 / 30.0, self._bridge_publish_velocity)
-        try:
-            self.get_logger().info("Integrated velocity bridge active (30 Hz)")
-        except Exception:
-            pass
+        # 直接控制：向 MAVROS /mavros/setpoint_raw/local 发布 PositionTarget
+        self.raw_setpoint_pub = self.create_publisher(PositionTarget, self._mavros_prefix + "/mavros/setpoint_raw/local", 10)
+        self.get_logger().info(f"Direct setpoint publisher: {self._mavros_prefix}/mavros/setpoint_raw/local")
 
         # --- services ---
         self.arming_client    = self.create_client(CommandBool, self._mavros_prefix + "/mavros/cmd/arming")
@@ -427,7 +250,7 @@ class IsaacSimEnv(Node):
         self.cmdlong_client   = self.create_client(CommandLong,self._mavros_prefix + "/mavros/cmd/command")
 
         # FCU 连接等待改为外部方法，在启动 MAVROS 之后调用
-
+        self.get_logger().info(f"UAV{self._vid} Waiting for FCU connection...")
         # --- 先发送一段时间的零速度（原始逻辑 for _ in range(100)）---
         for _ in range(100):
             self.pub_velocity(0.0, 0.0, 0.0, 0.0)
@@ -444,14 +267,35 @@ class IsaacSimEnv(Node):
 
         # 轨迹（可选：若你要跑轨迹）
         self.waypoints = []
-        self.init_height = 0.5  # 起飞高度
+        self.init_height = INIT_HEIGHT  # 起飞高度
 
-        # Hover target maintained while waiting for FIFO commands
+        # Hover target maintained while waiting for HTTP commands
         self.hover_target = None  # (x, y, z)
 
-        # Setup Socket
-        self._setup_socket()
-
+        # Setup HTTP server exposing env_server-compatible API (non-blocking, minimal changes)
+        # 端口从环境变量或命令行参数读取，允许多机按端口区分
+        
+        # 默认端口按车辆ID映射: gateway=5008, controllers从5009开始
+        default_port = 5009 + int(self._vid) if self._vid is not None else DEFAULT_HTTP_PORT
+        self._http_port = int(os.environ.get("PEGASUS_HTTP_PORT", str(default_port)))
+        self.get_logger().info(f"HTTP server port: {self._http_port}")
+        # env_id 用于健康检查区分不同实例（命名空间+端口）
+        self._env_id = f"{self._mavros_ns or 'default'}:{self._http_port}"
+        self._http_app = None
+        self._http_thread = None
+        self._task_lock = threading.Lock()
+        # Minimal batch state placeholders to match env_server's responses
+        self._batch_states: List[Dict[str, Any]] = []
+        self._batch_size: int = 0
+        self._json_name_list: List[Optional[str]] = []
+        self._instructions_list: List[Optional[str]] = []
+        self._color_topic: Optional[str] = None
+        self._color_sub = None
+        self._last_color_msg: Optional[Image] = None
+        self._image_from_ros = bool(IMAGE_FROM_ROS)
+        self._image_http_base = str(IMAGE_HTTP_URL)
+        self._step_return_each = bool(STEP_RETURN_EACH)
+        self._setup_http_server()
         # --- helper: configure MAVROS time sync after launch (as a method) ---
         # Intention: reduce/disable TIMESYNC to avoid PX4 "RTT too high" warnings
         # Tries setting params on '/<ns>/mavros/time', then falls back to '/<ns>/mavros'
@@ -502,11 +346,9 @@ class IsaacSimEnv(Node):
             # Primary: set on dedicated time node
             time_node = f"{ns_prefix}/mavros/time" if ns_prefix else "/mavros/time"
             base_params = {
-                # Prefer SYSTEM_TIME only; disable TIMESYNC messages
-                "timesync_mode": "MAVLINK",
-                "timesync_rate": 0.0,
-                "system_time_rate": 1.0,
-                # Always use wall-clock in MAVROS
+                "timesync_mode": "MAVLINK",  # use MAVLink SYSTEM_TIME only
+                "timesync_rate": 0.0,         # disable TIMESYNC messages to avoid RTT checks
+                "system_time_rate": 10.0,     # increase SYSTEM_TIME to 10Hz for stability
                 "use_sim_time": False,
             }
             ok = _set_params(time_node, base_params, timeout_sec=3.0)
@@ -522,7 +364,7 @@ class IsaacSimEnv(Node):
             fallback_params = {
                 "time.timesync_mode": "MAVLINK",
                 "time.timesync_rate": 0.0,
-                "time.system_time_rate": 1.0,
+                "time.system_time_rate": 10.0,
                 "use_sim_time": False,
             }
             ok2 = _set_params(main_node, fallback_params, timeout_sec=3.0)
@@ -541,42 +383,228 @@ class IsaacSimEnv(Node):
         # expose as instance method
         self.configure_mavros_time_plugin = configure_mavros_time_plugin_method
 
+    # ---------- HTTP helpers ----------
+    def _setup_http_server(self):
+        app = Flask(f"MAVROS_Based_UAV_Controller_{self._vid}")
+        @app.route('/reset', methods=['POST'])
+        def http_reset():
+            try:
+                data = request.json or {}
+                force = bool(data.get("force", False))
+                acquired = self._task_lock.acquire(blocking=force)
+                if not acquired:
+                    return jsonify({"status": "error", "message": "busy"}), 409
+                vid = data.get("vid")
+                pos = data.get("position") or data.get("pos")
+                yaw_deg = data.get("yaw_deg")
+                try:
+                    vid = int(vid) if vid is not None else None
+                except Exception:
+                    if acquired:
+                        try:
+                            self._task_lock.release()
+                        except Exception:
+                            pass
+                    return jsonify({"status": "error", "message": "vid must be int"}), 400
+                if vid is not None and vid != self._vid:
+                    if acquired:
+                        try:
+                            self._task_lock.release()
+                        except Exception:
+                            pass
+                    return jsonify({"status": "error", "message": f"vid mismatch: expected {self._vid}, got {vid}"}), 400
+                if pos is not None and (not isinstance(pos, (list, tuple)) or len(pos) < 3):
+                    if acquired:
+                        try:
+                            self._task_lock.release()
+                        except Exception:
+                            pass
+                    return jsonify({"status": "error", "message": "position must be [x,y,z]"}), 400
+                self._batch_size = 1
+                self._batch_states = [{"done": False}]
+                self._json_name_list = [None]
+                self._instructions_list = [None]
+                try:
+                    self.reboot_px4(pos, yaw_deg)
+                    return jsonify({"status": "success", "message": "reset ok", "vid": vid, "position": pos})
+                finally:
+                    if acquired:
+                        try:
+                            self._task_lock.release()
+                        except Exception:
+                            pass
+            except TimeoutError as e:
+                return jsonify({"status": "error", "message": str(e)}), 504
+            except Exception as e:
+                return jsonify({"status": "error", "message": str(e)}), 500
+        @app.route('/command', methods=['POST'])
+        def http_command():
+            try:
+                data = request.json or {}
+                force = bool(data.get("force", False))
+                acquired = self._task_lock.acquire(blocking=force)
+                if not acquired:
+                    return jsonify({"ok": False, "error": "busy"}), 409
+                if not isinstance(data, dict):
+                    if acquired:
+                        try:
+                            self._task_lock.release()
+                        except Exception:
+                            pass
+                    return jsonify({"ok": False, "error": "JSON body must be an object"}), 400
+                try:
+                    self.get_logger().info(f"HTTP /command: {data}")
+                except Exception:
+                    pass
+                try:
+                    resp = self.process_command(data)
+                finally:
+                    if acquired:
+                        try:
+                            self._task_lock.release()
+                        except Exception:
+                            pass
+                try:
+                    self.get_logger().info(f"HTTP /command resp: {resp}")
+                except Exception:
+                    pass
+                return jsonify(resp)
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)}), 500
+        @app.route('/step', methods=['POST'])
+        def http_step():
+            try:
+                data = request.json or {}
+                force = bool(data.get("force", False))
+                acquired = self._task_lock.acquire(blocking=force)
+                if not acquired:
+                    return jsonify({"status": "error", "message": "busy"}), 409
+                try:
+                    self.get_logger().info(f"HTTP /step: {data}")
+                except Exception:
+                    pass
+                try:
+                    resp, code = self._process_step_api(data, use_ros_image=True)
+                finally:
+                    if acquired:
+                        try:
+                            self._task_lock.release()
+                        except Exception:
+                            pass
+                try:
+                    self.get_logger().info(f"HTTP /step resp: {resp}")
+                except Exception:
+                    pass
+                return jsonify(resp), code
+            except Exception as e:
+                return jsonify({"status": "error", "message": str(e)}), 500
+        @app.route('/step_http', methods=['POST'])
+        def http_step_http():
+            try:
+                data = request.json or {}
+                force = bool(data.get("force", False))
+                acquired = self._task_lock.acquire(blocking=force)
+                if not acquired:
+                    return jsonify({"status": "error", "message": "busy"}), 409
+                try:
+                    self.get_logger().info(f"HTTP /step_http: {data}")
+                except Exception:
+                    pass
+                try:
+                    resp, code = self._process_step_api(data, use_ros_image=False)
+                finally:
+                    if acquired:
+                        try:
+                            self._task_lock.release()
+                        except Exception:
+                            pass
+                try:
+                    self.get_logger().info(f"HTTP /step_http resp: {resp}")
+                except Exception:
+                    pass
+                return jsonify(resp), code
+            except Exception as e:
+                return jsonify({"status": "error", "message": str(e)}), 500
+        @app.route('/health', methods=['GET'])
+        def http_health():
+            return jsonify({"status": "healthy", "env_id": self._env_id})
+        self._http_app = app
+
+    def _process_step_api(self, data: Dict[str, Any], use_ros_image: bool) -> Tuple[Dict[str, Any], int]:
+        actions_batch = data.get("actions", None)
+        if actions_batch is None or not isinstance(actions_batch, list) or len(actions_batch) == 0:
+            return {"status": "error", "message": "actions is required and must be a non-empty list"}, 400
+        if not self._batch_states:
+            return {"status": "error", "message": "Environment not reset. Please call /reset first."}, 400
+        first_actions = actions_batch[0] if actions_batch else []
+        per_step = bool(data.get("per_step", self._step_return_each))
+        old = self._image_from_ros
+        self._image_from_ros = bool(use_ros_image)
+        pts: List[List[float]] = []
+        if isinstance(first_actions, list) and len(first_actions) > 0:
+            for pt in first_actions:
+                if isinstance(pt, (list, tuple)) and len(pt) >= 3:
+                    pts.append([float(pt[0]), float(pt[1]), float(pt[2])])
+        images_batch: List[List[str]] = []
+        done_batch: List[bool] = []
+        if pts:
+            if per_step and len(pts) > 1:
+                frames: List[str] = []
+                for x, y, z in pts:
+                    self.move_to_many([[x, y, z]])
+                    b = self._capture_image_b64()
+                    if b:
+                        frames.append(b)
+                images_batch.append(frames)
+            else:
+                self.move_to_many(pts)
+                b = self._capture_image_b64()
+                images_batch.append([b] if b else [])
+        for _ in range(len(self._batch_states)):
+            done_batch.append(False)
+        resp = {"status": "success", "images": images_batch, "dones": done_batch, "message": "Step executed successfully", "batch_size": len(images_batch)}
+        self._image_from_ros = old
+        return resp, 200
+
+    def start_http_server(self):
+        if self._http_app is not None:
+            def _run():
+                try:
+                    self._http_app.run(host='0.0.0.0', port=self._http_port, threaded=True, debug=False, use_reloader=False)
+                except Exception:
+                    pass
+            t = Thread(target=_run, daemon=True)
+            t.start()
+            self._http_thread = t
+
+    def _http_hover_loop(self):
+        """以固定频率维持悬停，并处理 ROS 回调；HTTP 命令通过 Flask 路由触发，无需轮询。"""
+        self.get_logger().info("Entering hover + HTTP command loop...")
+        hz = CONTROL_LOOP_HZ
+        while rclpy.ok() and not self._shutdown_requested:
+            if self.hover_target is not None:
+                x, y, z = self.hover_target
+                self.pub_position(x, y, z)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(1.0 / hz)
+
     # ---------- Callbacks ----------
     def state_cb(self, msg: State):
         self.current_state = msg
 
     def pose_cb(self, msg: PoseStamped):
         self.current_pose = msg
-
+    
+    def extended_state_cb(self, msg: ExtendedState):
+        self.extended_state = msg
+    
     def rc_in_callback(self, msg: RCIn):
         self.current_rc_in = msg
-        if msg.channels and len(msg.channels) > 6:
-            self.offboard_channel_value = msg.channels[6]
-
-    # --- Sensor callbacks ---
-    def imu_cb(self, msg: Imu):
-        self.last_imu = msg
-
-    def navsat_cb(self, msg: NavSatFix):
-        self.last_navsat = msg
-
-    def pressure_cb(self, msg: FluidPressure):
-        self.last_pressure = msg
-
-    def mag_cb(self, msg: MagneticField):
-        self.last_mag = msg
-
-    def temp_cb(self, msg: Temperature):
-        self.last_temp = msg
-
-    def twist_cb(self, msg: TwistStamped):
-        self.last_twist = msg
-
-    def rgb_cb(self, msg: Image):
-        self.last_rgb_img = msg
-
-    def depth_cb(self, msg: Image):
-        self.last_depth_img = msg
+        try:
+            if msg.channels and len(msg.channels) > 6:
+                self.offboard_channel_value = msg.channels[6]
+        except Exception:
+            pass
 
     # ---------- Core API ----------
     def reset(self):
@@ -611,35 +639,43 @@ class IsaacSimEnv(Node):
         self.get_logger().info(f"Current height: {self.start_height}")
         target_x, target_y, target_z = 0.0, 0.0, self.start_height + self.init_height
         has_reached_initial_point = False
-        # Initialize tqdm for progress display
-        progress_bar = tqdm(total=100, desc="Takeoff Progress", unit="%")
+        # 优化进度条：显示为“当前高度/起飞要求高度（米）”
+        required_height = float(self.init_height)
+        progress_counter = 0
+        progress_bar = tqdm(total=required_height, desc="起飞进度", unit="m")
         while not has_reached_initial_point:
             # Publishing takeoff setpoint
             self.pub_position(target_x, target_y, target_z)
-            dx = self.current_pose.pose.position.x - target_x
-            dy = self.current_pose.pose.position.y - target_y
-            dz = self.current_pose.pose.position.z - target_z  
-            # Calculate the distance to target
-            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+            # 增加计数器，进度条每2s更新一次
+            progress_counter += 1
+            if progress_counter >= 20:  # 20Hz 对应 2s
+                progress_counter = 0
+                # 当前相对高度（相对于起飞起点）
+                cur_z = float(self.current_pose.pose.position.z)
+                climb = max(0.0, cur_z - float(self.start_height))
+                shown = min(required_height, climb)
+                # 更新进度条（将显示为 当前高度/起飞要求高度）
+                progress_bar.n = shown  
+                progress_bar.last_print_n = shown
+                progress_bar.update(0)
 
-            # Assuming you want to update progress based on distance to the target
-            progress = max(0, min(100, (1 - distance / self.init_height) * 100))  # Progress percentage based on height change
-            progress_bar.n = progress
-            progress_bar.last_print_n = progress
-            progress_bar.update(0)  # Update the progress bar
-            # Check if reached the initial point
-            if distance < 0.1:
+            # 目标距离用于完成判断
+            dx = float(self.current_pose.pose.position.x) - target_x
+            dy = float(self.current_pose.pose.position.y) - target_y
+            dz = float(self.current_pose.pose.position.z) - target_z
+            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if distance < REACH_THRESHOLD:
                 has_reached_initial_point = True
-                progress_bar.n = 100  # Set progress to 100% when the target is reached
-                progress_bar.last_print_n = 100
-                progress_bar.update(0)  # Force update to 100%
+                progress_bar.n = required_height
+                progress_bar.last_print_n = required_height
+                progress_bar.update(0)
                 self.get_logger().info("***** Reached initial point *****")
             rclpy.spin_once(self, timeout_sec=0.05)
             time.sleep(0.05)
-        # When the loop is done, ensure the progress bar is completed
-        progress_bar.n = 100
-        progress_bar.last_print_n = 100
-        progress_bar.update(0)  # Complete the progress bar
+        # 完成起飞后，确保进度条满格
+        progress_bar.n = required_height
+        progress_bar.last_print_n = required_height
+        progress_bar.update(0)
         self.get_logger().info("Takeoff complete.")
 
         # set hover target to current pose after takeoff
@@ -649,45 +685,170 @@ class IsaacSimEnv(Node):
             self.current_pose.pose.position.z,
         )
 
-    def reboot_px4(self):
-        # 原始逻辑：尝试先上“上锁 false”→ 发送 MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN → 等待重连
+    def reboot_px4(self, position: Optional[List[float]] = None, yaw_deg: Optional[float] = None):
+        vid = int(self._vid)
         try:
-            # arming false
-            if self.arming_client.wait_for_service(timeout_sec=5.0):
-                disarm_req = CommandBool.Request()
-                disarm_req.value = False
+            if bool(getattr(self.current_state, "armed", False)):
                 try:
-                    call_service_sync(self, self.arming_client, disarm_req, timeout_sec=3.0)
+                    self.get_logger().info(f"UAV{vid} landing before reset...")
                 except Exception:
                     pass
-        except Exception as e:
-            self.get_logger().warn(f"Disarm before reboot: {e}")
-
-        # MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN = 246, param1=1 reboot autopilot
-        if not self.cmdlong_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().warn("cmd/command not available, skip reboot.")
-            return
-        req = CommandLong.Request()
-        req.command = 246
-        req.param1 = 1.0
-        try:
-            call_service_sync(self, self.cmdlong_client, req, timeout_sec=5.0)
-        except Exception as e:
-            self.get_logger().warn(f"PX4 reboot command failed: {e}")
-
-        # 等待 MAVROS 重连（原始用 state.wait_for_message 循环）
-        start = self.get_clock().now()
-        timeout = Duration(seconds=20.0)
-        while (self.get_clock().now() - start) < timeout:
+                try:
+                    landed_ok = self.land()
+                except Exception:
+                    pass
+            if bool(getattr(self.current_state, "armed", False)):
+                self.get_logger().info(f"UAV{vid} disarming...")
+                if self.arming_client.wait_for_service(timeout_sec=5.0):
+                    disarm_req = CommandBool.Request()
+                    disarm_req.value = False
+                    try:
+                        call_service_sync(self, self.arming_client, disarm_req, timeout_sec=5.0)
+                        self.get_logger().info(f"UAV{vid} disarmed.")
+                    except Exception:
+                        self.get_logger().warn(f"UAV{vid} disarm failed.")
+                self.wait_until_disarmed(timeout_s=10.0)
+        except Exception:
+            self.get_logger().warn(f"UAV{vid} disarm service failed.")
+            
+        self.get_logger().info(f"UAV{vid} rebooting to position {position} yaw={yaw_deg}")
+        if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
             try:
-                state = wait_for_message(self, self._mavros_prefix + "/mavros/state", State, timeout=2.0)
-                if getattr(state, "connected", False):
+                import urllib.request, json as _json
+                url = f"{self._image_http_base}/uav/{vid}/reset"
+                payload = _json.dumps({"position": [float(position[0]), float(position[1]), float(position[2])], "yaw_deg": yaw_deg}).encode("utf-8")
+                req = urllib.request.Request(url, data=payload, method="POST")
+                req.add_header("Content-Type", "application/json")
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        _ = resp.read()
+                        self.get_logger().info(f"UAV{vid} reset response from PGSIM: {_}")
+                        self.get_logger().info(f"UAV{vid} moved in sim to {position} yaw={yaw_deg}")
+                except Exception as e:
+                    self.get_logger().warn(f"UAV{vid} reboot move Request failed. Exception: {e}")
+                    pass
+            except Exception as e:
+                self.get_logger().warn(f"UAV{vid} reboot move failed. Exception: {e}")
+                pass
+            
+        srv_name = self._mavros_prefix + "/mavros/cmd/command"
+        reboot_attempted = False
+        try:
+            names_types = self.get_service_names_and_types()
+            if any(n == srv_name for n, _ in names_types):
+                if self.cmdlong_client.wait_for_service(timeout_sec=10.0):
+                    req = CommandLong.Request()
+                    req.command = 246
+                    req.param1 = 1.0
+                    try:
+                        call_service_sync(self, self.cmdlong_client, req, timeout_sec=10.0)
+                        reboot_attempted = True
+                    except Exception as e:
+                        self.get_logger().warn(f"PX4 reboot command failed: {e}")
+                else:
+                    self.get_logger().warn("cmd/command service not ready; skip reboot")
+            else:
+                self.get_logger().warn(f"Service {srv_name} not found; skip reboot")
+        except Exception:
+            self.get_logger().warn("Service discovery failed; skip reboot")
+
+        if reboot_attempted:
+            start = time.time()
+            while (time.time() - start) < 60.0:
+                try:
+                    st = wait_for_message(self, self._mavros_prefix + "/mavros/state", State, timeout=2.0)
+                    if getattr(st, "connected", False):
+                        break
+                except Exception:
+                    self.get_logger().warn(f"UAV{vid} state check failed.")
+        self.arming_client.wait_for_service(timeout_sec=10.0)
+        self.set_mode_client.wait_for_service(timeout_sec=10.0)
+
+        # 3) 发布初始setpoints → 切换OFFBOARD→ 解锁 → 起飞到 INIT_HEIGHT（各60s超时）
+        try:
+            self.get_logger().info(f"UAV{vid} Publishing initial dummy setpoints to prevent RTL...")
+        except Exception:
+            pass
+        for _ in range(50):
+            self.pub_position(0.0, 0.0, 1.0)
+            spin_sleep(self, 20.0)
+        try:
+            self.get_logger().info(f"UAV{vid} Initial setpoints published.")
+        except Exception:
+            pass
+
+        self.offb_set_mode.custom_mode = "OFFBOARD"
+        off_start = time.time()
+        while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 60.0:
+            try:
+                resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=5.0)
+                if resp and getattr(resp, "mode_sent", False):
+                    self.get_logger().info("***** OFFBOARD enabled *****")
+            except Exception:
+                pass
+            spin_sleep(self, 2.0)
+        if self.current_state.mode != "OFFBOARD":
+            raise TimeoutError("OFFBOARD not enabled within 60s")
+        try:
+            self.get_logger().info("Vehicle in OFFBOARD mode.")
+        except Exception:
+            pass
+
+        self.arm_cmd.value = True
+        arm_start = time.time()
+        while not self.current_state.armed and (time.time() - arm_start) < 60.0:
+            try:
+                resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
+                if resp and getattr(resp, "success", False):
+                    self.get_logger().info(f"UAV{vid} ***** Vehicle armed *****")
                     break
             except Exception:
                 pass
-        # 再确认服务可用
-        self.arming_client.wait_for_service(timeout_sec=10.0)
-        self.set_mode_client.wait_for_service(timeout_sec=10.0)
+            spin_sleep(self, 2.0)
+        if not self.current_state.armed:
+            raise TimeoutError("Vehicle not armed within 60s")
+        try:
+            self.get_logger().info(f"UAV{vid} armed.")
+        except Exception:
+            pass
+
+        self.start_height = self.current_pose.pose.position.z
+        target_x, target_y, target_z = 0.0, 0.0, self.start_height + self.init_height
+        has_reached_initial_point = False
+        required_height = float(self.init_height)
+        progress_bar = tqdm(total=required_height, desc="起飞进度", unit="m")
+        while not has_reached_initial_point:
+            self.pub_position(target_x, target_y, target_z)
+            cur_z = float(self.current_pose.pose.position.z)
+            climb = max(0.0, cur_z - float(self.start_height))
+            shown = min(required_height, climb)
+            progress_bar.n = shown
+            progress_bar.last_print_n = shown
+            progress_bar.update(0)
+            dx = float(self.current_pose.pose.position.x) - target_x
+            dy = float(self.current_pose.pose.position.y) - target_y
+            dz = float(self.current_pose.pose.position.z) - target_z
+            if math.sqrt(dx*dx + dy*dy + dz*dz) < REACH_THRESHOLD:
+                has_reached_initial_point = True
+                progress_bar.n = required_height
+                progress_bar.last_print_n = required_height
+                progress_bar.update(0)
+                try:
+                    self.get_logger().info("***** Reached initial point *****")
+                except Exception:
+                    pass
+            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.05)
+        try:
+            self.get_logger().info("Takeoff complete.")
+        except Exception:
+            pass
+
+        self.hover_target = (
+            self.current_pose.pose.position.x,
+            self.current_pose.pose.position.y,
+            self.current_pose.pose.position.z,
+        )
         self.cmdlong_client.wait_for_service(timeout_sec=10.0)
         self.get_logger().info("PX4 reboot complete; MAVROS reconnected.")
 
@@ -700,12 +861,12 @@ class IsaacSimEnv(Node):
         while rclpy.ok() and not getattr(self.current_state, "connected", False):
             spin_sleep(self, 20.0)
         try:
-            self.get_logger().info("FCU connected.")
+            self.get_logger().info(f"UAV{self._vid} FCU connected.")
         except Exception:
-            pass
+            self.get_logger().info("FCU connected.")
 
     def pub_position(self, target_x, target_y, target_z):
-        # 与原始一致：位置控制 + FRAME_LOCAL_NED，通过桥接主题发送
+        # 与原始一致：位置控制 + FRAME_LOCAL_NED，直接发布到 setpoint_raw/local
         target_position = PositionTarget()
         target_position.header.stamp = self.get_clock().now().to_msg()
         target_position.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
@@ -714,10 +875,10 @@ class IsaacSimEnv(Node):
             PositionTarget.IGNORE_AFX | PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
             PositionTarget.IGNORE_YAW | PositionTarget.IGNORE_YAW_RATE
         )
-        target_position.position.x = target_x
-        target_position.position.y = target_y
-        target_position.position.z = target_z
-        self.vel_pub.publish(target_position)
+        target_position.position.x = float(target_x)
+        target_position.position.y = float(target_y)
+        target_position.position.z = float(target_z)
+        self.raw_setpoint_pub.publish(target_position)
 
     def pub_velocity(self, velocity_x, velocity_y, velocity_z, yaw_rate):
         # 与原始一致：速度控制 + FRAME_BODY_NED，通过桥接主题发送
@@ -733,161 +894,7 @@ class IsaacSimEnv(Node):
         target_velocity.velocity.y = float(velocity_y)
         target_velocity.velocity.z = float(velocity_z)
         target_velocity.yaw_rate   = float(yaw_rate)
-        self.vel_pub.publish(target_velocity)
-
-    # ---------- Integrated bridge callbacks ----------
-    def _bridge_nav_velocity_cb(self, msg: PositionTarget):
-        # 完全复刻 vel.py 的行为：接收 /nav/velocity 的最新指令并缓存
-        self._bridge_last_velocity = msg
-
-    def _bridge_publish_velocity(self):
-        # 以固定频率将最近一次的速度指令发布到 MAVROS 入口主题
-        try:
-            self.mavros_vel_pub.publish(self._bridge_last_velocity)
-        except Exception:
-            pass
-
-    # ---------- Saving helpers ----------
-    def _build_sensor_snapshot(self) -> Dict[str, Any]:
-        data: Dict[str, Any] = {}
-        # State
-        st = self.current_state
-        data["state"] = {
-            "connected": getattr(st, "connected", False),
-            "armed": getattr(st, "armed", False),
-            "mode": getattr(st, "mode", "")
-        }
-        # Pose
-        p = self.current_pose.pose
-        data["pose"] = {
-            "position": {"x": p.position.x, "y": p.position.y, "z": p.position.z},
-            "orientation": {"x": p.orientation.x, "y": p.orientation.y, "z": p.orientation.z, "w": p.orientation.w}
-        }
-        # IMU
-        if self.last_imu is not None:
-            imu = self.last_imu
-            data["imu"] = {
-                "linear_acceleration": {"x": imu.linear_acceleration.x, "y": imu.linear_acceleration.y, "z": imu.linear_acceleration.z},
-                "angular_velocity": {"x": imu.angular_velocity.x, "y": imu.angular_velocity.y, "z": imu.angular_velocity.z}
-            }
-        # GPS
-        if self.last_navsat is not None:
-            gps = self.last_navsat
-            data["gps"] = {
-                "status": int(getattr(gps.status, "status", 0)),
-                "latitude": gps.latitude,
-                "longitude": gps.longitude,
-                "altitude": gps.altitude,
-                "position_covariance_type": int(getattr(gps, "position_covariance_type", 0))
-            }
-        # Barometer
-        if self.last_pressure is not None:
-            pr = self.last_pressure
-            data["barometer"] = {"fluid_pressure": pr.fluid_pressure, "variance": pr.variance}
-        # Magnetometer
-        if self.last_mag is not None:
-            mg = self.last_mag
-            data["magnetometer"] = {"x": mg.magnetic_field.x, "y": mg.magnetic_field.y, "z": mg.magnetic_field.z}
-        # Temperature
-        if self.last_temp is not None:
-            tp = self.last_temp
-            data["temperature"] = {"temperature": tp.temperature, "variance": tp.variance}
-        # Velocity
-        if self.last_twist is not None:
-            tw = self.last_twist
-            data["velocity"] = {
-                "linear": {"x": tw.twist.linear.x, "y": tw.twist.linear.y, "z": tw.twist.linear.z},
-                "angular": {"x": tw.twist.angular.x, "y": tw.twist.angular.y, "z": tw.twist.angular.z}
-            }
-        return data
-
-    def save_snapshot(self, action_tag: Optional[int] = None):
-        if not self.save_enabled:
-            return
-        ts = action_tag if action_tag is not None else now_int()
-        # Save sensors/state
-        if self.save_sensors:
-            try:
-                ensure_dir(self.sensors_dir)
-                snap = self._build_sensor_snapshot()
-                out_json = os.path.join(self.sensors_dir, f"sensors_data_{ts}.json")
-                with open(out_json, 'w') as f:
-                    json.dump(snap, f)
-            except Exception as e:
-                self.get_logger().warn(f"Failed to save sensors snapshot: {e}")
-        # Save images
-        if self.save_images and self.last_rgb_img is not None:
-            try:
-                ensure_dir(self.camera_dir)
-                rgb_arr = _numpy_from_ros_image(self.last_rgb_img)
-                if rgb_arr is not None and PILImage is not None:
-                    rgb_img = PILImage.fromarray(rgb_arr)
-                    rgb_path = os.path.join(self.camera_dir, f"camera_image_{ts}.png")
-                    rgb_img.save(rgb_path)
-                elif rgb_arr is not None:
-                    np.save(os.path.join(self.camera_dir, f"camera_image_{ts}.npy"), rgb_arr)
-            except Exception as e:
-                self.get_logger().warn(f"Failed to save RGB image: {e}")
-        # Save depth
-        if self.save_depth and self.last_depth_img is not None:
-            try:
-                depth_arr = _numpy_from_ros_image(self.last_depth_img)
-                if depth_arr is not None:
-                    depth_path = os.path.join(self.camera_dir, f"depth_image_{ts}.png")
-                    _save_depth_png(depth_arr, depth_path, self.depth_max_dis)
-            except Exception as e:
-                self.get_logger().warn(f"Failed to save depth image: {e}")
-
-    def save_named(self, sensors_filename: Optional[str] = None, rgb_filename: Optional[str] = None, depth_filename: Optional[str] = None) -> Dict[str, Any]:
-        saved: Dict[str, Any] = {}
-        if not self.save_enabled:
-            return saved
-        # sensors
-        if self.save_sensors and sensors_filename:
-            try:
-                ensure_dir(self.sensors_dir)
-                name = sensors_filename if sensors_filename.endswith('.json') else sensors_filename + '.json'
-                out_json = os.path.join(self.sensors_dir, name)
-                with open(out_json, 'w') as f:
-                    json.dump(self._build_sensor_snapshot(), f)
-                saved['sensors'] = out_json
-            except Exception as e:
-                self.get_logger().warn(f"Failed to save named sensors file: {e}")
-        # rgb
-        if self.save_images and self.last_rgb_img is not None and rgb_filename:
-            try:
-                ensure_dir(self.camera_dir)
-                name = rgb_filename
-                if PILImage is not None:
-                    if not name.endswith('.png'):
-                        name += '.png'
-                    rgb_arr = _numpy_from_ros_image(self.last_rgb_img)
-                    if rgb_arr is not None:
-                        PILImage.fromarray(rgb_arr).save(os.path.join(self.camera_dir, name))
-                        saved['rgb'] = os.path.join(self.camera_dir, name)
-                else:
-                    if not name.endswith('.npy'):
-                        name += '.npy'
-                    rgb_arr = _numpy_from_ros_image(self.last_rgb_img)
-                    if rgb_arr is not None:
-                        np.save(os.path.join(self.camera_dir, name), rgb_arr)
-                        saved['rgb'] = os.path.join(self.camera_dir, name)
-            except Exception as e:
-                self.get_logger().warn(f"Failed to save named RGB file: {e}")
-        # depth
-        if self.save_depth and self.last_depth_img is not None and depth_filename:
-            try:
-                ensure_dir(self.camera_dir)
-                name = depth_filename
-                if not name.endswith('.png'):
-                    name += '.png'
-                depth_arr = _numpy_from_ros_image(self.last_depth_img)
-                if depth_arr is not None:
-                    _save_depth_png(depth_arr, os.path.join(self.camera_dir, name), self.depth_max_dis)
-                    saved['depth'] = os.path.join(self.camera_dir, name)
-            except Exception as e:
-                self.get_logger().warn(f"Failed to save named depth file: {e}")
-        return saved
+        self.raw_setpoint_pub.publish(target_velocity)
 
     # ---------- 轨迹（可选：如果你要跑外部 JSON 轨迹） ----------
     def load_trajectory(self, file_path):
@@ -924,128 +931,6 @@ class IsaacSimEnv(Node):
             self.get_logger().info(f"Go to waypoint: ({x:.2f}, {y:.2f}, {z:.2f})")
             time.sleep(1.0)  # 同原始风格的简单等待
 
-    # ---------- Socket & Control Interfaces ----------
-    def _setup_socket(self):
-        try:
-            self.listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.listen_sock.bind((self.cmd_sock_host, self.cmd_sock_port))
-            self.listen_sock.listen(8)
-            self.listen_sock.setblocking(False)
-            self.get_logger().info(f"Socket listening at {self.cmd_sock_host}:{self.cmd_sock_port}")
-        except Exception as e:
-            self.get_logger().warn(f"Failed to setup socket: {e}")
-            try:
-                if self.listen_sock:
-                    self.listen_sock.close()
-            except Exception:
-                pass
-            self.listen_sock = None
-            self.client_socks = []
-            self._sock_buffers = {}
-
-    def _read_socket_commands(self) -> List[Dict[str, Any]]:
-        cmds: List[Dict[str, Any]] = []
-        if self.listen_sock is None:
-            return cmds
-        try:
-            rlist, _, _ = select.select([self.listen_sock] + list(self.client_socks), [], [], 0.0)
-            for s in rlist:
-                if s is self.listen_sock:
-                    # accept new connections (non-blocking loop)
-                    while True:
-                        try:
-                            conn, addr = self.listen_sock.accept()
-                            conn.setblocking(False)
-                            self.client_socks.append(conn)
-                            self._sock_buffers[conn] = b""
-                            self.get_logger().info(f"Client connected: {addr}")
-                        except BlockingIOError:
-                            break
-                        except Exception:
-                            break
-                else:
-                    try:
-                        data = s.recv(65536)
-                        if not data:
-                            # closed
-                            try:
-                                s.close()
-                            except Exception:
-                                pass
-                            if s in self.client_socks:
-                                self.client_socks.remove(s)
-                            self._sock_buffers.pop(s, None)
-                            continue
-                        buf = self._sock_buffers.get(s, b"") + data
-                        while b"\n" in buf:
-                            line, buf = buf.split(b"\n", 1)
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                cmd = json.loads(line.decode('utf-8'))
-                                cmds.append(cmd)
-                            except Exception:
-                                self.get_logger().warn("Invalid JSON command in socket")
-                        self._sock_buffers[s] = buf
-                    except Exception:
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-                        if s in self.client_socks:
-                            self.client_socks.remove(s)
-                        self._sock_buffers.pop(s, None)
-        except Exception:
-            pass
-        return cmds
-
-    def _close_socket(self):
-        try:
-            for s in list(self.client_socks):
-                try:
-                    s.close()
-                except Exception:
-                    pass
-            self.client_socks = []
-            if self.listen_sock:
-                try:
-                    self.listen_sock.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def update_session_ts(self, new_ts: int):
-        """Update the current session timestamp and rebuild save directories immediately."""
-        try:
-            global SESSION_TS_GLOBAL
-            SESSION_TS_GLOBAL = int(new_ts)
-            self.session_ts = SESSION_TS_GLOBAL
-            # rebuild directories
-            self.sensors_dir = os.path.join(self.save_root, f"sensors_{self.session_ts}")
-            self.camera_dir = os.path.join(self.save_root, f"camera_{self.session_ts}")
-            self.status_dir = os.path.join(self.save_root, f"status_{self.session_ts}")
-            ensure_dir(self.sensors_dir)
-            ensure_dir(self.camera_dir)
-            ensure_dir(self.status_dir)
-            self.get_logger().info(f"Switched session to {self.session_ts}; new dirs ready.")
-        except Exception as e:
-            self.get_logger().warn(f"Failed to update session timestamp: {e}")
-
-    def _write_status(self, filename: Optional[str], resp: Dict[str, Any]):
-        if not filename:
-            return
-        try:
-            ensure_dir(self.status_dir)
-            name = filename if filename.endswith('.json') else filename + '.json'
-            out_json = os.path.join(self.status_dir, name)
-            with open(out_json, 'w') as f:
-                json.dump(resp, f)
-        except Exception as e:
-            self.get_logger().warn(f"Failed to write status file {filename}: {e}")
-
     # Interfaces
     def get_position(self) -> Dict[str, float]:
         p = self.current_pose.pose.position
@@ -1055,20 +940,15 @@ class IsaacSimEnv(Node):
         st = self.current_state
         return {"connected": getattr(st, "connected", False), "armed": getattr(st, "armed", False), "mode": getattr(st, "mode", "")}
 
-    def move_to(self, x: float, y: float, z: float, save: bool = True):
-        tag = now_int()
+    def move_to(self, x: float, y: float, z: float):
         self.pub_position(x, y, z)
         self.hover_target = (x, y, z)
-        self._last_action_tag = tag
-        if save:
-            self.save_snapshot(tag)
 
-    def move_to_many(self, points: List[List[float]], threshold: float = 0.1, save_each: bool = True):
+    def move_to_many(self, points: List[List[float]], threshold: float = REACH_THRESHOLD):
         for pt in points:
             if not isinstance(pt, (list, tuple)) or len(pt) < 3:
                 continue
             x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
-            tag = now_int()
             reached = False
             while rclpy.ok() and not reached:
                 self.pub_position(x, y, z)
@@ -1080,14 +960,108 @@ class IsaacSimEnv(Node):
                 rclpy.spin_once(self, timeout_sec=0.05)
                 time.sleep(0.05)
             self.hover_target = (x, y, z)
-            self._last_action_tag = tag
-            if save_each:
-                self.save_snapshot(tag)
 
-    def land(self, descend_rate: float = 0.2, save: bool = True):
-        # Descend to start_height (takeoff baseline) then disarm
-        tag = now_int()
-        target_z = self.start_height
+    def _select_color_topic(self) -> Optional[str]:
+        try:
+            topics = self.get_topic_names_and_types()
+        except Exception:
+            topics = []
+        ns_prefix = self._mavros_prefix or ""
+        candidates = []
+        for name, _types in topics:
+            if name.endswith("/color/image_raw"):
+                candidates.append(name)
+        for name in candidates:
+            if ns_prefix and name.startswith(ns_prefix + "/"):
+                return name
+        return candidates[0] if candidates else None
+
+    def _color_image_cb(self, msg: Image):
+        self._last_color_msg = msg
+
+    def ensure_camera_subscription(self) -> bool:
+        if self._color_sub is not None and self._color_topic:
+            return True
+        topic = self._select_color_topic()
+        if not topic:
+            return False
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
+        try:
+            self._color_sub = self.create_subscription(Image, topic, self._color_image_cb, qos)
+            self._color_topic = topic
+            return True
+        except Exception:
+            return False
+
+    def _encode_image_msg_to_b64(self, msg: Image) -> Optional[str]:
+        if msg is None:
+            return None
+        if PILImage is None:
+            return None
+        w = int(getattr(msg, "width", 0) or 0)
+        h = int(getattr(msg, "height", 0) or 0)
+        enc = str(getattr(msg, "encoding", "")).lower()
+        data = bytes(getattr(msg, "data", b""))
+        if w <= 0 or h <= 0 or not data:
+            return None
+        try:
+            arr = np.frombuffer(data, dtype=np.uint8)
+            if enc in ("rgb8", "bgr8", "rgba8", "bgra8"):
+                c = 3 if enc.endswith("rgb8") or enc.endswith("bgr8") else 4
+                arr = arr.reshape((h, w, c))
+                if enc.startswith("bgr") or enc.startswith("bgra"):
+                    arr = arr[:, :, :3][:, :, ::-1]
+                else:
+                    arr = arr[:, :, :3]
+            elif enc in ("mono8", "8UC1"):
+                arr = arr.reshape((h, w))
+            else:
+                step = int(getattr(msg, "step", w * 3))
+                c = step // max(w, 1)
+                try:
+                    arr = arr.reshape((h, w, c))
+                    arr = arr[:, :, :3]
+                except Exception:
+                    return None
+            pil_img = PILImage.fromarray(arr)
+            buf = BytesIO()
+            pil_img.save(buf, format='PNG')
+            return base64.b64encode(buf.getvalue()).decode('ascii')
+        except Exception:
+            return None
+
+    def _capture_image_b64(self) -> Optional[str]:
+        if self._image_from_ros:
+            ok = self.ensure_camera_subscription()
+            if not ok:
+                return None
+            if self._last_color_msg is None and self._color_topic:
+                try:
+                    msg = wait_for_message(self, self._color_topic, Image, timeout=2.0)
+                    self._last_color_msg = msg
+                except Exception:
+                    pass
+            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.05)
+            return self._encode_image_msg_to_b64(self._last_color_msg)
+        else:
+            try:
+                import urllib.request
+                url = f"{self._image_http_base}/uav/{vid}/image"
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    raw = resp.read()
+                    import json as _json
+                    obj = _json.loads(raw.decode("utf-8"))
+                    b64 = obj.get("data") or obj.get("image", {}).get("data")
+                    if isinstance(b64, str) and b64:
+                        return b64
+                    return None
+            except Exception:
+                return None
+
+    def land(self, descend_rate: float = 0.2):
+        target_z = getattr(self, "start_height", 0.0)
         while rclpy.ok() and (self.current_pose.pose.position.z - target_z) > 0.05:
             x = self.current_pose.pose.position.x
             y = self.current_pose.pose.position.y
@@ -1095,84 +1069,76 @@ class IsaacSimEnv(Node):
             self.pub_position(x, y, z)
             rclpy.spin_once(self, timeout_sec=0.05)
             time.sleep(0.1)
-        if save:
-            self.save_snapshot(tag)
-        # Disarm
-        try:
-            disarm_req = CommandBool.Request()
-            disarm_req.value = False
-            call_service_sync(self, self.arming_client, disarm_req, timeout_sec=5.0)
-        except Exception:
-            pass
+        landed = self.wait_until_landed(target_z, timeout_s=15.0, window_s=2.0, eps=0.03)
+        if landed:
+            try:
+                disarm_req = CommandBool.Request()
+                disarm_req.value = False
+                call_service_sync(self, self.arming_client, disarm_req, timeout_sec=5.0)
+            except Exception as e:
+                self.get_logger().error(f"Failed to disarm the vehicle. {e}")
+            self.wait_until_disarmed(timeout_s=10.0)
+        return landed
 
-    def get_sensor_data(self, filename: Optional[str] = None) -> Dict[str, Any]:
-        data = self._build_sensor_snapshot()
-        saved = {}
-        if filename:
-            saved = self.save_named(sensors_filename=filename)
-        if saved:
-            data['saved'] = saved
-        return data
+    def wait_until_landed(self, target_z: Optional[float] = None, timeout_s: float = 15.0, window_s: float = 2.0, eps: float = 0.03) -> bool:
+        if target_z is None:
+            target_z = getattr(self, "start_height", 0.0)
+        start = time.time()
+        last = None
+        stable_for = 0.0
+        step = 0.1
+        while time.time() - start < timeout_s:
+            z = float(self.current_pose.pose.position.z)
+            on_ground = False
+            try:
+                on_ground = int(getattr(self.extended_state, "landed_state", 0)) == int(ExtendedState.LANDED_STATE_ON_GROUND)
+            except Exception:
+                on_ground = False
+            near_target = abs(z - target_z) <= 0.05
+            if near_target or on_ground:
+                if last is not None and abs(z - last) <= eps:
+                    stable_for += step
+                else:
+                    stable_for = 0.0
+            else:
+                stable_for = 0.0
+            last = z
+            if stable_for >= window_s:
+                return True
+            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(step)
+        return False
 
-    def get_image_data(self, filename: Optional[str] = None, filename_rgb: Optional[str] = None, filename_depth: Optional[str] = None) -> Dict[str, Any]:
-        info: Dict[str, Any] = {}
-        if self.last_rgb_img is not None:
-            info["rgb"] = {"width": self.last_rgb_img.width, "height": self.last_rgb_img.height, "encoding": self.last_rgb_img.encoding}
-        if self.last_depth_img is not None:
-            info["depth"] = {"width": self.last_depth_img.width, "height": self.last_depth_img.height, "encoding": self.last_depth_img.encoding}
-        # saving using provided names
-        rgb_name = filename_rgb
-        depth_name = filename_depth
-        if filename and not rgb_name:
-            rgb_name = filename if PILImage is not None else filename  # extension handled in save_named
-        if filename and not depth_name:
-            depth_name = filename + "_depth"
-        saved = self.save_named(rgb_filename=rgb_name, depth_filename=depth_name)
-        if saved:
-            info['saved'] = saved
-        return info
+    def wait_until_disarmed(self, timeout_s: float = 5.0) -> bool:
+        start = time.time()
+        while time.time() - start < timeout_s:
+            if not bool(getattr(self.current_state, "armed", False)):
+                return True
+            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.1)
+        return False
 
     def process_command(self, cmd: Dict[str, Any]):
         ctype = cmd.get("cmd") or cmd.get("type")
         resp: Dict[str, Any] = {"ok": True}
         try:
-            if ctype == "set_session_ts":
-                new_ts = cmd.get("ts") or cmd.get("session_ts")
-                if new_ts is None:
-                    raise ValueError("set_session_ts requires 'ts' or 'session_ts'")
-                new_ts = int(new_ts)
-                # update session immediately; status will be written to the NEW status dir
-                self.update_session_ts(new_ts)
-                resp.update({"message": "session updated", "session_ts": new_ts})
-            elif ctype == "move_to":
+            if ctype == "move_to":
                 x = float(cmd.get("x"))
                 y = float(cmd.get("y"))
                 z = float(cmd.get("z"))
-                self.move_to(x, y, z, save=True)
+                self.move_to(x, y, z)
                 resp.update({"position": self.get_position()})
             elif ctype == "move_to_many":
                 pts = cmd.get("points") or cmd.get("waypoints") or []
-                self.move_to_many(pts, save_each=True)
+                self.move_to_many(pts)
                 resp.update({"position": self.get_position()})
             elif ctype == "land":
-                self.land(save=True)
+                self.land()
                 resp.update({"status": self.get_status()})
             elif ctype == "get_position":
                 resp.update({"position": self.get_position()})
             elif ctype == "get_status":
                 resp.update({"status": self.get_status()})
-            elif ctype == "get_sensors":
-                fname = cmd.get("filename")
-                resp.update({"sensors": self.get_sensor_data(filename=fname)})
-            elif ctype == "get_images":
-                fname = cmd.get("filename")
-                fname_rgb = cmd.get("filename_rgb")
-                fname_depth = cmd.get("filename_depth")
-                resp.update({"images": self.get_image_data(filename=fname, filename_rgb=fname_rgb, filename_depth=fname_depth)})
-            elif ctype == "save_snapshot":
-                tag = now_int()
-                self.save_snapshot(tag)
-                resp.update({"saved_at": tag})
             elif ctype == "shutdown":
                 self._shutdown_requested = True
                 resp.update({"message": "Shutdown requested"})
@@ -1180,151 +1146,48 @@ class IsaacSimEnv(Node):
                 resp = {"ok": False, "error": f"Unknown cmd: {ctype}"}
         except Exception as e:
             resp = {"ok": False, "error": str(e)}
-        # write status to filename if provided
-        self._write_status(cmd.get("filename"), resp)
-
-    def hover_and_socket_loop(self):
-        self.get_logger().info("Entering hover + Socket command loop...")
-        hz = 30.0  # 与桥接发布频率保持一致
-        while rclpy.ok() and not self._shutdown_requested:
-            # maintain hover
-            if self.hover_target is not None:
-                x, y, z = self.hover_target
-                self.pub_position(x, y, z)
-            # process incoming commands
-            for cmd in self._read_socket_commands():
-                self.process_command(cmd)
-            # aligned saving based on last action tag, optional periodic
-            rclpy.spin_once(self, timeout_sec=0.05)
-            time.sleep(1.0 / hz)
+        return resp
 
 
 # =======================================================================
 #                                   main
 # =======================================================================
 def main():
-    # Parse optional CLI args for session timestamp and pass remaining to ROS
+    # 解析必要的 CLI 参数，并过滤 ROS2 命名空间标志
     import argparse
     parser = argparse.ArgumentParser(description="Pegasus ROS2 IsaacSimEnv")
-    parser.add_argument("--session-ts", dest="session_ts", type=int, default=None, help="Override session timestamp (int)")
-    parser.add_argument("--mavros-url", dest="mavros_url", type=str, default=None, help="MAVROS FCU URL (e.g., udp://:14540@)")
     parser.add_argument("--mavros-ns", dest="mavros_ns", type=str, default=None, help="ROS2 namespace for MAVROS (e.g., uav0)")
     # 允许通过 --ros-args __ns:=uavX 的方式设置命名空间（由 launch_multi_rospy 传递）
-    parser.add_argument("--output-dir", dest="output_dir", type=str, default=None, help="Override output root dir (PEGASUS_OUTPUT_DIR)")
-    args, unknown = parser.parse_known_args()
+    args = parser.parse_args()
     print("[INFO] Parsed arguments:")
     for arg, value in vars(args).items():
         print(f"{arg}: {value}")
-    # Prefer env var if provided
-    env_session = os.environ.get("PEGASUS_SESSION_TS")
-    session_ts = None
-    if env_session:
-        try:
-            session_ts = int(env_session)
-        except Exception:
-            session_ts = None
-    if session_ts is None:
-        session_ts = args.session_ts
-    # keep module global aligned so set_session_ts starts from known value
-    try:
-        global SESSION_TS_GLOBAL
-        if session_ts is not None:
-            SESSION_TS_GLOBAL = int(session_ts)
-    except Exception:
-        SESSION_TS_GLOBAL = None
-    # 解析可能的 ROS2 命名空间参数，避免 rclpy 对未加 --ros-args 的全局参数报错
-    # 提取 CLI 命名空间（支持 __ns:= 与 --namespace 两种形式）并从传递给 rclpy 的参数中过滤掉这些标志
-    cli_ns = None
-    filtered_unknown = []
-    i = 0
-    while i < len(unknown):
-        tok = unknown[i]
-        if tok == '--ros-args':
-            # 由上层传递给 Python 的 --ros-args 在本节点中不需要，过滤掉
-            i += 1
-            continue
-        if tok == '--namespace':
-            if i + 1 < len(unknown):
-                cli_ns = unknown[i + 1].lstrip('/')
-            i += 2
-            continue
-        if tok.startswith('--namespace='):
-            cli_ns = tok.split('--namespace=', 1)[1].lstrip('/')
-            i += 1
-            continue
-        if tok == '__ns:=':
-            if i + 1 < len(unknown):
-                cli_ns = unknown[i + 1].lstrip('/')
-            i += 2
-            continue
-        if tok.startswith('__ns:='):
-            cli_ns = tok.split('__ns:=', 1)[1].lstrip('/')
-            i += 1
-            continue
-        # 其它未知参数保留传递给 rclpy（若不被识别，rclpy 会忽略）
-        filtered_unknown.append(tok)
-        i += 1
-    # 初始化 rcl，避免将命名空间标志直接传入导致 UnknownROSArgsError
-    rclpy.init(args=filtered_unknown)
+    
+    rclpy.init()
     env = None
-    vel_process = None  # 已废弃：不再外部启动 vel.py，保留变量仅作占位
-    mavros_process = None
     try:
-        # Resolve MAVROS URL and namespace from env or CLI
         # Resolve MAVROS URL/NS and output directory (prefers env, falls back to CLI, then defaults)
-        env_mavros_url = os.environ.get("MAVROS_URL")
         env_mavros_ns = os.environ.get("MAVROS_NS")
-        mavros_url = env_mavros_url if env_mavros_url else (args.mavros_url if args.mavros_url else "udp://:14540@")
-        mavros_ns = env_mavros_ns if env_mavros_ns else (cli_ns if cli_ns else args.mavros_ns)
-        if args.output_dir:
-            os.environ["PEGASUS_OUTPUT_DIR"] = args.output_dir
+        mavros_ns = env_mavros_ns if env_mavros_ns else args.mavros_ns
 
-        env = IsaacSimEnv(session_ts=session_ts, mavros_ns=mavros_ns)
+        env = IsaacSimEnv(mavros_ns=mavros_ns)
         env.get_logger().info("IsaacSimEnv node started.")
-
-        # 启动 MAVROS（确保在发送命令前已运行）
-        try:
-            # 强制将 MAVROS 放入命名空间：同时使用 ROS_NAMESPACE 和 --ros-args __ns:=
-            child_env = os.environ.copy()
-            # 使用 ros2 launch 启动 px4.launch，并通过其定义的参数传递 fcu_url 与 namespace
-            mavros_cmd = [
-                '/opt/ros/humble/bin/ros2', 'launch', 'mavros', 'px4.launch',
-                f'fcu_url:={mavros_url}'
-            ]
-            if mavros_ns:
-                # 将 MAVROS 放入 '/<ns>/mavros' 下，使所有话题形如 '/uavX/mavros/...'
-                mavros_cmd += [f'namespace:=/{mavros_ns}/mavros']
-                child_env['ROS_NAMESPACE'] = f'/{mavros_ns}'
-            try:
-                env.get_logger().info(f"MAVROS launch cmd: {' '.join(mavros_cmd)} | ROS_NAMESPACE={child_env.get('ROS_NAMESPACE')}")
-            except Exception:
-                pass
-            mavros_process = subprocess.Popen(mavros_cmd, env=child_env, preexec_fn=os.setsid)
-            env.get_logger().info("MAVROS (px4.launch) started.")
-        except Exception as e:
-            env.get_logger().warn(f"Failed to start MAVROS: {e}")
 
         # 在 MAVROS 启动后等待 FCU 连接
         env.wait_for_fcu_connection()
 
-        # 内置桥已启用，无需外部进程
-        env.get_logger().info("Integrated velocity bridge running; external vel.py disabled.")
-
         env.reset()
-        env.get_logger().info("Environment reset complete; switching to hover+Socket mode.")
-
+        env.get_logger().info("Environment reset complete; switching to hover+HTTP mode.")
+        env.start_http_server()
         # Configure MAVROS time sync parameters to avoid PX4 timesync RTT warnings
         try:
-            env.get_logger().info("Configuring MAVROS time sync parameters...")
-        except Exception:
-            pass
-        try:
+            env.get_logger().info(f"UAV{env._vid} Configuring MAVROS time sync parameters...")
             env.configure_mavros_time_plugin()
-        except Exception:
-            pass
+        except Exception as e:
+            env.get_logger().error(f"Failed to configure MAVROS time sync parameters: {e}")
 
-        # Hover + Socket commands loop (wait for external commands)
-        env.hover_and_socket_loop()
+        # Hover + HTTP commands loop (wait for external HTTP commands)
+        env._http_hover_loop()
 
     except Exception as e:
         # 异常情况：记录错误但继续执行清理流程
@@ -1337,46 +1200,9 @@ def main():
             print(f"Unhandled exception in main(): {e}")
 
     finally:
-        # 无需清理外部 vel.py 进程（未启动）
-
-        # 清理 MAVROS 进程（正常或异常结束都执行）
-        if mavros_process is not None and mavros_process.poll() is None:
-            if env is not None:
-                try:
-                    env.get_logger().info("Shutting down MAVROS (px4.launch)...")
-                except Exception:
-                    pass
-            try:
-                pgid = os.getpgid(mavros_process.pid)
-            except Exception:
-                pgid = None
-            if pgid is not None:
-                for sig in (signal.SIGINT, signal.SIGTERM):
-                    try:
-                        os.killpg(pgid, sig)
-                        mavros_process.wait(timeout=5)
-                        break
-                    except Exception:
-                        pass
-                if mavros_process.poll() is None:
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except Exception:
-                        pass
-            else:
-                try:
-                    mavros_process.terminate()
-                    mavros_process.wait(timeout=5)
-                except Exception:
-                    try:
-                        mavros_process.kill()
-                    except Exception:
-                        pass
-
         # 释放 ROS 资源
         if env is not None:
             try:
-                env._close_socket()
                 env.destroy_node()
             except Exception:
                 pass
