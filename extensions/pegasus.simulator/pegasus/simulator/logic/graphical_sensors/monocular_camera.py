@@ -16,6 +16,7 @@ from omni.usd import get_stage_next_free_path
 # Auxiliary scipy and numpy modules
 import numpy as np
 from scipy.spatial.transform import Rotation
+import time
 
 
 class MonocularCamera(GraphicalSensor):
@@ -68,6 +69,12 @@ class MonocularCamera(GraphicalSensor):
         self._camera_full_set = False
 
         self.counter = 0
+
+        # Cache of last image and timestamp (updated on render updates)
+        self._last_image = None
+        self._last_image_ts = None
+        # Cache of last state snapshot aligned with last image
+        self._last_state_snapshot = None
 
 
     def initialize(self, vehicle):
@@ -148,11 +155,28 @@ class MonocularCamera(GraphicalSensor):
             self._state = {}
             self._state["camera_name"] = self._camera_name
             self._state["stage_prim_path"] = self._stage_prim_path
-            #self._state["image"] = self._camera.get_rgba()[:, :, :3]
             self._state["height"] = self._resolution[1]
             self._state["width"] = self._resolution[0]
             self._state["frequency"] = self._frequency
             self._state["camera"] = self._camera
+            # Acquire and cache the latest RGB frame only during render updates
+            # Note: get_rgba returns last rendered frame; we cache RGB channels
+            img = self._camera.get_rgba()[:, :, :3]
+            self._last_image = img
+            ts = time.time()
+            self._last_image_ts = ts
+            self._state["timestamp"] = ts
+            # Snapshot the vehicle state aligned with this image
+            try:
+                self._last_state_snapshot = {
+                    "position": np.array(state.position, copy=True),
+                    "attitude": np.array(state.attitude, copy=True),
+                    "linear_velocity": np.array(state.linear_velocity, copy=True),
+                    "angular_velocity": np.array(state.angular_velocity, copy=True),
+                    "linear_acceleration": np.array(state.linear_acceleration, copy=True),
+                }
+            except Exception:
+                self._last_state_snapshot = None
 
             # Check if we want to get the depth image
             #if self._depth:
@@ -166,3 +190,28 @@ class MonocularCamera(GraphicalSensor):
             self._state = None
 
         return self._state
+    
+    def get_image(self):
+        """Method that returns the current image from the camera.
+
+        Returns:
+            (np.ndarray) The current image from the camera.
+        """
+        # Prefer returning cached image to avoid extra work outside render updates
+        return self._last_image
+
+    def get_last_image_with_timestamp(self):
+        """Return the last cached RGB frame and its capture timestamp.
+
+        Returns:
+            (tuple[np.ndarray, float] | (None, None)): Cached image and timestamp if available.
+        """
+        return self._last_image, self._last_image_ts
+
+    def get_last_state_snapshot(self):
+        """Return the last cached vehicle state snapshot aligned with image timestamp.
+
+        Returns:
+            (dict | None): Dict with position, attitude, linear_velocity, angular_velocity, linear_acceleration.
+        """
+        return self._last_state_snapshot

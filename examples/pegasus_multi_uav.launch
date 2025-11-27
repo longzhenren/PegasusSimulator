@@ -1,0 +1,29 @@
+<launch>
+    <group>
+        <arg name="id" default="0" />
+        <arg name="fcu_url" default="udp://:14540@127.0.0.1:14580" />
+        <include file="$(find-pkg-share mavros)/launch/px4.launch">
+            <arg name="tgt_system" value="1" />
+            <arg name="namespace" value="/uav0/mavros" />
+            <arg name="time_sync" value="False" />
+        </include>
+    </group>
+    <group>
+        <arg name="id" default="1" />
+        <arg name="fcu_url" default="udp://:14541@127.0.0.1:14581" />
+        <include file="$(find-pkg-share mavros)/launch/px4.launch">
+            <arg name="tgt_system" value="2" />
+            <arg name="namespace" value="/uav1/mavros" />
+            <arg name="time_sync" value="False" />
+        </include>
+    </group>
+    <group>
+        <arg name="id" default="2" />
+        <arg name="fcu_url" default="udp://:14542@127.0.0.1:14582" />
+        <include file="$(find-pkg-share mavros)/launch/px4.launch">
+            <arg name="tgt_system" value="3" />
+            <arg name="namespace" value="/uav2/mavros" />
+            <arg name="time_sync" value="False" />
+        </include>
+    </group>
+</launch>

@@ -31,7 +31,7 @@ ROBOTS_ASSETS = ASSET_PATH + "/Robots"
 ROBOTS = {"Iris": ROBOTS_ASSETS + "/Iris/iris.usd"} #, "Flying Cube": ROBOTS_ASSETS + "/iris_cube.usda"}
 
 # Setup the default simulation environments path
-NVIDIA_ASSETS_PATH = str(nucleus.get_assets_root_path())
+# NVIDIA_ASSETS_PATH = str(nucleus.get_assets_root_path())
 ISAAC_SIM_ENVIRONMENTS = "/Isaac/Environments"
 NVIDIA_SIMULATION_ENVIRONMENTS = {
     "Default Environment": "Grid/default_environment.usd",
@@ -57,11 +57,11 @@ OMNIVERSE_ENVIRONMENTS = {
 
 SIMULATION_ENVIRONMENTS = {}
 
-# Add the Isaac Sim assets to the list
-for asset in NVIDIA_SIMULATION_ENVIRONMENTS:
-    SIMULATION_ENVIRONMENTS[asset] = (
-        NVIDIA_ASSETS_PATH + ISAAC_SIM_ENVIRONMENTS + "/" + NVIDIA_SIMULATION_ENVIRONMENTS[asset]
-    )
+# # Add the Isaac Sim assets to the list
+# for asset in NVIDIA_SIMULATION_ENVIRONMENTS:
+#     SIMULATION_ENVIRONMENTS[asset] = (
+#         NVIDIA_ASSETS_PATH + ISAAC_SIM_ENVIRONMENTS + "/" + NVIDIA_SIMULATION_ENVIRONMENTS[asset]
+#     )
 
 # Add the omniverse assets to the list
 for asset in OMNIVERSE_ENVIRONMENTS:

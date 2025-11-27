@@ -222,7 +222,6 @@ class PX4MavlinkBackendConfig(BackendConfig):
 
         # Configure whether to launch px4 in the background automatically or not for every vehicle launched
         self.px4_autolaunch: bool = self.config.get("px4_autolaunch", True)
-        # MAVROS 自动启动已弃用：由外部脚本管理（examples/rospy_isaacsim.py）
         self.mavros_autolaunch: bool = False
         
         self.px4_dir: str = self.config.get("px4_dir", PegasusInterface().px4_path)
@@ -238,10 +237,6 @@ class PX4MavlinkBackendConfig(BackendConfig):
         # The update rate at which we will be sending data to mavlink (TODO - remove this from here in the future
         # and infer directly from the function calls)
         self.update_rate: float = self.config.get("update_rate", 250.0)  # [Hz]
-
-        # MAVROS 配置已迁移到外部脚本；此处不再使用
-        self.mavros_fcu_url: str = None
-        self.mavros_namespace: str = None
 
 
 class PX4MavlinkBackend(Backend):
@@ -276,14 +271,11 @@ class PX4MavlinkBackend(Backend):
         # Check if we need to autolaunch px4 in the background or not
         self.px4_autolaunch: bool = self.config.px4_autolaunch
         # Check if we need to autolaunch mavlink in the background or not
-        # Disabled: MAVROS is now managed externally by examples/rospy_isaacsim.py
-        self.mavros_autolaunch: bool = False
         
         self.px4_vehicle_model: str = self.config.px4_vehicle_model  # only needed if px4_autolaunch == True
         self.px4_tool: PX4LaunchTool = None
         self.px4_dir: str = self.config.px4_dir
 
-        # MAVROS settings are no longer handled inside Pegasus (pgsim)
         # They are configured and launched by the external control script.
 
         # Set the update rate used for sending the messages (TODO - remove this hardcoded value from here)
