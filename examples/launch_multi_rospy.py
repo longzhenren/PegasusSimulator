@@ -380,6 +380,7 @@ def main():
             candidate_ports.add(14540 + vid) 
             candidate_ports.add(14550 + vid) 
             candidate_ports.add(14580 + vid) 
+            candidate_ports.add(4560 + vid) 
             candidate_ports.add(8888 + vid) # ROS2 UXRCE DDS Port
             candidate_ports.add(5009 + vid) # HTTP Command Port
         name_patterns = ["mavros", "px4", "px4-sitl", "mavros_node", "ros2 launch mavros"]
@@ -472,11 +473,19 @@ def main():
             setattr(isaac_proc, "_log_file", isaac_log_f)
             print(f"[LAUNCH] ISAACSIM scene: {args.isaac} pid={isaac_proc.pid} logs: {isaac_log}")
 
-            # Filter out noisy lines containing "[Warning] [omni.usd]" from both console and file
-            import threading
-            def _isaac_log_filter(proc, file):
+            # Filter, write to file, and optionally tee to console
+            import threading, re
+            def _pick_color(tag: str) -> str:
+                palette = ["31","32","33","34","35","36","37","91","92","93","94","95","96"]
+                m = re.search(r"(uav\d+)", tag or "")
+                idx = int(m.group(0)[3:]) if m else 0
+                return palette[idx % len(palette)]
+            def _isaac_log_filter(proc, file, tag: str):
+                color = _pick_color(tag or "[isaac]")
+                pre = f"\033[{color}m{tag}\033[0m" if tag else ""
                 try:
-                    for line in proc.stdout:
+                    for raw in proc.stdout:
+                        line = raw.rstrip("\n")
                         filter_list = [
                             "[Warning] [omni.usd]",
                             "[Warning] [omni.kit]",
@@ -492,13 +501,21 @@ def main():
                         if not line.strip():
                             continue
                         try:
-                            file.write(line)
+                            file.write(line + "\n")
                             file.flush()
                         except Exception:
                             pass
+                        if args.console_logs:
+                            try:
+                                if tag:
+                                    print(f"{pre} {line}")
+                                else:
+                                    print(line)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
-            t = threading.Thread(target=_isaac_log_filter, args=(isaac_proc, isaac_log_f), daemon=True)
+            t = threading.Thread(target=_isaac_log_filter, args=(isaac_proc, isaac_log_f, "[isaac]"), daemon=True)
             t.start()
 
             # Wait for simulator readiness by watching log markers, then gate on PX4 commander messages

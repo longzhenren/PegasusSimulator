@@ -56,7 +56,30 @@ from PIL import Image
 from flask import Flask, jsonify, request, Response
 from werkzeug.serving import make_server
 from scipy.spatial.transform import Rotation
-import json as _json
+
+SIMULATION_ENVIRONMENTS = {}
+NVIDIA_SIMULATION_ENVIRONMENTS = {
+    "Default Environment": "Grid/default_environment.usd",
+    "Black Gridroom": "Grid/gridroom_black.usd",
+    "Curved Gridroom": "Grid/gridroom_curved.usd",
+    "Hospital": "Hospital/hospital.usd",
+    "Office": "Office/office.usd",
+    "Simple Room": "Simple_Room/simple_room.usd",
+    "Warehouse": "Simple_Warehouse/warehouse.usd",
+    "Warehouse with Forklifts": "Simple_Warehouse/warehouse_with_forklifts.usd",
+    "Warehouse with Shelves": "Simple_Warehouse/warehouse_multiple_shelves.usd",
+    "Full Warehouse": "Simple_Warehouse/full_warehouse.usd",
+    "Flat Plane": "Terrains/flat_plane.usd",
+    "Rough Plane": "Terrains/rough_plane.usd",
+    "Slope Plane": "Terrains/slope.usd",
+    "Stairs Plane": "Terrains/stairs.usd",
+}
+for asset in NVIDIA_SIMULATION_ENVIRONMENTS:
+    SIMULATION_ENVIRONMENTS[asset] = (
+        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Environments/" + NVIDIA_SIMULATION_ENVIRONMENTS[asset]
+    )
+
+
 # Start Isaac Sim's simulation environment
 # Note: this simulation app must be instantiated right after the SimulationApp import, otherwise the simulator will crash
 # as this is the object that will load all the extensions and load the actual simulator.
@@ -77,7 +100,8 @@ USE_RASTERIZATION = False
 # 渲染节流：仅按设定 FPS 渲染；其余物理步不渲染（相机不更新）
 RENDER_THROTTLE = True
 RENDER_MAX_FPS = 10.0
-USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
+USD_PATH = SIMULATION_ENVIRONMENTS['Default Environment']
+# USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
 # -------------------------
 # Recording (global switch)
 # -------------------------
@@ -102,7 +126,7 @@ APP_CONFIG = {
     "height": 600,
     "window_width": 1280,
     "window_height": 720,
-    "headless": False,
+    "headless": True,
     "max_bounces": 1,  # RT 模式里 bounces 越低越快
     "samples_per_pixel_per_frame": 16,  # 默认 64，很吃GPU，先降
     "anti_aliasing": 1,  # 0/1 更快（3=高质量）
@@ -132,7 +156,7 @@ from isaacsim.core.api.world import World
 sys.path.insert(0, os.path.expanduser("~/PegasusSimulator/extensions/pegasus.simulator/"))
 
 # Import the Pegasus API for simulating drones
-from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS
+from pegasus.simulator.params import ROBOTS
 from pegasus.simulator.logic.graphical_sensors.monocular_camera import MonocularCamera
 from pegasus.simulator.logic.backends.px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
 from pegasus.simulator.logic.backends.ros2_backend import ROS2Backend

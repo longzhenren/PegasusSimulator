@@ -26,7 +26,7 @@ Pegasus ROS2 控制器（rospy_isaacsim.py）
   3) `arm`（`CommandBool`）。
   4) 起飞到 `start_height + INIT_HEIGHT`，使用 `tqdm` 进度；到达后设定 `hover_target`。
 - `move_to(x,y,z)` / `move_to_many(points)`：按位置目标发布 `PositionTarget` 并以 `REACH_THRESHOLD` 检查到达。
-- `land(descend_rate)`：
+- `land()`：
   - 每步将高度向 `start_height` 下降，调用 `wait_until_landed()` 做窗口稳定检测；着陆后调用 `disarm` 并 `wait_until_disarmed()`。
 - `wait_until_landed(target_z, timeout_s, window_s, eps)`：
   - 结合 `ExtendedState.landed_state == ON_GROUND` 与高度接近 `target_z` 的稳定窗口判定；若满足窗口时间返回 True。
@@ -148,6 +148,13 @@ STEP_RETURN_EACH = os.environ.get("PEGASUS_STEP_RETURN_EACH", "0") in ("1", "tru
 INIT_HEIGHT = float(os.environ.get("PEGASUS_INIT_HEIGHT", "5.0"))
 REACH_THRESHOLD = float(os.environ.get("PEGASUS_REACH_THRESHOLD", "0.1"))
 CONTROL_LOOP_HZ = float(os.environ.get("PEGASUS_HOVER_HZ", "30.0"))
+LAND_TIMEOUT_S = float(os.environ.get("PEGASUS_LAND_TIMEOUT_S", "45.0"))
+DISARM_TIMEOUT_S = float(os.environ.get("PEGASUS_DISARM_TIMEOUT_S", "15.0"))
+LAND_STABLE_WINDOW_S = float(os.environ.get("PEGASUS_LAND_STABLE_WINDOW_S", "2.5"))
+LAND_STABLE_EPS = float(os.environ.get("PEGASUS_LAND_STABLE_EPS", "0.03"))
+POSITION_READY_TIMEOUT_S = float(os.environ.get("PEGASUS_POSITION_READY_TIMEOUT_S", "30.0"))
+POSITION_READY_WINDOW_S = float(os.environ.get("PEGASUS_POSITION_READY_WINDOW_S", "1.5"))
+POSITION_READY_EPS = float(os.environ.get("PEGASUS_POSITION_READY_EPS", "0.05"))
 
 # ---------------- Helper: wait for a single message ----------------
 def wait_for_message(node: Node, topic: str, msg_type, timeout: float = None):
@@ -218,8 +225,11 @@ class IsaacSimEnv(Node):
         self.current_pose = PoseStamped()
         self.current_state = State()
 
-        # HTTP 命令处理（通过 Flask 路由
         self._shutdown_requested = False
+        self._external_spin = False
+        self._control_paused = False
+        self._pose_updates = 0
+        self._state_updates = 0
 
         # MAVROS namespace support: build topic/service prefix
         self._mavros_ns = mavros_ns if mavros_ns is not None else os.environ.get("MAVROS_NS", None)
@@ -570,6 +580,7 @@ class IsaacSimEnv(Node):
         if self._http_app is not None:
             def _run():
                 try:
+                    self._external_spin = True
                     self._http_app.run(host='0.0.0.0', port=self._http_port, threaded=True, debug=False, use_reloader=False)
                 except Exception:
                     pass
@@ -578,22 +589,45 @@ class IsaacSimEnv(Node):
             self._http_thread = t
 
     def _http_hover_loop(self):
-        """以固定频率维持悬停，并处理 ROS 回调；HTTP 命令通过 Flask 路由触发，无需轮询。"""
         self.get_logger().info("Entering hover + HTTP command loop...")
         hz = CONTROL_LOOP_HZ
         while rclpy.ok() and not self._shutdown_requested:
-            if self.hover_target is not None:
-                x, y, z = self.hover_target
-                self.pub_position(x, y, z)
-            rclpy.spin_once(self, timeout_sec=0.05)
+            try:
+                li = bool(getattr(self, "_landing_in_progress", False))
+                if not li and self.hover_target is not None:
+                    x, y, z = self.hover_target
+                    try:
+                        self.pub_position(x, y, z)
+                    except Exception as e:
+                        self.get_logger().error(f"Hover loop publish failed: {e}")
+                if not li and not self._external_spin:
+                    try:
+                        rclpy.spin_once(self, timeout_sec=0.05)
+                    except Exception as e:
+                        import traceback as _tb
+                        tb = _tb.format_exc()
+                        mode = getattr(self.current_state, "mode", "")
+                        armed = bool(getattr(self.current_state, "armed", False))
+                        z = float(getattr(getattr(self, "current_pose", PoseStamped()), "pose", PoseStamped().pose).position.z or 0.0)
+                        ls = int(getattr(self.extended_state, "landed_state", 0))
+                        self.get_logger().error(f"Hover loop exception: {e}")
+                        self.get_logger().error(f"Hover loop traceback: {tb}")
+                        self.get_logger().error(f"Hover loop context: mode={mode} armed={armed} z={z:.3f} landed_state={ls} landing_in_progress={li}")
+            except Exception as e:
+                import traceback as _tb
+                tb = _tb.format_exc()
+                self.get_logger().error(f"Hover loop outer exception: {e}")
+                self.get_logger().error(f"Hover loop outer traceback: {tb}")
             time.sleep(1.0 / hz)
 
     # ---------- Callbacks ----------
     def state_cb(self, msg: State):
         self.current_state = msg
+        self._state_updates += 1
 
     def pose_cb(self, msg: PoseStamped):
         self.current_pose = msg
+        self._pose_updates += 1
     
     def extended_state_cb(self, msg: ExtendedState):
         self.extended_state = msg
@@ -609,40 +643,41 @@ class IsaacSimEnv(Node):
     # ---------- Core API ----------
     def reset(self):
         # Step 0) Warm-up setpoints (防止进入 RTL/Failsafe)
-        self.get_logger().info("Publishing initial dummy setpoints to prevent RTL...")
+        self.get_logger().info("[reset] Publishing initial dummy setpoints to prevent RTL...")
         for _ in range(50):  # 2.5s at 20Hz
-            self.pub_position(0.0, 0.0, 1.0)
+            self.pub_position(0.0, 0.0, self.init_height)
             spin_sleep(self, 20.0)
-        self.get_logger().info("Initial setpoints published.")
+        
+        self.get_logger().info(f"[reset] UAV{self._vid} Initial setpoints published.")
 
         # Step 1) 切换 OFFBOARD
         self.offb_set_mode.custom_mode = "OFFBOARD"
         while self.current_state.mode != "OFFBOARD":
             resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=5.0)
             if resp and getattr(resp, "mode_sent", False):
-                self.get_logger().info("***** OFFBOARD enabled *****")
+                self.get_logger().info("[reset] ***** OFFBOARD enabled *****")
             spin_sleep(self, 2.0)
-        self.get_logger().info("Vehicle in OFFBOARD mode.")
+        self.get_logger().info("[reset] Vehicle in OFFBOARD mode.")
 
         # Step 2) 解锁
         self.arm_cmd.value = True
         while not self.current_state.armed:
             resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
             if resp and getattr(resp, "success", False):
-                self.get_logger().info("***** Vehicle armed *****")
+                self.get_logger().info("[reset] ***** Vehicle armed *****")
                 break
             spin_sleep(self, 2.0)
-        self.get_logger().info("Vehicle armed.")
+        self.get_logger().info("[reset] Vehicle armed.")
 
         # Step 3) 起飞逻辑（和你原来一样）
         self.start_height = self.current_pose.pose.position.z
-        self.get_logger().info(f"Current height: {self.start_height}")
+        self.get_logger().info(f"[reset] Current height: {self.start_height}")
         target_x, target_y, target_z = 0.0, 0.0, self.start_height + self.init_height
         has_reached_initial_point = False
         # 优化进度条：显示为“当前高度/起飞要求高度（米）”
         required_height = float(self.init_height)
         progress_counter = 0
-        progress_bar = tqdm(total=required_height, desc="起飞进度", unit="m")
+        progress_bar = tqdm(total=required_height, desc="[reset] 起飞进度", unit="m")
         while not has_reached_initial_point:
             # Publishing takeoff setpoint
             self.pub_position(target_x, target_y, target_z)
@@ -669,14 +704,15 @@ class IsaacSimEnv(Node):
                 progress_bar.n = required_height
                 progress_bar.last_print_n = required_height
                 progress_bar.update(0)
-                self.get_logger().info("***** Reached initial point *****")
+                self.get_logger().info("[reset] ***** Reached initial point *****")
             rclpy.spin_once(self, timeout_sec=0.05)
             time.sleep(0.05)
         # 完成起飞后，确保进度条满格
         progress_bar.n = required_height
         progress_bar.last_print_n = required_height
         progress_bar.update(0)
-        self.get_logger().info("Takeoff complete.")
+        progress_bar.close()        
+        self.get_logger().info("[reset] Takeoff complete.")
 
         # set hover target to current pose after takeoff
         self.hover_target = (
@@ -688,49 +724,42 @@ class IsaacSimEnv(Node):
     def reboot_px4(self, position: Optional[List[float]] = None, yaw_deg: Optional[float] = None):
         vid = int(self._vid)
         try:
+            landed_ok = True
             if bool(getattr(self.current_state, "armed", False)):
-                try:
-                    self.get_logger().info(f"UAV{vid} landing before reset...")
-                except Exception:
-                    pass
-                try:
-                    landed_ok = self.land()
-                except Exception:
-                    pass
+                self.get_logger().info(f"[reboot] UAV{vid} landing before reset...")
+                
+                landed_ok = self.land()
+                
+                if not landed_ok:
+                    land_mode = SetMode.Request()
+                    land_mode.custom_mode = "AUTO.LAND"
+                    try:
+                        call_service_sync(self, self.set_mode_client, land_mode, timeout_sec=5.0)
+                    except Exception as e:
+                        self.get_logger().warn(f"[reboot] UAV{vid} land failed. {e}")
+                    landed_ok = self.wait_until_landed(timeout_s=60.0, window_s=2.0, eps=0.03)
+                if not landed_ok:
+                    raise RuntimeError("[reboot] Landing failed or timed out during PX4 reset")
             if bool(getattr(self.current_state, "armed", False)):
-                self.get_logger().info(f"UAV{vid} disarming...")
+                self.get_logger().info(f"[reboot] UAV{vid} disarming...")
                 if self.arming_client.wait_for_service(timeout_sec=5.0):
                     disarm_req = CommandBool.Request()
                     disarm_req.value = False
                     try:
                         call_service_sync(self, self.arming_client, disarm_req, timeout_sec=5.0)
-                        self.get_logger().info(f"UAV{vid} disarmed.")
+                        self.get_logger().info(f"[reboot] UAV{vid} disarmed.")
                     except Exception:
-                        self.get_logger().warn(f"UAV{vid} disarm failed.")
+                        self.get_logger().warn(f"[reboot] UAV{vid} disarm failed.")
                 self.wait_until_disarmed(timeout_s=10.0)
-        except Exception:
-            self.get_logger().warn(f"UAV{vid} disarm service failed.")
-            
-        self.get_logger().info(f"UAV{vid} rebooting to position {position} yaw={yaw_deg}")
-        if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
-            try:
-                import urllib.request, json as _json
-                url = f"{self._image_http_base}/uav/{vid}/reset"
-                payload = _json.dumps({"position": [float(position[0]), float(position[1]), float(position[2])], "yaw_deg": yaw_deg}).encode("utf-8")
-                req = urllib.request.Request(url, data=payload, method="POST")
-                req.add_header("Content-Type", "application/json")
-                try:
-                    with urllib.request.urlopen(req, timeout=60) as resp:
-                        _ = resp.read()
-                        self.get_logger().info(f"UAV{vid} reset response from PGSIM: {_}")
-                        self.get_logger().info(f"UAV{vid} moved in sim to {position} yaw={yaw_deg}")
-                except Exception as e:
-                    self.get_logger().warn(f"UAV{vid} reboot move Request failed. Exception: {e}")
-                    pass
-            except Exception as e:
-                self.get_logger().warn(f"UAV{vid} reboot move failed. Exception: {e}")
-                pass
-            
+        except Exception as e:
+            mode = getattr(self.current_state, "mode", "")
+            armed = bool(getattr(self.current_state, "armed", False))
+            z = float(self.current_pose.pose.position.z)
+            ls = int(getattr(self.extended_state, "landed_state", 0))
+            srv = getattr(self.arming_client, "srv_name", "<unknown>")
+            ready = bool(self.arming_client.service_is_ready())
+            self.get_logger().warn(f"[reboot] UAV{vid} disarm service failed: {e}; srv={srv} ready={ready} mode={mode} armed={armed} z={z:.3f} landed_state={ls}")
+        
         srv_name = self._mavros_prefix + "/mavros/cmd/command"
         reboot_attempted = False
         try:
@@ -741,41 +770,53 @@ class IsaacSimEnv(Node):
                     req.command = 246
                     req.param1 = 1.0
                     try:
+                        self.get_logger().info(f"[reboot] UAV{vid} rebooting by command long...")
                         call_service_sync(self, self.cmdlong_client, req, timeout_sec=10.0)
                         reboot_attempted = True
                     except Exception as e:
-                        self.get_logger().warn(f"PX4 reboot command failed: {e}")
+                        self.get_logger().warn(f"[reboot] PX4 reboot command failed: {e}")
                 else:
-                    self.get_logger().warn("cmd/command service not ready; skip reboot")
+                    self.get_logger().warn("[reboot] cmd/command service not ready; skip reboot")
             else:
-                self.get_logger().warn(f"Service {srv_name} not found; skip reboot")
+                self.get_logger().warn(f"[reboot] Service {srv_name} not found; skip reboot")
         except Exception:
-            self.get_logger().warn("Service discovery failed; skip reboot")
+            self.get_logger().warn("[reboot] Service discovery failed; skip reboot")
+            
+        self.get_logger().info(f"[reboot] UAV{vid} moving to position {position} yaw={yaw_deg}")
+        if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
+            try:
+                import urllib.request, json as _json
+                url = f"{self._image_http_base}/uav/{vid}/reset"
+                payload = _json.dumps({"position": [float(position[0]), float(position[1]), float(position[2])], "yaw_deg": yaw_deg}).encode("utf-8")
+                req = urllib.request.Request(url, data=payload, method="POST")
+                req.add_header("Content-Type", "application/json")
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        _ = resp.read()
+                        self.get_logger().info(f"[reboot] UAV{vid} reset response from PGSIM: {_}")
+                        self.get_logger().info(f"[reboot] UAV{vid} moved in sim to {position} yaw={yaw_deg}")
+                except Exception as e:
+                    self.get_logger().warn(f"[reboot] UAV{vid} reboot move Request failed. Exception: {e}")
+            except Exception as e:
+                self.get_logger().warn(f"[reboot] UAV{vid} reboot move failed. Exception: {e}")
 
         if reboot_attempted:
-            start = time.time()
-            while (time.time() - start) < 60.0:
-                try:
-                    st = wait_for_message(self, self._mavros_prefix + "/mavros/state", State, timeout=2.0)
-                    if getattr(st, "connected", False):
-                        break
-                except Exception:
-                    self.get_logger().warn(f"UAV{vid} state check failed.")
-        self.arming_client.wait_for_service(timeout_sec=10.0)
-        self.set_mode_client.wait_for_service(timeout_sec=10.0)
-
+            self.get_logger().info(f"[reboot] UAV{vid} waiting PX4 reboot completion, sleep 10s...")
+            time.sleep(10.0)
+        self.get_logger().info(f"[reboot] UAV{vid} arming_client.wait_for_service(timeout_sec=20.0)")
+        self.arming_client.wait_for_service(timeout_sec=20.0)
+        self.get_logger().info(f"[reboot] UAV{vid} set_mode_client.wait_for_service(timeout_sec=20.0)")
+        self.set_mode_client.wait_for_service(timeout_sec=20.0)
+        # 输出当前sys状态和位置信息
+        self.get_logger().info(f"[reboot] UAV{vid} current_state={self.current_state}")
+        self.get_logger().info(f"[reboot] UAV{vid} current_pose={self.current_pose}")
         # 3) 发布初始setpoints → 切换OFFBOARD→ 解锁 → 起飞到 INIT_HEIGHT（各60s超时）
-        try:
-            self.get_logger().info(f"UAV{vid} Publishing initial dummy setpoints to prevent RTL...")
-        except Exception:
-            pass
-        for _ in range(50):
-            self.pub_position(0.0, 0.0, 1.0)
+        self.get_logger().info(f"[reboot] UAV{vid} Publishing initial dummy setpoints to prevent RTL...")
+        for _ in range(80):
+            self.pub_position(0.0, 0.0, self.init_height)
             spin_sleep(self, 20.0)
-        try:
-            self.get_logger().info(f"UAV{vid} Initial setpoints published.")
-        except Exception:
-            pass
+
+        self.get_logger().info(f"[reboot] UAV{vid} Initial setpoints published.")
 
         self.offb_set_mode.custom_mode = "OFFBOARD"
         off_start = time.time()
@@ -783,40 +824,49 @@ class IsaacSimEnv(Node):
             try:
                 resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=5.0)
                 if resp and getattr(resp, "mode_sent", False):
-                    self.get_logger().info("***** OFFBOARD enabled *****")
-            except Exception:
-                pass
+                    self.get_logger().info("[reboot] ***** OFFBOARD enabled *****")
+            except Exception as e:
+                self.get_logger().warn(f"UAV{vid} OFFBOARD enable failed. Exception: {e}")
             spin_sleep(self, 2.0)
         if self.current_state.mode != "OFFBOARD":
             raise TimeoutError("OFFBOARD not enabled within 60s")
         try:
-            self.get_logger().info("Vehicle in OFFBOARD mode.")
-        except Exception:
-            pass
+            self.get_logger().info(f"[reboot] UAV{vid} Vehicle in OFFBOARD mode.")
+        except Exception as e:
+            self.get_logger().warn(f"[reboot] UAV{vid} Vehicle in OFFBOARD mode failed. Exception: {e}")
+
+        # Wait for local position estimate to be stable before arming to avoid
+        # preflight "position estimate error" after PX4 reboot.
+        pos_ready = self.wait_until_local_position_ready(
+            timeout_s=POSITION_READY_TIMEOUT_S,
+            window_s=POSITION_READY_WINDOW_S,
+            eps=POSITION_READY_EPS,
+        )
+        self.get_logger().info(
+            f"[reboot] UAV{vid} local position ready={pos_ready} (timeout={POSITION_READY_TIMEOUT_S}s, window={POSITION_READY_WINDOW_S}s, eps={POSITION_READY_EPS})"
+        )
 
         self.arm_cmd.value = True
         arm_start = time.time()
         while not self.current_state.armed and (time.time() - arm_start) < 60.0:
             try:
                 resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
+                # self.get_logger().info(f"[reboot] UAV{vid} arming resp={resp}")
                 if resp and getattr(resp, "success", False):
-                    self.get_logger().info(f"UAV{vid} ***** Vehicle armed *****")
+                    self.get_logger().info(f"[reboot] UAV{vid} ***** Vehicle armed *****")
                     break
-            except Exception:
-                pass
+            except Exception as e:
+                self.get_logger().warn(f"[reboot] UAV{vid} arming failed. Exception: {e}")
             spin_sleep(self, 2.0)
-        if not self.current_state.armed:
-            raise TimeoutError("Vehicle not armed within 60s")
-        try:
-            self.get_logger().info(f"UAV{vid} armed.")
-        except Exception:
-            pass
+        # if not self.current_state.armed:
+            # raise TimeoutError("Vehicle not armed within 60s")
+        self.get_logger().info(f"[reboot] UAV{vid} armed.")
 
         self.start_height = self.current_pose.pose.position.z
         target_x, target_y, target_z = 0.0, 0.0, self.start_height + self.init_height
         has_reached_initial_point = False
         required_height = float(self.init_height)
-        progress_bar = tqdm(total=required_height, desc="起飞进度", unit="m")
+        progress_bar = tqdm(total=required_height, desc="[reboot] 起飞进度", unit="m")
         while not has_reached_initial_point:
             self.pub_position(target_x, target_y, target_z)
             cur_z = float(self.current_pose.pose.position.z)
@@ -834,15 +884,13 @@ class IsaacSimEnv(Node):
                 progress_bar.last_print_n = required_height
                 progress_bar.update(0)
                 try:
-                    self.get_logger().info("***** Reached initial point *****")
+                    self.get_logger().info("[reboot] ***** Reached initial point *****")
                 except Exception:
                     pass
             rclpy.spin_once(self, timeout_sec=0.05)
             time.sleep(0.05)
-        try:
-            self.get_logger().info("Takeoff complete.")
-        except Exception:
-            pass
+        progress_bar.close()
+        self.get_logger().info("[reboot] Takeoff complete.")
 
         self.hover_target = (
             self.current_pose.pose.position.x,
@@ -850,7 +898,49 @@ class IsaacSimEnv(Node):
             self.current_pose.pose.position.z,
         )
         self.cmdlong_client.wait_for_service(timeout_sec=10.0)
-        self.get_logger().info("PX4 reboot complete; MAVROS reconnected.")
+        self.get_logger().info("[reboot] PX4 reboot complete; MAVROS reconnected.")
+
+    # def wait_for_px4_reboot_completion(self, timeout_s: float = 60.0) -> bool:
+    #     start = time.time()
+    #     last_pose = self._pose_updates
+    #     last_state = self._state_updates
+    #     step = 0.2
+    #     while time.time() - start < timeout_s:
+    #         svc_ready = self.arming_client.service_is_ready() and self.set_mode_client.service_is_ready()
+    #         pose_inc = self._pose_updates > last_pose
+    #         state_inc = self._state_updates > last_state
+    #         short_ready = False
+    #         self.get_logger().info(f"[reboot] UAV{self._vid} svc_ready={svc_ready}, pose_inc={pose_inc}, state_inc={state_inc}")
+    #         if svc_ready and pose_inc and state_inc:
+    #             short_ready = self.wait_until_local_position_ready(timeout_s=5.0, window_s=0.8, eps=POSITION_READY_EPS)
+    #         if svc_ready and pose_inc and state_inc and short_ready:
+    #             self.get_logger().info(f"[reboot] UAV{self._vid} local position ready={short_ready} (timeout={timeout_s}s, window={window_s}s, eps={eps})")
+    #             return True
+    #         last_pose = self._pose_updates
+    #         last_state = self._state_updates
+    #         time.sleep(step)
+    #     return False
+
+    def wait_until_local_position_ready(self, timeout_s: float = 30.0, window_s: float = 1.5, eps: float = 0.05) -> bool:
+        start = time.time()
+        last = None
+        stable_for = 0.0
+        step = 0.1
+        samples = 0
+        while time.time() - start < timeout_s:
+            z = float(self.current_pose.pose.position.z)
+            self.get_logger().info(f"UAV{self._vid} local position z={z}")
+            samples += 1
+            if last is not None and abs(z - last) <= eps:
+                stable_for += step
+            else:
+                stable_for = 0.0
+            last = z
+            if stable_for >= window_s and samples >= 10:
+                return True
+            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(step)
+        return False
 
     def wait_for_fcu_connection(self):
         """在 MAVROS 启动后阻塞等待 FCU 连接成功。"""
@@ -1060,24 +1150,134 @@ class IsaacSimEnv(Node):
             except Exception:
                 return None
 
-    def land(self, descend_rate: float = 0.2):
+    def land(self):
+        vid = int(self._vid)
         target_z = getattr(self, "start_height", 0.0)
-        while rclpy.ok() and (self.current_pose.pose.position.z - target_z) > 0.05:
-            x = self.current_pose.pose.position.x
-            y = self.current_pose.pose.position.y
-            z = max(target_z, self.current_pose.pose.position.z - descend_rate * 0.1)
-            self.pub_position(x, y, z)
-            rclpy.spin_once(self, timeout_sec=0.05)
-            time.sleep(0.1)
-        landed = self.wait_until_landed(target_z, timeout_s=15.0, window_s=2.0, eps=0.03)
-        if landed:
+        self.get_logger().info(f"UAV{vid} initiating landing via MAVROS CommandLong MAV_CMD_NAV_LAND (21). target_z={target_z}")
+        self.get_logger().info(f"UAV{vid} land() context before pause: mode={getattr(self.current_state,'mode','')} armed={bool(getattr(self.current_state,'armed',False))} z={float(getattr(getattr(self,'current_pose',PoseStamped()),'pose',PoseStamped().pose).position.z or 0.0):.3f} ls={int(getattr(self.extended_state,'landed_state',0))}")
+        old_hover = self.hover_target
+        self._landing_in_progress = True
+        try:
+            self.hover_target = None
+
+            sent_cmd = False
             try:
-                disarm_req = CommandBool.Request()
-                disarm_req.value = False
-                call_service_sync(self, self.arming_client, disarm_req, timeout_sec=5.0)
+                if self.cmdlong_client.wait_for_service(timeout_sec=5.0):
+                    req = CommandLong.Request()
+                    req.command = 21
+                    req.confirmation = 0
+                    req.param1 = float('nan')
+                    req.param2 = float('nan')
+                    req.param3 = float('nan')
+                    req.param4 = float('nan')
+                    req.param5 = float('nan')
+                    req.param6 = float('nan')
+                    req.param7 = float('nan')
+                    self.get_logger().info(f"UAV{vid} calling cmd/command MAV_CMD_NAV_LAND")
+                    resp = call_service_sync(self, self.cmdlong_client, req, timeout_sec=5.0)
+                    self.get_logger().info(f"UAV{vid} NAV_LAND resp: success={getattr(resp,'success',None)} result={getattr(resp,'result',None)}")
+                    sent_cmd = True
+                else:
+                    self.get_logger().warn(f"UAV{vid} cmd/command service not ready; skip CommandLong")
             except Exception as e:
-                self.get_logger().error(f"Failed to disarm the vehicle. {e}")
-            self.wait_until_disarmed(timeout_s=10.0)
+                self.get_logger().warn(f"UAV{vid} CommandLong NAV_LAND failed: {e}")
+
+            if not sent_cmd:
+                try:
+                    land_mode = SetMode.Request()
+                    land_mode.custom_mode = "AUTO.LAND"
+                    self.get_logger().info(f"UAV{vid} fallback: set_mode AUTO.LAND")
+                    resp2 = call_service_sync(self, self.set_mode_client, land_mode, timeout_sec=5.0)
+                    self.get_logger().info(f"UAV{vid} set_mode AUTO.LAND resp: {resp2}")
+                except Exception as e:
+                    self.get_logger().warn(f"UAV{vid} fallback set_mode AUTO.LAND failed: {e}")
+
+            start = time.time()
+            window_s = LAND_STABLE_WINDOW_S
+            eps = LAND_STABLE_EPS
+            stable_for = 0.0
+            last = None
+            step = 0.2
+            timeout_s = LAND_TIMEOUT_S
+
+            initial_z = float(self.current_pose.pose.position.z)
+            total_desc = max(0.0, initial_z - float(target_z))
+            progress_bar = tqdm(total=total_desc if total_desc > 0 else 1.0, desc="降落进度", unit="m")
+            progress_counter = 0
+
+            landed = False
+            while time.time() - start < timeout_s and rclpy.ok():
+                z = float(self.current_pose.pose.position.z)
+                try:
+                    on_ground = int(getattr(self.extended_state, "landed_state", 0)) == int(ExtendedState.LANDED_STATE_ON_GROUND)
+                except Exception:
+                    on_ground = False
+                near_target = abs(z - target_z) <= 0.05
+                if near_target or on_ground:
+                    if last is not None and abs(z - last) <= eps:
+                        stable_for += step
+                    else:
+                        stable_for = 0.0
+                else:
+                    stable_for = 0.0
+                last = z
+                mode = getattr(self.current_state, "mode", "")
+                armed = bool(getattr(self.current_state, "armed", False))
+                ach = max(0.0, initial_z - z)
+                if ach > progress_bar.total:
+                    ach = progress_bar.total
+                progress_counter += 1
+                if progress_counter >= 20:
+                    progress_counter = 0
+                    progress_bar.n = ach
+                    progress_bar.last_print_n = ach
+                    progress_bar.set_postfix({
+                        "z": f"{z:.2f}",
+                        "ground": on_ground,
+                        "near": near_target,
+                        "stable": f"{stable_for:.1f}s",
+                        "mode": mode,
+                    })
+                    progress_bar.update(0)
+                if stable_for >= window_s:
+                    landed = True
+                    break
+                rclpy.spin_once(self, timeout_sec=0.05)
+                time.sleep(step)
+
+            if landed:
+                progress_bar.n = progress_bar.total
+                progress_bar.last_print_n = progress_bar.total
+                progress_bar.update(0)
+                progress_bar.close()
+                self.get_logger().info(f"UAV{vid} landed. disarming...")
+                try:
+                    disarm_req = CommandBool.Request()
+                    disarm_req.value = False
+                    resp3 = call_service_sync(self, self.arming_client, disarm_req, timeout_sec=5.0)
+                    self.get_logger().info(f"UAV{vid} disarm resp: {resp3}")
+                except Exception as e:
+                    mode = getattr(self.current_state, "mode", "")
+                    armed = bool(getattr(self.current_state, "armed", False))
+                    z = float(self.current_pose.pose.position.z)
+                    ls = int(getattr(self.extended_state, "landed_state", 0))
+                    srv = getattr(self.arming_client, "srv_name", "<unknown>")
+                    ready = bool(self.arming_client.service_is_ready())
+                    self.get_logger().error(f"UAV{vid} disarm failed: {e}; srv={srv} ready={ready} mode={mode} armed={armed} z={z:.3f} landed_state={ls}")
+                self.wait_until_disarmed(timeout_s=DISARM_TIMEOUT_S)
+            else:
+                progress_bar.close()
+                z = float(self.current_pose.pose.position.z)
+                dist = abs(z - target_z)
+                ls = int(getattr(self.extended_state, "landed_state", 0))
+                mode = getattr(self.current_state, "mode", "")
+                armed = bool(getattr(self.current_state, "armed", False))
+                self.get_logger().warn(f"UAV{vid} landing timeout: z={z:.3f} target_z={target_z:.3f} dist={dist:.3f} stable_for={stable_for:.1f}s landed_state={ls} mode={mode} armed={armed}")
+                self.get_logger().warn(f"UAV{vid} landing timeout context: _landing_in_progress={getattr(self,'_landing_in_progress',None)} hover_target={self.hover_target}")
+        finally:
+            self.hover_target = old_hover
+            self._landing_in_progress = False
+        self.get_logger().info(f"UAV{vid} land() exit: landed={landed} mode={getattr(self.current_state,'mode','')} armed={bool(getattr(self.current_state,'armed',False))} z={float(self.current_pose.pose.position.z):.3f} ls={int(getattr(self.extended_state,'landed_state',0))}")
         return landed
 
     def wait_until_landed(self, target_z: Optional[float] = None, timeout_s: float = 15.0, window_s: float = 2.0, eps: float = 0.03) -> bool:
@@ -1146,6 +1346,10 @@ class IsaacSimEnv(Node):
                 resp = {"ok": False, "error": f"Unknown cmd: {ctype}"}
         except Exception as e:
             resp = {"ok": False, "error": str(e)}
+            try:
+                self.get_logger().error(f"HTTP command '{ctype}' failed: {e}")
+            except Exception:
+                pass
         return resp
 
 
@@ -1187,7 +1391,10 @@ def main():
             env.get_logger().error(f"Failed to configure MAVROS time sync parameters: {e}")
 
         # Hover + HTTP commands loop (wait for external HTTP commands)
-        env._http_hover_loop()
+        try:
+            env._http_hover_loop()
+        except Exception as e:
+            env.get_logger().error(f"Hover loop exception: {e}")
 
     except Exception as e:
         # 异常情况：记录错误但继续执行清理流程
