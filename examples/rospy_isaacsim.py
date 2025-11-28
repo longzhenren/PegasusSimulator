@@ -224,6 +224,7 @@ class IsaacSimEnv(Node):
         # self.bridge = CvBridge()
         self.current_pose = PoseStamped()
         self.current_state = State()
+        self._reset_target_position = None
 
         self._shutdown_requested = False
         self._external_spin = False
@@ -837,14 +838,15 @@ class IsaacSimEnv(Node):
 
         # Wait for local position estimate to be stable before arming to avoid
         # preflight "position estimate error" after PX4 reboot.
-        pos_ready = self.wait_until_local_position_ready(
-            timeout_s=POSITION_READY_TIMEOUT_S,
-            window_s=POSITION_READY_WINDOW_S,
-            eps=POSITION_READY_EPS,
-        )
-        self.get_logger().info(
-            f"[reboot] UAV{vid} local position ready={pos_ready} (timeout={POSITION_READY_TIMEOUT_S}s, window={POSITION_READY_WINDOW_S}s, eps={POSITION_READY_EPS})"
-        )
+        # pos_ready = self.wait_until_local_position_ready(
+        #     timeout_s=POSITION_READY_TIMEOUT_S,
+        #     window_s=POSITION_READY_WINDOW_S,
+        #     eps=POSITION_READY_EPS,
+        # )
+        # self.get_logger().info(
+        #     f"[reboot] UAV{vid} local position ready={pos_ready} (timeout={POSITION_READY_TIMEOUT_S}s, window={POSITION_READY_WINDOW_S}s, eps={POSITION_READY_EPS})"
+        # )
+        time.sleep(5.0)
 
         self.arm_cmd.value = True
         arm_start = time.time()
@@ -863,18 +865,29 @@ class IsaacSimEnv(Node):
         self.get_logger().info(f"[reboot] UAV{vid} armed.")
 
         self.start_height = self.current_pose.pose.position.z
-        target_x, target_y, target_z = 0.0, 0.0, self.start_height + self.init_height
+        if self._reset_target_position and len(self._reset_target_position) >= 3:
+            target_x = float(self.current_pose.pose.position.x)
+            target_y = float(self.current_pose.pose.position.y)
+            target_z = float(self._reset_target_position[2])
+        else:
+            target_x = float(self.current_pose.pose.position.x)
+            target_y = float(self.current_pose.pose.position.y)
+            target_z = float(self.start_height + self.init_height)
         has_reached_initial_point = False
-        required_height = float(self.init_height)
+        required_height = max(0.0, float(target_z) - float(self.start_height))
+        progress_counter = 0
         progress_bar = tqdm(total=required_height, desc="[reboot] 起飞进度", unit="m")
         while not has_reached_initial_point:
             self.pub_position(target_x, target_y, target_z)
             cur_z = float(self.current_pose.pose.position.z)
             climb = max(0.0, cur_z - float(self.start_height))
             shown = min(required_height, climb)
-            progress_bar.n = shown
-            progress_bar.last_print_n = shown
-            progress_bar.update(0)
+            progress_counter += 1
+            if progress_counter >= 20:
+                progress_counter = 0
+                progress_bar.n = shown
+                progress_bar.last_print_n = shown
+                progress_bar.update(0)
             dx = float(self.current_pose.pose.position.x) - target_x
             dy = float(self.current_pose.pose.position.y) - target_y
             dz = float(self.current_pose.pose.position.z) - target_z
@@ -921,7 +934,7 @@ class IsaacSimEnv(Node):
     #         time.sleep(step)
     #     return False
 
-    def wait_until_local_position_ready(self, timeout_s: float = 30.0, window_s: float = 1.5, eps: float = 0.05) -> bool:
+    def wait_until_local_position_ready(self, timeout_s: float = 30.0, window_s: float = 1.5, eps: float = 0.1) -> bool:
         start = time.time()
         last = None
         stable_for = 0.0
@@ -929,14 +942,14 @@ class IsaacSimEnv(Node):
         samples = 0
         while time.time() - start < timeout_s:
             z = float(self.current_pose.pose.position.z)
-            self.get_logger().info(f"UAV{self._vid} local position z={z}")
+            # self.get_logger().info(f"UAV{self._vid} local position z={z}")
             samples += 1
             if last is not None and abs(z - last) <= eps:
                 stable_for += step
             else:
                 stable_for = 0.0
             last = z
-            if stable_for >= window_s and samples >= 10:
+            if stable_for >= window_s and samples >= 5:
                 return True
             rclpy.spin_once(self, timeout_sec=0.05)
             time.sleep(step)
