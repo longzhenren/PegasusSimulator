@@ -8,6 +8,7 @@ __all__ = ["PX4MavlinkBackend", "PX4MavlinkBackendConfig"]
 
 import carb
 import time
+import traceback
 import numpy as np
 from pymavlink import mavutil
 
@@ -238,6 +239,9 @@ class PX4MavlinkBackendConfig(BackendConfig):
         # and infer directly from the function calls)
         self.update_rate: float = self.config.get("update_rate", 250.0)  # [Hz]
 
+        # The simulation speed factor
+        self.sim_speed_factor: float = self.config.get("sim_speed_factor", 1.0)
+
 
 class PX4MavlinkBackend(Backend):
     """ The Mavlink Backend used to receive the vehicle's state and sensor data in order to send to PX4 through mavlink. It also
@@ -275,6 +279,10 @@ class PX4MavlinkBackend(Backend):
         self.px4_vehicle_model: str = self.config.px4_vehicle_model  # only needed if px4_autolaunch == True
         self.px4_tool: PX4LaunchTool = None
         self.px4_dir: str = self.config.px4_dir
+
+        # Registry for managing PX4 processes per vehicle (persisted via pid files)
+        # Prefer reusing existing PX4 if already launched elsewhere
+        self._px4_pid_path = PX4LaunchTool.pid_file_path(self._vehicle_id)
 
         # They are configured and launched by the external control script.
 
@@ -524,9 +532,28 @@ class PX4MavlinkBackend(Backend):
         # Launch the PX4 in the background if needed
         if self.px4_tool is None:
             carb.log_info(f"{self._log_prefix} Attempting to launch PX4 in background process")
-            self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model)
+            self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model, self.config.sim_speed_factor)
             if self.px4_autolaunch:
-                self.px4_tool.launch_px4()
+                # If a pid file exists, verify the process is alive; otherwise relaunch
+                try:
+                    import os
+                    exists = os.path.exists(self._px4_pid_path)
+                    alive = self._is_px4_alive() if exists else False
+                    if exists and alive:
+                        carb.log_info(f"{self._log_prefix} Existing PX4 pid alive ({self._px4_pid_path}); skipping autolaunch")
+                    else:
+                        if exists and not alive:
+                            try:
+                                os.remove(self._px4_pid_path)
+                                carb.log_warn(f"{self._log_prefix} Removed stale PX4 pid file {self._px4_pid_path}")
+                            except Exception as e_rm:
+                                carb.log_warn(f"{self._log_prefix} Remove stale PID failed: {e_rm}")
+                                carb.log_warn(traceback.format_exc())
+                        self.px4_tool.launch_px4()
+                except Exception as e:
+                    carb.log_warn(f"{self._log_prefix} PID/alive check failed: {e}; autolaunch anyway")
+                    carb.log_warn(traceback.format_exc())
+                    self.px4_tool.launch_px4()
             # Internal MAVROS launch disabled
             
 
@@ -546,13 +573,79 @@ class PX4MavlinkBackend(Backend):
         self._connection.close()
         self._connection = None
 
-        # Close the PX4 if it was running
+        # Close the PX4 if it was running and was autolaunched by this backend
         if self.px4_tool is not None:
             carb.log_info(f"{self._log_prefix} Attempting to kill PX4 background process")
             if self.px4_autolaunch:
-                self.px4_tool.kill_px4()
+                try:
+                    self.px4_tool.kill_px4()
+                except Exception as e:
+                    carb.log_warn(f"{self._log_prefix} PX4 kill failed: {e}")
+                    carb.log_warn(traceback.format_exc())
             # Internal MAVROS termination disabled
             self.px4_tool = None
+
+    def hard_reboot_px4(self):
+        """Immediately terminate PX4 process for this vehicle and clear registry.
+        The simulator keeps running; other vehicles remain unaffected.
+        """
+        try:
+            carb.log_warn(f"{self._log_prefix} HARD reboot: killing PX4 process")
+            if self.px4_tool is not None:
+                self.px4_tool.kill_px4()
+            else:
+                import os, signal
+                if os.path.exists(self._px4_pid_path):
+                    with open(self._px4_pid_path, "r") as f:
+                        pid = int(f.read().strip() or "0")
+                    if pid > 0:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except Exception as e:
+                            carb.log_warn(f"{self._log_prefix} SIGKILL PX4 failed: {e}")
+                            carb.log_warn(traceback.format_exc())
+                    try:
+                        os.remove(self._px4_pid_path)
+                    except Exception as e:
+                        carb.log_warn(f"{self._log_prefix} Remove PX4 pid file failed: {e}")
+                        carb.log_warn(traceback.format_exc())
+        except Exception as e:
+            carb.log_warn(f"{self._log_prefix} HARD reboot encountered error: {e}")
+            carb.log_warn(traceback.format_exc())
+
+        # Reset MAVLink interface so ports are free to reconnect
+        try:
+            if self._connection is not None:
+                self._connection.close()
+        except Exception as e:
+            carb.log_warn(f"{self._log_prefix} MAVLink close failed: {e}")
+            carb.log_warn(traceback.format_exc())
+        self._connection = None
+        self._is_running = False
+        # Reset protocol state so update() restarts heartbeat wait cleanly
+        self._received_first_hearbeat = False
+        self._received_first_actuator = False
+        self._received_actuator = False
+        self._last_heartbeat_sent_time = 0
+        self._last_waiting_heartbeat_log_time = 0
+
+    def soft_relaunch_px4(self):
+        """Relaunch PX4 using current config without stopping simulator."""
+        try:
+            carb.log_info(f"{self._log_prefix} Relaunching PX4")
+            # Ensure previous pid file is cleared to avoid px4 thinking 'server not running'
+            try:
+                import os
+                if os.path.exists(self._px4_pid_path):
+                    os.remove(self._px4_pid_path)
+            except Exception as e:
+                carb.log_warn(f"{self._log_prefix} Remove stale PID before relaunch failed: {e}")
+                carb.log_warn(traceback.format_exc())
+            self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model, self.config.sim_speed_factor)
+            self.px4_tool.launch_px4()
+        except Exception as e:
+            carb.log_warn(f"{self._log_prefix} Relaunch PX4 failed: {e}")
+            carb.log_warn(traceback.format_exc())
 
     def reset(self):
         """For now does nothing. Here for compatibility purposes only
@@ -612,6 +705,13 @@ class PX4MavlinkBackend(Backend):
             dt (float): The time elapsed between the previous and current function calls (s).
         """
 
+        # Ensure PX4 process is running (auto-recover if killed externally)
+        self._ensure_px4_running_periodic()
+
+        # Guard: mavlink connection may be None during hard reset/relaunch
+        if self._connection is None:
+            return
+
         # Check for the first hearbeat on the first few iterations
         if not self._received_first_hearbeat:
             self.wait_for_first_hearbeat()
@@ -641,6 +741,48 @@ class PX4MavlinkBackend(Backend):
         # Send the GPS messages
         self.send_gps_msgs(self._current_utime)
 
+    def _is_px4_alive(self) -> bool:
+        try:
+            import os, signal
+            if not os.path.exists(self._px4_pid_path):
+                return False
+            with open(self._px4_pid_path, "r") as f:
+                pid = int((f.read().strip() or "0"))
+            if pid <= 0:
+                return False
+            try:
+                os.kill(pid, 0)
+                return True
+            except Exception as e:
+                carb.log_warn(f"{self._log_prefix} os.kill(0) check failed: {e}")
+                carb.log_warn(traceback.format_exc())
+                return False
+        except Exception as e:
+            carb.log_warn(f"{self._log_prefix} _is_px4_alive error: {e}")
+            carb.log_warn(traceback.format_exc())
+            return False
+
+    def _ensure_px4_running_periodic(self):
+        # Throttle checks to avoid spamming
+        now = time.time()
+        if not hasattr(self, "_last_px4_check_time"):
+            self._last_px4_check_time = 0.0
+            self._px4_check_interval = 1.0
+        if (now - self._last_px4_check_time) < self._px4_check_interval:
+            return
+        self._last_px4_check_time = now
+
+        if not self.px4_autolaunch:
+            return
+        if self._is_px4_alive():
+            return
+        try:
+            carb.log_warn(f"{self._log_prefix} PX4 not alive; attempting relaunch")
+            self.soft_relaunch_px4()
+        except Exception as e:
+            carb.log_warn(f"{self._log_prefix} Periodic relaunch failed: {e}")
+            carb.log_warn(traceback.format_exc())
+
     def poll_mavlink_messages(self):
         """
         Method that is used to check if new mavlink messages were received
@@ -648,6 +790,10 @@ class PX4MavlinkBackend(Backend):
 
         # If we have not received the first hearbeat yet, do not poll for mavlink messages
         if self._received_first_hearbeat == False:
+            return
+
+        # Guard: mavlink connection may be None during hard reset/relaunch
+        if self._connection is None:
             return
 
         # Check if we need to lock and wait for actuator control data
@@ -689,6 +835,10 @@ class PX4MavlinkBackend(Backend):
 
         carb.log_info(f"{self._log_prefix} Sending heartbeat")
 
+        # Guard: mavlink connection may be None during hard reset/relaunch
+        if self._connection is None:
+            return
+
         # Note: to know more about these functions, go to pymavlink->dialects->v20->standard.py
         # This contains the definitions for sending the hearbeat and simulated sensor messages
         self._connection.mav.heartbeat_send(mav_type, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
@@ -701,6 +851,10 @@ class PX4MavlinkBackend(Backend):
             time_usec (int): The total time elapsed since the simulation started
         """
         carb.log_info(f"{self._log_prefix} Sending sensor msgs")
+
+        # Guard: mavlink connection may be None during hard reset/relaunch
+        if self._connection is None:
+            return
 
         # Check which sensors have new data to send
         fields_updated: int = 0
@@ -755,6 +909,10 @@ class PX4MavlinkBackend(Backend):
         """
         carb.log_info("Sending GPS msgs")
 
+        # Guard: mavlink connection may be None during hard reset/relaunch
+        if self._connection is None:
+            return
+
         # Do not send GPS data, if no new data was received
         if not self._sensor_data.new_gps_data:
             return
@@ -790,6 +948,10 @@ class PX4MavlinkBackend(Backend):
         """
         carb.log_info(f"{self._log_prefix} Sending vision/mocap msgs")
 
+        # Guard: mavlink connection may be None during hard reset/relaunch
+        if self._connection is None:
+            return
+
         # Do not send vision/mocap data, if not new data was received
         if not self._sensor_data.new_vision_data:
             return
@@ -819,6 +981,10 @@ class PX4MavlinkBackend(Backend):
         """
 
         carb.log_info(f"{self._log_prefix} Sending groundtruth msgs")
+
+        # Guard: mavlink connection may be None during hard reset/relaunch
+        if self._connection is None:
+            return
 
         # Do not send vision/mocap data, if not new data was received
         if not self._sensor_data.new_sim_state or self._sensor_data.sim_alt == 0:
