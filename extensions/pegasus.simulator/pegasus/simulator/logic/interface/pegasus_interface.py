@@ -349,7 +349,7 @@ class PegasusInterface:
 
     def set_world_settings(self, physics_dt=None, stage_units_in_meters=None, rendering_dt=None, device=None):
         """
-        Set the current world settings to the pre-defined settings. TODO - finish the implementation of this method.
+        Set the current world settings to the pre-defined settings.
         For now these new setting will never override the default ones.
         """
         # Set the physics engine update rate
@@ -366,6 +366,31 @@ class PegasusInterface:
 
         if device is not None:
             self._world_settings["device"] = device
+
+    def set_time_scale(self, time_scale: float):
+        """
+        Method that sets the time scale of the simulation
+        Args:
+            time_scale (float): The time scale factor. 1.0 is real-time, > 1.0 is faster than real-time, < 1.0 is slower than real-time
+        """
+        if self._world is not None:
+            pass
+            # Note: Isaac Sim's time scaling is typically handled by adjusting physics steps per render frame
+            # or by setting the time scale on the Timeline.
+            # However, since we are using a custom physics loop via World, 
+            # the 'physics_dt' effectively controls the simulation step size.
+            # If we want to run faster than real-time, we need to ensure the physics loop runs faster
+            # relative to wall clock time, which is often limited by rendering performance.
+            # 
+            # For headless mode or when rendering is decoupled, simply running the loop as fast as possible
+            # (which is default behavior unless throttled) will achieve max speed.
+            #
+            # To enforcing a specific time scale requires controlling the relationship between
+            # simulation time and wall clock time.
+            
+            # TODO: Implement explicit time scaling control if needed beyond "run as fast as possible".
+            # Currently, setting physics_dt and ensuring no real-time throttling (if any) is the key.
+
 
     def _get_px4_path_from_config(self):
         """

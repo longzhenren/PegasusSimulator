@@ -100,6 +100,9 @@ class ROS2Backend(Backend):
         # Optional: bridge /nav/velocity -> /mavros/setpoint_raw/local
         self._bridge_nav_velocity = config.get("bridge_nav_velocity", False) and mavros_loaded
         self._bridge_rate_hz = float(config.get("bridge_rate_hz", 30.0)) if self._bridge_nav_velocity else 0.0
+        
+        # Enable use of sim time if requested
+        self._use_sim_time = config.get("use_sim_time", True)
 
         # Check if the tf2_ros library is loaded and if the flag is set to True
         self._pub_tf = config.get("pub_tf", False) and tf2_ros_loaded
@@ -112,6 +115,10 @@ class ROS2Backend(Backend):
             pass
 
         self.node = rclpy.create_node("simulator_vehicle_" + str(vehicle_id))
+        
+        # Set use_sim_time parameter
+        if self._use_sim_time:
+            self.node.set_parameters([rclpy.parameter.Parameter("use_sim_time", rclpy.Parameter.Type.BOOL, True)])
 
         # Initialize the publishers and subscribers
         self.initialize_publishers(config)
@@ -447,6 +454,26 @@ class ROS2Backend(Backend):
         # Check if the camera name exists in the writers dictionary
         if data["camera_name"] not in self.graphical_sensors_writers:
             self.add_monocular_camera_writter(data)
+        
+        # If on-demand rendering is enabled for the camera, signal that we need an update
+        # We can check if the camera object has the attribute and request it
+        # This ensures that if we are running the ROS2 backend, we request updates
+        if "camera" in data and hasattr(data["camera"], "request_update"):
+             # We might want to control this frequency, but for now request every frame 
+             # if we are connected and publishing
+             pass
+             # Note: The camera object passed in data is the omni.isaac.sensor.Camera object, 
+             # not the MonocularCamera wrapper. So we can't call request_update() directly on it easily here
+             # unless we change what is passed in 'data'.
+             # However, the MonocularCamera wrapper calls this update_monocular_camera_data with the data dict.
+             # The logic for requesting update should ideally be in the vehicle or main loop if ROS2 is active,
+             # OR we assume if ROS2 backend is active, we want continuous updates?
+             # For now, let's rely on the MonocularCamera's on_demand logic which defaults to continuous if not set.
+             # If the user sets on_demand=True, they must manage requests or we add logic here.
+             
+             # If we really need to drive the camera from here, we need a reference to the MonocularCamera wrapper.
+             # But we only get the data dict.
+             pass
 
 
     def add_monocular_camera_writter(self, data):

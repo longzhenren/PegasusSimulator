@@ -63,6 +63,11 @@ class MonocularCamera(GraphicalSensor):
         self._intrinsics = config.get("intrinsics", np.array([[958.8, 0.0, 957.8], [0.0, 956.7, 589.5], [0.0, 0.0, 1.0]]))
         self._distortion_coefficients = config.get("distortion_coefficients", np.array([0.14, -0.03, -0.0002, -0.00003, 0.009, 0.5, -0.07, 0.017]))
         self._diagonal_fov = config.get("diagonal_fov", 140.0)
+        
+        # Configuration for on-demand rendering
+        # If True, camera only updates when requested via request_update() or if ROS2 backend is enabled and needs it
+        self._on_demand = config.get("on_demand", False)
+        self._update_requested = False
 
         # Setup an empty camera output dictionary
         self._state = {}
@@ -129,6 +134,12 @@ class MonocularCamera(GraphicalSensor):
         return self._state
 
 
+    def request_update(self):
+        """
+        Method that requests a camera update for the next rendering step.
+        """
+        self._update_requested = True
+
     @GraphicalSensor.update_at_rate
     def update(self, state: State, dt: float):
         """Method that gets the current RGB image from the camera and returns it as a dictionary.
@@ -148,6 +159,21 @@ class MonocularCamera(GraphicalSensor):
         # If all the camera properties are not set yet, return None
         if not self._camera_full_set:
             return None
+            
+        # Check if on-demand rendering is enabled and if an update was requested
+        if self._on_demand and not self._update_requested:
+            # If on-demand is on but no update requested, return cached state if available or None
+            return self._state if self._state else None
+            
+        # Reset request flag
+        if self._on_demand:
+            self._update_requested = False
+
+        # Check if we are rendering at a lower frequency than the camera frequency
+        # and warn the user if that is the case
+        if dt > (1.0 / self._frequency) * 1.1:
+            import carb
+            carb.log_warn(f"Camera {self._camera_name} is running at {1.0/dt:.2f} Hz, which is lower than the requested {self._frequency} Hz. Consider reducing the resolution or the number of cameras.")
 
         # Get the data from the camera
         # TODO: Fix this feature later

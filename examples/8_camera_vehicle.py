@@ -57,27 +57,27 @@ from flask import Flask, jsonify, request, Response
 from werkzeug.serving import make_server
 from scipy.spatial.transform import Rotation
 
-SIMULATION_ENVIRONMENTS = {}
-NVIDIA_SIMULATION_ENVIRONMENTS = {
-    "Default Environment": "Grid/default_environment.usd",
-    "Black Gridroom": "Grid/gridroom_black.usd",
-    "Curved Gridroom": "Grid/gridroom_curved.usd",
-    "Hospital": "Hospital/hospital.usd",
-    "Office": "Office/office.usd",
-    "Simple Room": "Simple_Room/simple_room.usd",
-    "Warehouse": "Simple_Warehouse/warehouse.usd",
-    "Warehouse with Forklifts": "Simple_Warehouse/warehouse_with_forklifts.usd",
-    "Warehouse with Shelves": "Simple_Warehouse/warehouse_multiple_shelves.usd",
-    "Full Warehouse": "Simple_Warehouse/full_warehouse.usd",
-    "Flat Plane": "Terrains/flat_plane.usd",
-    "Rough Plane": "Terrains/rough_plane.usd",
-    "Slope Plane": "Terrains/slope.usd",
-    "Stairs Plane": "Terrains/stairs.usd",
-}
-for asset in NVIDIA_SIMULATION_ENVIRONMENTS:
-    SIMULATION_ENVIRONMENTS[asset] = (
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Environments/" + NVIDIA_SIMULATION_ENVIRONMENTS[asset]
-    )
+# SIMULATION_ENVIRONMENTS = {}
+# NVIDIA_SIMULATION_ENVIRONMENTS = {
+#     "Default Environment": "Grid/default_environment.usd",
+#     "Black Gridroom": "Grid/gridroom_black.usd",
+#     "Curved Gridroom": "Grid/gridroom_curved.usd",
+#     "Hospital": "Hospital/hospital.usd",
+#     "Office": "Office/office.usd",
+#     "Simple Room": "Simple_Room/simple_room.usd",
+#     "Warehouse": "Simple_Warehouse/warehouse.usd",
+#     "Warehouse with Forklifts": "Simple_Warehouse/warehouse_with_forklifts.usd",
+#     "Warehouse with Shelves": "Simple_Warehouse/warehouse_multiple_shelves.usd",
+#     "Full Warehouse": "Simple_Warehouse/full_warehouse.usd",
+#     "Flat Plane": "Terrains/flat_plane.usd",
+#     "Rough Plane": "Terrains/rough_plane.usd",
+#     "Slope Plane": "Terrains/slope.usd",
+#     "Stairs Plane": "Terrains/stairs.usd",
+# }
+# for asset in NVIDIA_SIMULATION_ENVIRONMENTS:
+#     SIMULATION_ENVIRONMENTS[asset] = (
+#         "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Environments/" + NVIDIA_SIMULATION_ENVIRONMENTS[asset]
+#     )
 
 
 # Start Isaac Sim's simulation environment
@@ -96,12 +96,14 @@ for asset in NVIDIA_SIMULATION_ENVIRONMENTS:
 # - 建议：多载具/多相机场景下将 RENDER_MAX_FPS 调低（例如 10–20），配合栅格化渲染可显著降低 GPU 消耗。
 # - 边界：不应设为 <=0。代码中使用 max(RENDER_MAX_FPS, 0.1) 以避免除零并保持健壮性。
 # 切换到 Rasterization（栅格化）以降低 GPU 消耗；如需光追请设为 False
-USE_RASTERIZATION = False
+USE_RASTERIZATION = True
 # 渲染节流：仅按设定 FPS 渲染；其余物理步不渲染（相机不更新）
 RENDER_THROTTLE = True
 RENDER_MAX_FPS = 10.0
-USD_PATH = SIMULATION_ENVIRONMENTS['Default Environment']
+CAMERA_RESOLUTION = (640, 640)
+# USD_PATH = SIMULATION_ENVIRONMENTS['Default Environment']
 # USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
+USD_PATH = "/home/user/export/Demo_Environment.usda"
 # -------------------------
 # Recording (global switch)
 # -------------------------
@@ -127,11 +129,11 @@ APP_CONFIG = {
     "window_width": 1280,
     "window_height": 720,
     "headless": True,
-    "max_bounces": 1,  # RT 模式里 bounces 越低越快
-    "samples_per_pixel_per_frame": 16,  # 默认 64，很吃GPU，先降
+    "max_bounces": 0 if USE_RASTERIZATION else 1,  # RT 模式里 bounces 越低越快
+    "samples_per_pixel_per_frame": 1 if USE_RASTERIZATION else 16,  # 默认 64，很吃GPU，先降
     "anti_aliasing": 1,  # 0/1 更快（3=高质量）
-    "renderer": "RayTracedLighting",
-    # "renderer": "Rasterization",
+    # "renderer": "RayTracedLighting",
+    "renderer": "Rasterization" if USE_RASTERIZATION else "RayTracedLighting",
     # Ref: https://docs.isaacsim.omniverse.nvidia.com/4.5.0/reference_material/sim_performance_optimization_handbook.html
     "extra_args": [
         # DLSS Performance Mode: When rendering 720p cameras, Auto mode tends to select Quality, so you may see performance impacts by running in Auto mode while rendering cameras at lower resolution.
@@ -142,6 +144,9 @@ APP_CONFIG = {
         # "--/rtx-transient/resourcemanager/texturestreaming/enabled=false",
         "--exts.\"isaacsim.core.throttling\".enable_async=true",
         "--exts.\"omni.isaac.throttling\".enable_async=true",
+        # Enable MDL Disk Cache
+        "--mdl-disk-cache=true",
+        "--mdl-disk-cache-path=/home/user/.cache/omni/mdl_cache",
     ],
 }
 simulation_app = SimulationApp(APP_CONFIG)
@@ -178,6 +183,7 @@ class MultiUAVManager:
         self.world = world
         self.config = config
         self.vehicles = []
+        self.camera_resolution = CAMERA_RESOLUTION
         # self.world.set_physics_step_size(1.0 / 30.0)
         # self.world.set_min_simulation_frame_rate(30.0)
         # self.world.set_gpu_dynamics_enabled(True)
@@ -197,6 +203,7 @@ class MultiUAVManager:
                 "vehicle_id": vid,
                 "px4_autolaunch": bool(v.get("px4_autolaunch", True)),
                 "px4_dir": v.get("px4_dir", self.pg.px4_path),
+                "sim_speed_factor": v.get("sim_speed_factor", 2.0),
             }
             mavlink_config = PX4MavlinkBackendConfig(px4_cfg_dict)
 
@@ -204,7 +211,7 @@ class MultiUAVManager:
             ros2_ns = v.get("ros2_namespace", f"uav{vid}")
 
             # Configure vehicle sensors
-            camera = MonocularCamera(f"front_camera_{vid}", config={"depth": False, "frequency": 10.0, "resolution": (448, 448)})
+            camera = MonocularCamera(f"front_camera_{vid}", config={"depth": False, "frequency": 10.0, "resolution": self.camera_resolution})
             config_multirotor = MultirotorConfig()
             config_multirotor.graphical_sensors = [camera]
             if ROS2_ENABLE:
@@ -512,6 +519,53 @@ class PegasusApp:
             except Exception as e:
                 carb.log_warn(f"HTTP reset error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
                 return jsonify({"error": str(e), "endpoint": "reset"}), 500
+
+        @app.route('/uav/<int:uav_id>/px4/hard_reset', methods=['POST'])
+        def px4_hard_reset_route(uav_id: int):
+            try:
+                vehicle = self._get_vehicle(uav_id)
+                if vehicle is None:
+                    return jsonify({"status": "error", "message": f"Vehicle /World/uav{uav_id} not found"}), 404
+                try:
+                    backend = None
+                    for b in getattr(vehicle, "_backends", []):
+                        if isinstance(b, PX4MavlinkBackend):
+                            backend = b
+                            break
+                    if backend is None:
+                        return jsonify({"status": "error", "message": "PX4 backend not found"}), 404
+                    backend.hard_reboot_px4()
+                except Exception as e:
+                    carb.log_warn(f"HTTP px4 hard_reset exec_error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                    return jsonify({"status": "error", "message": f"px4 hard reset failed: {e}"}), 500
+                return jsonify({"status": "success", "uav_id": uav_id, "message": "px4 hard reset ok"})
+            except Exception as e:
+                carb.log_warn(f"HTTP px4 hard_reset error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                return jsonify({"error": str(e), "endpoint": "px4/hard_reset"}), 500
+
+        @app.route('/uav/<int:uav_id>/px4/relaunch', methods=['POST'])
+        def px4_relaunch_route(uav_id: int):
+            try:
+                vehicle = self._get_vehicle(uav_id)
+                if vehicle is None:
+                    return jsonify({"status": "error", "message": f"Vehicle /World/uav{uav_id} not found"}), 404
+                try:
+                    backend = None
+                    for b in getattr(vehicle, "_backends", []):
+                        if isinstance(b, PX4MavlinkBackend):
+                            backend = b
+                            break
+                    if backend is None:
+                        return jsonify({"status": "error", "message": "PX4 backend not found"}), 404
+                    backend.soft_relaunch_px4()
+                    backend.start()
+                except Exception as e:
+                    carb.log_warn(f"HTTP px4 relaunch exec_error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                    return jsonify({"status": "error", "message": f"px4 relaunch failed: {e}"}), 500
+                return jsonify({"status": "success", "uav_id": uav_id, "message": "px4 relaunch ok"})
+            except Exception as e:
+                carb.log_warn(f"HTTP px4 relaunch error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                return jsonify({"error": str(e), "endpoint": "px4/relaunch"}), 500
 
     def _png_bytes_and_b64(self, img):
         arr = np.array(img)

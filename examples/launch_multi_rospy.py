@@ -483,9 +483,14 @@ def main():
             def _isaac_log_filter(proc, file, tag: str):
                 color = _pick_color(tag or "[isaac]")
                 pre = f"\033[{color}m{tag}\033[0m" if tag else ""
+                re_ready = re.compile(r"INFO\s*\[commander\].*?Ready for takeoff!", re.IGNORECASE)
+                re_poll = re.compile(r"ERROR\s*\[simulator_mavlink\].*?poll timeout", re.IGNORECASE)
+                ready_seen = False
                 try:
                     for raw in proc.stdout:
                         line = raw.rstrip("\n")
+                        if re_ready.search(line):
+                            ready_seen = True
                         filter_list = [
                             "[Warning] [omni.usd]",
                             "[Warning] [omni.kit]",
@@ -497,6 +502,8 @@ def main():
                             "[omni.neuraylib.plugin]",
                         ]
                         if any(f in line for f in filter_list):
+                            continue
+                        if (not ready_seen) and re_poll.search(line):
                             continue
                         if not line.strip():
                             continue

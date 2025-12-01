@@ -4,8 +4,8 @@
     {
       "vehicle_id": 0,
       "initial_position": [
-        -88.0,
-        8.0,
+        2.0,
+        0.0,
         5.07
       ],
       "initial_orientation_euler_deg": [
@@ -17,7 +17,8 @@
       "px4_dir": "/home/user/PX4-Autopilot",
       "mavros_namespace": "uav0",
       "ros2_namespace": "uav0",
-      "publish_graphical_sensors": true
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 2.0
     },
     {
       "vehicle_id": 1,
@@ -27,21 +28,22 @@
         5.07
       ],
       "initial_orientation_euler_deg": [
+        1.0,
         0.0,
-        0.0,
-        0.0
+        5.07
       ],
       "px4_autolaunch": true,
       "px4_dir": "/home/user/PX4-Autopilot",
       "mavros_namespace": "uav1",
       "ros2_namespace": "uav1",
-      "publish_graphical_sensors": true
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 2.0
     },
     {
       "vehicle_id": 2,
       "initial_position": [
-        -90.0,
-        8.0,
+        0.0,
+        0.0,
         5.07
       ],
       "initial_orientation_euler_deg": [
@@ -53,7 +55,8 @@
       "px4_dir": "/home/user/PX4-Autopilot",
       "mavros_namespace": "uav2",
       "ros2_namespace": "uav2",
-      "publish_graphical_sensors": true
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 2.0
     }
   ]
 }

@@ -30,6 +30,7 @@ To instantiate a ``PX4MavlinkBackend`` via Python scripting, consider the follow
         "px4_autolaunch": True,
         "px4_dir": "PegasusInterface().px4_path",
         "px4_vehicle_model": "iris",
+        "sim_speed_factor": 1.0, # The speed factor for the simulation (e.g. 2.0 for 2x real-time)
         })
     config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
 
@@ -64,3 +65,128 @@ path for the ``PX4-Autopilot`` by either:
         # This will be saved for future runs
         pg.set_px4_path("path_to_px4_directory")
 
+HTTP Control API (Examples)
+---------------------------
+
+For controlling vehicles from external processes, the examples include a ROS2 + MAVROS controller that exposes a small HTTP API while maintaining OFFBOARD control timing. See `examples/rospy_isaacsim.py`.
+
+- Endpoints: `POST /reset`, `POST /command`, `POST /step`, `POST /step_http`, `GET /health`
+- Concurrency: a task-level mutex ensures only one request executes at a time; `force:true` allows blocking acquisition.
+- Image sources: can return images either from ROS2 topics or the simulation HTTP endpoint.
+- Internal abstractions: `HttpApi` encapsulates route handlers; `ImageService` unifies image acquisition; `TaskGuard` standardizes lock handling.
+
+This controller preserves the original takeoff/landing/reboot sequences and OFFBOARD setpoint timing while improving code readability and maintainability.
+
+Examples (Python)
+-----------------
+
+Basic requests to `rospy_isaacsim.py` (default controller port `5009 + vehicle_id`):
+
+.. code:: Python
+
+    import requests
+
+    base = "http://127.0.0.1:5009"  # For vehicle_id=0; adjust if MAVROS_NS is uavN
+
+    # 1) Reset: optionally move vehicle in simulation, hard PX4 relaunch, and takeoff
+    r = requests.post(base + "/reset", json={
+        "vid": 0,
+        "position": [0.0, 0.0, 1.0],
+        "yaw_deg": 0.0,
+        "hard": True,
+        "force": True,
+    }, timeout=60)
+    print("reset:", r.status_code, r.json())
+
+    # 2) Command: move_to
+    r = requests.post(base + "/command", json={
+        "cmd": "move_to",
+        "x": 1.0, "y": -0.5, "z": 2.0,
+        "force": True,
+    }, timeout=30)
+    print("move_to:", r.status_code, r.json())
+
+    # 3) Command: move_to_many
+    r = requests.post(base + "/command", json={
+        "cmd": "move_to_many",
+        "points": [[0.0, 0.0, 1.5], [0.5, 0.0, 1.5], [0.5, 0.5, 1.5]],
+        "force": True,
+    }, timeout=60)
+    print("move_to_many:", r.status_code, r.json())
+
+    # 4) Command: get_position
+    r = requests.post(base + "/command", json={"cmd": "get_position"}, timeout=10)
+    print("get_position:", r.status_code, r.json())
+
+    # 5) Command: get_status
+    r = requests.post(base + "/command", json={"cmd": "get_status"}, timeout=10)
+    print("get_status:", r.status_code, r.json())
+
+    # 6) Command: land
+    r = requests.post(base + "/command", json={"cmd": "land", "force": True}, timeout=60)
+    print("land:", r.status_code, r.json())
+
+    # 7) Step: batch of waypoints (returns Base64 PNG frames)
+    r = requests.post(base + "/step", json={
+        "actions": [[[0.0, 0.0, 2.0], [0.5, 0.5, 2.0], [0.5, 0.0, 2.0]]],
+        "per_step": False,
+        "force": True,
+    }, timeout=60)
+    print("step:", r.status_code, r.json())
+
+    # 8) Step_HTTP: same but get images from simulation HTTP (not ROS)
+    r = requests.post(base + "/step_http", json={
+        "actions": [[[0.0, 0.0, 2.0]]],
+        "per_step": True,
+        "force": True,
+    }, timeout=60)
+    print("step_http:", r.status_code, r.json())
+
+    # 9) Health check
+    r = requests.get(base + "/health", timeout=5)
+    print("health:", r.status_code, r.json())
+
+Examples (curl)
+---------------
+
+.. code:: bash
+
+    # Reset (hard)
+    curl -X POST "http://127.0.0.1:5009/reset" \
+         -H "Content-Type: application/json" \
+         -d '{"vid":0,"position":[0,0,1],"yaw_deg":0,"hard":true,"force":true}'
+
+    # Move to
+    curl -X POST "http://127.0.0.1:5009/command" \
+         -H "Content-Type: application/json" \
+         -d '{"cmd":"move_to","x":1,"y":-0.5,"z":2,"force":true}'
+
+    # Move to many
+    curl -X POST "http://127.0.0.1:5009/command" \
+         -H "Content-Type: application/json" \
+         -d '{"cmd":"move_to_many","points":[[0,0,1.5],[0.5,0,1.5],[0.5,0.5,1.5]],"force":true}'
+
+    # Get position
+    curl -X POST "http://127.0.0.1:5009/command" -H "Content-Type: application/json" -d '{"cmd":"get_position"}'
+
+    # Get status
+    curl -X POST "http://127.0.0.1:5009/command" -H "Content-Type: application/json" -d '{"cmd":"get_status"}'
+
+    # Land
+    curl -X POST "http://127.0.0.1:5009/command" -H "Content-Type: application/json" -d '{"cmd":"land","force":true}'
+
+    # Step (ROS image)
+    curl -X POST "http://127.0.0.1:5009/step" -H "Content-Type: application/json" \
+         -d '{"actions":[[[0,0,2],[0.5,0.5,2]]],"per_step":false,"force":true}'
+
+    # Step HTTP (simulation image)
+    curl -X POST "http://127.0.0.1:5009/step_http" -H "Content-Type: application/json" \
+         -d '{"actions":[[[0,0,2]]],"per_step":true,"force":true}'
+
+Notes
+-----
+
+- Port: default is `5009 + vehicle_id`; can be overridden via `PEGASUS_HTTP_PORT`.
+- Namespace: `MAVROS_NS` (e.g. `uav0`) determines vehicle id and ROS2 topic prefix.
+- Concurrency: when a request is processing, another request returns `409 busy`; set `force:true` to block until the lock is acquired.
+- Images: set `PEGASUS_IMAGE_FROM_ROS` and `PEGASUS_IMAGE_HTTP_URL` to select source; `per_step:true` returns a frame per waypoint.

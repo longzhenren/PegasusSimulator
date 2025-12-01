@@ -384,9 +384,27 @@ class Vehicle(Robot):
         Args:
             event (float): The timer event that contains the time elapsed between the previous and current function calls (s).
         """
-
+        
+        # Check if we have any ROS2 backend enabled and if it is active
+        # If so, we might need to request updates for on-demand sensors
+        # Ideally, we should do this based on actual subscriber status, but for now
+        # let's assume if a ROS2 backend exists, we want camera updates.
+        # Note: This is a simplification. A better approach would be for the backend to signal need.
+        ros2_active = False
+        for backend in self._backends:
+            # Check if backend class name contains ROS2
+            if "ROS2" in backend.__class__.__name__:
+                ros2_active = True
+                break
+        
         # Call the update method for the sensor to update its values internally (if applicable)
         for sensor in self._graphical_sensors:
+            
+            # If ROS2 backend is active and sensor has request_update method, trigger it
+            # This ensures cameras with on_demand=True will update when ROS2 is used
+            if ros2_active and hasattr(sensor, "request_update"):
+                sensor.request_update()
+                
             sensor_data = sensor.update(self._state, event.payload['dt'])
 
             # If some data was updated and we have a ros backend (or other), then just update it
