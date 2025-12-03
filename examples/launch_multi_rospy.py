@@ -41,6 +41,7 @@ try:
 except Exception:
     psutil = None
 
+CONTROL_UP_INTERVAL = 2.0
 
 def load_config(path: Path) -> Dict[str, Any]:
     if not path.exists():
@@ -613,6 +614,7 @@ def main():
             setattr(proc, "_mavros_ns", mavros_ns)
             procs.append(proc)
             print(f"[LAUNCH] vehicle_id= {vid} pid= {proc.pid} logs: {log_path}")
+            time.sleep(CONTROL_UP_INTERVAL)
         except Exception as e:
             print(f"[ERROR] Failed to launch vehicle_id={vid}: {e}")
 

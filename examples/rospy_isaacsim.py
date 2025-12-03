@@ -193,6 +193,9 @@ POSITION_READY_TIMEOUT_S = float(os.environ.get("PEGASUS_POSITION_READY_TIMEOUT_
 POSITION_READY_WINDOW_S = float(os.environ.get("PEGASUS_POSITION_READY_WINDOW_S", "1.5"))
 POSITION_READY_EPS = float(os.environ.get("PEGASUS_POSITION_READY_EPS", "0.05"))
 
+MAX_PITCH_DEG = 20.0
+MAX_ROLL_DEG = 20.0
+
 # ---------------- Helper: wait for a single message ----------------
 def wait_for_message(node: Node, topic: str, msg_type, timeout: float = None):
     """
@@ -290,7 +293,6 @@ class IsaacSimEnv(Node):
         # --- publishers ---
         # 直接控制：向 MAVROS /mavros/setpoint_raw/local 发布 PositionTarget
         self.raw_setpoint_pub = self.create_publisher(PositionTarget, self._mavros_prefix + "/mavros/setpoint_raw/local", 10)
-        self.get_logger().info(f"Direct setpoint publisher: {self._mavros_prefix}/mavros/setpoint_raw/local")
 
         # --- services ---
         self.arming_client    = self.create_client(CommandBool, self._mavros_prefix + "/mavros/cmd/arming")
@@ -300,7 +302,7 @@ class IsaacSimEnv(Node):
         # FCU 连接等待改为外部方法，在启动 MAVROS 之后调用
         self.get_logger().info(f"UAV{self._vid} Waiting for FCU connection...")
         # --- 先发送一段时间的零速度（原始逻辑 for _ in range(100)）---
-        for _ in range(100):
+        for _ in range(60):
             self.pub_velocity(0.0, 0.0, 0.0, 0.0)
             spin_sleep(self, 20.0)
 
@@ -366,9 +368,11 @@ class IsaacSimEnv(Node):
         def _set_params(node_path: str, params: dict, timeout_sec: float = 3.0) -> bool:
             try:
                 client = self.create_client(SetParameters, f"{node_path}/set_parameters")
-            except Exception:
+            except Exception as e:
+                self.get_logger().warn(f"Create SetParameters client for {node_path} failed: {e}")
                 return False
             if not client.wait_for_service(timeout_sec=timeout_sec):
+                self.get_logger().warn(f"SetParameters service for {node_path} not ready")
                 return False
             req = SetParameters.Request()
             req.parameters = [_make_param(k, v) for k, v in params.items()]
@@ -385,7 +389,8 @@ class IsaacSimEnv(Node):
                             ok = False
                             break
                 return ok
-            except Exception:
+            except Exception as e:
+                self.get_logger().warn(f"Call SetParameters for {node_path} failed: {e}")
                 return False
 
         def _set_params_candidates(params: dict, timeout_sec: float = 3.0) -> bool:
@@ -402,7 +407,42 @@ class IsaacSimEnv(Node):
                     break
             return ok_any
 
-        def _set_px4_params(params: dict, timeout_sec: float = 3.0) -> bool:
+        # def _set_px4_params(params: dict, timeout_sec: float = 3.0) -> bool:
+        #     if not _PARAM_AVAILABLE:
+        #         self.get_logger().warn("MAVROS ParamSet not available; skip PX4 param configuration")
+        #         return False
+        #     srv = f"{self._mavros_prefix}/mavros/param/set" if self._mavros_prefix else "/mavros/param/set"
+        #     try:
+        #         client = self.create_client(ParamSet, srv)
+        #     except Exception as e:
+        #         self.get_logger().warn(f"Create ParamSet client failed: {e}")
+        #         return False
+        #     if not client.wait_for_service(timeout_sec=timeout_sec):
+        #         self.get_logger().warn("ParamSet service not ready; skip PX4 param configuration")
+        #         return False
+        #     ok_any = False
+        #     for name, value in params.items():
+        #         req = ParamSet.Request()
+        #         req.param_id = str(name)
+        #         pv = MavrosParamValue()
+        #         if isinstance(value, bool):
+        #             pv.integer = int(value)
+        #             pv.real = float(int(value))
+        #         elif isinstance(value, int):
+        #             pv.integer = int(value)
+        #             pv.real = float(value)
+        #         else:
+        #             pv.integer = 0
+        #             pv.real = float(value)
+        #         req.value = pv
+        #         try:
+        #             call_service_sync(self, client, req, timeout_sec=timeout_sec)
+        #             ok_any = True
+        #         except Exception as e:
+        #             self.get_logger().warn(f"Param set failed: {name} -> {value}; {e}")
+        #     return ok_any
+
+        def _set_px4_params_impl(params: dict, timeout_sec: float = 3.0) -> bool:
             if not _PARAM_AVAILABLE:
                 self.get_logger().warn("MAVROS ParamSet not available; skip PX4 param configuration")
                 return False
@@ -433,9 +473,13 @@ class IsaacSimEnv(Node):
                 try:
                     call_service_sync(self, client, req, timeout_sec=timeout_sec)
                     ok_any = True
+                    self.get_logger().info(f"Set PX4 param {name} to {value} success.")
                 except Exception as e:
                     self.get_logger().warn(f"Param set failed: {name} -> {value}; {e}")
             return ok_any
+        
+        # Expose
+        self.set_px4_params = _set_px4_params_impl
 
         def configure_unlimited_flight_method():
             fallback_params = {
@@ -451,24 +495,24 @@ class IsaacSimEnv(Node):
                 self.get_logger().warn("Failed to configure MAVROS time sync parameters; proceeding anyway")
 
             # PX4 params for unlimited flight (disable EKF checks, allow arm without GPS, remove geofence limits)
-            px4_params = {
-                "COM_ARM_EKF": 0.0,
-                "COM_ARM_IMU": 0.0,
-                "COM_ARM_WO_GPS": 1.0,
-                "EKF2_GPS_CHECK": 0.0,
-                "EKF2_AID_REQ": 0.0,
-                "EKF2_REQ_GPS_H": 0.0,
-                "EKF2_REQ_GPS_V": 0.0,
-                "EKF2_REQ_IMU": 0.0,
-                "EKF2_REQ_MAG": 0.0,
-                "EKF2_REQ_BARO": 0.0,
-                "GF_ACTION": 0.0,
-                "GF_MAX_HOR_DIST": 3.4e38,
-                "GF_MAX_VER_DIST": 3.4e38,
-                "GF_SOURCE": 0.0,
-                "GF_ENABLE": 0.0,
-            }
-            _set_px4_params(px4_params, timeout_sec=5.0)
+            # px4_params = {
+            #     "COM_ARM_EKF": 0.0,
+            #     "COM_ARM_IMU": 0.0,
+            #     "COM_ARM_WO_GPS": 1.0,
+            #     "EKF2_GPS_CHECK": 0.0,
+            #     "EKF2_AID_REQ": 0.0,
+            #     "EKF2_REQ_GPS_H": 0.0,
+            #     "EKF2_REQ_GPS_V": 0.0,
+            #     "EKF2_REQ_IMU": 0.0,
+            #     "EKF2_REQ_MAG": 0.0,
+            #     "EKF2_REQ_BARO": 0.0,
+            #     "GF_ACTION": 0.0,
+            #     "GF_MAX_HOR_DIST": 3.4e38,
+            #     "GF_MAX_VER_DIST": 3.4e38,
+            #     "GF_SOURCE": 0.0,
+            #     "GF_ENABLE": 0.0,
+            # }
+            # _set_px4_params(px4_params, timeout_sec=5.0)
             return True
         # expose as instance method（直接替换原方法名）
         self.configure_mavros_time_plugin = configure_unlimited_flight_method
@@ -759,15 +803,24 @@ class IsaacSimEnv(Node):
     def reset(self, target_z: float = None):
         if target_z is None:
             target_z = self.init_height
-        # Step 0) Warm-up setpoints (防止进入 RTL/Failsafe)
+        
+        self.arm_cmd.value = True
+        while not self.current_state.armed:
+            self.get_logger().info("[reset] Sending arm command...")
+            resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
+            if resp and getattr(resp, "success", False):
+                self.get_logger().info("[reset] ***** Vehicle armed *****")
+                break
+            spin_sleep(self, 2.0)
+        self.get_logger().info("[reset] Vehicle armed.")
+
         self.get_logger().info("[reset] Publishing initial dummy setpoints to prevent RTL...")
-        for _ in range(50):  # 2.5s at 20Hz
+        for _ in range(60): 
             self.pub_position(0.0, 0.0, target_z)
             spin_sleep(self, 20.0)
         
         self.get_logger().info(f"[reset] UAV{self._vid} Initial setpoints published.")
-
-        # Step 1) 切换 OFFBOARD
+        
         self.offb_set_mode.custom_mode = "OFFBOARD"
         while self.current_state.mode != "OFFBOARD":
             resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=5.0)
@@ -775,16 +828,6 @@ class IsaacSimEnv(Node):
                 self.get_logger().info("[reset] ***** OFFBOARD enabled *****")
             spin_sleep(self, 2.0)
         self.get_logger().info("[reset] Vehicle in OFFBOARD mode.")
-
-        # Step 2) 解锁
-        self.arm_cmd.value = True
-        while not self.current_state.armed:
-            resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
-            if resp and getattr(resp, "success", False):
-                self.get_logger().info("[reset] ***** Vehicle armed *****")
-                break
-            spin_sleep(self, 2.0)
-        self.get_logger().info("[reset] Vehicle armed.")
 
         target_x, target_y = 0.0, 0.0
         self._perform_takeoff(target_x, target_y, target_z, "[reset]")
@@ -1009,12 +1052,29 @@ class IsaacSimEnv(Node):
             self.get_logger().warn(f"[reboot_hard] UAV{vid} px4 relaunch failed")
         time.sleep(5.0)
         self.wait_for_fcu_connection()
+        
+        # Wait for arming service to be available.
         self.arming_client.wait_for_service(timeout_sec=20.0)
-        self.set_mode_client.wait_for_service(timeout_sec=20.0)
-        warmup_count = 80
+        self.arm_cmd.value = True
+        arm_start = time.time()
+        while not self.current_state.armed and (time.time() - arm_start) < 60.0:
+            try:
+                resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
+                if resp and getattr(resp, "success", False):
+                    self.get_logger().info(f"[reboot_hard] UAV{vid} ***** Vehicle armed *****")
+                    break
+            except Exception as e:
+                self.get_logger().warn(f"[reboot_hard] UAV{vid} arming failed. Exception: {e}")
+            spin_sleep(self, 2.0)
+            
+        # Send warmup position commands before sending OFFBOARD mode command, to avoid fallback into disarm mode.
+        warmup_count = 60
         for _ in range(warmup_count):
             self.pub_position(0.0, 0.0, self.init_height)
             spin_sleep(self, 20.0)
+        
+        # Send OFFBOARD mode command.
+        self.set_mode_client.wait_for_service(timeout_sec=20.0)
         self.offb_set_mode.custom_mode = "OFFBOARD"
         off_start = time.time()
         while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 60.0:
@@ -1033,17 +1093,6 @@ class IsaacSimEnv(Node):
             eps=POSITION_READY_EPS,
         )
         self.get_logger().info(f"[reboot_hard] UAV{vid} attitude stable={ok_att}")
-        self.arm_cmd.value = True
-        arm_start = time.time()
-        while not self.current_state.armed and (time.time() - arm_start) < 60.0:
-            try:
-                resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
-                if resp and getattr(resp, "success", False):
-                    self.get_logger().info(f"[reboot_hard] UAV{vid} ***** Vehicle armed *****")
-                    break
-            except Exception as e:
-                self.get_logger().warn(f"[reboot_hard] UAV{vid} arming failed. Exception: {e}")
-            spin_sleep(self, 2.0)
         target_x = float(self.current_pose.pose.position.x)
         target_y = float(self.current_pose.pose.position.y)
         z0 = float(self.current_pose.pose.position.z)
@@ -1087,9 +1136,6 @@ class IsaacSimEnv(Node):
         tx = float(target_x)
         ty = float(target_y)
         tz = float(target_z)
-        target = (tx, ty, tz)
-
-        # -----------------------------
 
         # -----------------------------
         # 正常 MAVROS 发布 setpoint
@@ -1097,6 +1143,22 @@ class IsaacSimEnv(Node):
         target_position = PositionTarget()
         target_position.header.stamp = self.get_clock().now().to_msg()
         target_position.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+        
+        # # 限制 Pitch 和 Roll
+        # # 通过全局变量动态设置 MPC_TILTMAX_AIR 参数来限制最大倾角
+        # try:
+        #     # 取两者中较小的一个作为整体倾角限制（PX4 MPC_TILTMAX_AIR 是总倾角限制）
+        #     limit_deg = min(float(MAX_PITCH_DEG), float(MAX_ROLL_DEG))
+        #     limit_deg = max(0.0, min(limit_deg, 89.0)) # Clamp 0-89
+            
+        #     # 只有当参数发生变化时才调用服务（简单缓存机制）
+        #     if not hasattr(self, "_last_tilt_max_deg") or abs(self._last_tilt_max_deg - limit_deg) > 1.0:
+        #          # 使用异步调用避免阻塞控制循环太久
+        #         self.set_px4_params({"MPC_TILTMAX_AIR": float(limit_deg)}, timeout_sec=1.0)
+        #         self._last_tilt_max_deg = limit_deg
+        # except Exception as e:
+        #     self.get_logger().warn(f"Failed to update tilt limit: {e}")
+        
         target_position.type_mask = (
             PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY | PositionTarget.IGNORE_VZ |
             PositionTarget.IGNORE_AFX | PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
@@ -1658,17 +1720,29 @@ def main():
 
         # 在 MAVROS 启动后等待 FCU 连接
         env.wait_for_fcu_connection()
+        # Configure MAVROS time sync parameters to avoid PX4 timesync RTT warnings
+        # try:
+        #     env.get_logger().info(f"UAV{env._vid} Configuring MAVROS time sync parameters...")
+        #     env.configure_mavros_time_plugin()
+            
+        #     # Set PX4 parameters as requested
+        #     # MPC_TKO_SPEED=5.0, MPC_Z_VEL_MAX_UP=5.0, MPC_Z_VEL_MAX_DN=5.0, MPC_XY_VEL_MAX=10.0
+        #     # Also setting MPC_TILTMAX_AIR for pitch/roll limiting if needed, but not explicitly requested yet.
+        #     px4_params = {
+        #         "MPC_TKO_SPEED": 5.0,
+        #         "MPC_Z_VEL_MAX_UP": 5.0,
+        #         "MPC_Z_VEL_MAX_DN": 5.0,
+        #         "MPC_XY_VEL_MAX": 10.0
+        #     }
+        #     env.get_logger().info(f"UAV{env._vid} Setting PX4 flight parameters: {px4_params}")
+        #     env.set_px4_params(px4_params, timeout_sec=5.0)
+            
+        # except Exception as e:
+        #     env.get_logger().error(f"Failed to configure parameters: {e}")
 
         env.reset()
         env.get_logger().info("Environment reset complete; switching to hover+HTTP mode.")
         env.start_http_server()
-        # Configure MAVROS time sync parameters to avoid PX4 timesync RTT warnings
-        try:
-            env.get_logger().info(f"UAV{env._vid} Configuring MAVROS time sync parameters...")
-            env.configure_mavros_time_plugin()
-        except Exception as e:
-            env.get_logger().error(f"Failed to configure MAVROS time sync parameters: {e}")
-
         # Hover + HTTP commands loop (wait for external HTTP commands)
         try:
             env._http_hover_loop()
@@ -1689,7 +1763,6 @@ def main():
         # 释放 ROS 资源
         if env is not None:
             try:
-                env._flush_last_target_log()
                 env.destroy_node()
             except Exception as de:
                 print(f"[WARN] destroy_node failed: {de}")

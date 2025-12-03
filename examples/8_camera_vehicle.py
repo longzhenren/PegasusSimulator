@@ -57,27 +57,27 @@ from flask import Flask, jsonify, request, Response
 from werkzeug.serving import make_server
 from scipy.spatial.transform import Rotation
 
-# SIMULATION_ENVIRONMENTS = {}
-# NVIDIA_SIMULATION_ENVIRONMENTS = {
-#     "Default Environment": "Grid/default_environment.usd",
-#     "Black Gridroom": "Grid/gridroom_black.usd",
-#     "Curved Gridroom": "Grid/gridroom_curved.usd",
-#     "Hospital": "Hospital/hospital.usd",
-#     "Office": "Office/office.usd",
-#     "Simple Room": "Simple_Room/simple_room.usd",
-#     "Warehouse": "Simple_Warehouse/warehouse.usd",
-#     "Warehouse with Forklifts": "Simple_Warehouse/warehouse_with_forklifts.usd",
-#     "Warehouse with Shelves": "Simple_Warehouse/warehouse_multiple_shelves.usd",
-#     "Full Warehouse": "Simple_Warehouse/full_warehouse.usd",
-#     "Flat Plane": "Terrains/flat_plane.usd",
-#     "Rough Plane": "Terrains/rough_plane.usd",
-#     "Slope Plane": "Terrains/slope.usd",
-#     "Stairs Plane": "Terrains/stairs.usd",
-# }
-# for asset in NVIDIA_SIMULATION_ENVIRONMENTS:
-#     SIMULATION_ENVIRONMENTS[asset] = (
-#         "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Environments/" + NVIDIA_SIMULATION_ENVIRONMENTS[asset]
-#     )
+SIMULATION_ENVIRONMENTS = {}
+NVIDIA_SIMULATION_ENVIRONMENTS = {
+    "Default Environment": "Grid/default_environment.usd",
+    "Black Gridroom": "Grid/gridroom_black.usd",
+    "Curved Gridroom": "Grid/gridroom_curved.usd",
+    "Hospital": "Hospital/hospital.usd",
+    "Office": "Office/office.usd",
+    "Simple Room": "Simple_Room/simple_room.usd",
+    "Warehouse": "Simple_Warehouse/warehouse.usd",
+    "Warehouse with Forklifts": "Simple_Warehouse/warehouse_with_forklifts.usd",
+    "Warehouse with Shelves": "Simple_Warehouse/warehouse_multiple_shelves.usd",
+    "Full Warehouse": "Simple_Warehouse/full_warehouse.usd",
+    "Flat Plane": "Terrains/flat_plane.usd",
+    "Rough Plane": "Terrains/rough_plane.usd",
+    "Slope Plane": "Terrains/slope.usd",
+    "Stairs Plane": "Terrains/stairs.usd",
+}
+for asset in NVIDIA_SIMULATION_ENVIRONMENTS:
+    SIMULATION_ENVIRONMENTS[asset] = (
+        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Environments/" + NVIDIA_SIMULATION_ENVIRONMENTS[asset]
+    )
 
 
 # Start Isaac Sim's simulation environment
@@ -101,14 +101,14 @@ USE_RASTERIZATION = True
 RENDER_THROTTLE = True
 RENDER_MAX_FPS = 10.0
 CAMERA_RESOLUTION = (640, 640)
-# USD_PATH = SIMULATION_ENVIRONMENTS['Default Environment']
-# USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
-USD_PATH = "/home/user/export/Demo_Environment.usda"
+# USD_PATH = SIMULATION_ENVIRONMENTS['Curved Gridroom']
+USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
+# USD_PATH = "/home/user/export/Demo_Environment.usda"
 # -------------------------
 # Recording (global switch)
 # -------------------------
 # 全局录制开关：是否以10fps频率保存PNG图片和CSV数据到本地（时间戳命名）
-RECORD_ENABLE = True
+RECORD_ENABLE = False
 RECORD_FPS = 10.0
 RECORD_DIR = os.path.join(os.path.dirname(__file__), "recordings")
 
@@ -118,9 +118,9 @@ RECORD_DIR = os.path.join(os.path.dirname(__file__), "recordings")
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "multi_uav_config.json")
 
 # 是否启用 ROS2 后端（若设为 False 则仅使用 PX4 MAVLink）
-ROS2_ENABLE = True
-ROS2_CAMERA_ENABLE = True
-ROS2_SENSOR_ENABLE = True
+ROS2_ENABLE = False
+ROS2_CAMERA_ENABLE = False
+ROS2_SENSOR_ENABLE = False
 ROS2_STATE_ENABLE = False
 
 APP_CONFIG = {
@@ -128,7 +128,7 @@ APP_CONFIG = {
     "height": 600,
     "window_width": 1280,
     "window_height": 720,
-    "headless": True,
+    "headless": False,
     "max_bounces": 0 if USE_RASTERIZATION else 1,  # RT 模式里 bounces 越低越快
     "samples_per_pixel_per_frame": 1 if USE_RASTERIZATION else 16,  # 默认 64，很吃GPU，先降
     "anti_aliasing": 1,  # 0/1 更快（3=高质量）
