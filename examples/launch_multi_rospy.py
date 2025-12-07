@@ -36,7 +36,7 @@ import sys
 import time
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import subprocess as sp
 import urllib.request
 import concurrent.futures as cf
@@ -121,19 +121,18 @@ def _probe_port(port: int) -> bool:
     except Exception:
         return False
 
-def _generate_mavros_launch_from_config(cfg_path: Path) -> Path:
+def _generate_mavros_launch_from_config(cfg_path: Path) -> List[Tuple[int, Path]]:
     try:
         cfg = json.loads(cfg_path.read_text())
     except Exception:
         cfg = {"vehicles": []}
     vehicles = cfg.get("vehicles", [])
-    lines: List[str] = []
-    lines.append("<launch>")
+    out: List[Tuple[int, Path]] = []
     for v in vehicles:
         vid = int(v.get("vehicle_id", 0))
         ns = v.get("mavros_namespace", f"uav{vid}")
         tcp_port = 5760 + vid
-        fcu_local = 14540 + vid
+        fcu_local = 14740 + vid
         fcu_remote = 14580 + vid
         use_tcp = bool(v.get("mavros_use_tcp", False))
         if use_tcp:
@@ -141,6 +140,8 @@ def _generate_mavros_launch_from_config(cfg_path: Path) -> Path:
         else:
             fcu_url = f"udp://:{fcu_local}@127.0.0.1:{fcu_remote}"
         tgt_system = 1 + vid
+        lines: List[str] = []
+        lines.append("<launch>")
         lines.append("    <group>")
         lines.append(f"        <arg name=\"id\" default=\"{vid}\" />")
         lines.append(f"        <arg name=\"fcu_url\" default=\"{fcu_url}\" />")
@@ -151,12 +152,12 @@ def _generate_mavros_launch_from_config(cfg_path: Path) -> Path:
         lines.append(f"            <arg name=\"timesync_rate\" value=\"0.0\" />")
         lines.append("        </include>")
         lines.append("    </group>")
-    lines.append("</launch>")
-    content = "\n".join(lines)
-    # 和cfg_path保存到相同目录
-    path = cfg_path.parent / f"launch/pegasus_multi_uav.launch"
-    path.write_text(content)
-    return path
+        lines.append("</launch>")
+        content = "\n".join(lines)
+        out_path = cfg_path.parent / f"launch/pegasus_uav_{vid}.launch"
+        out_path.write_text(content)
+        out.append((vid, out_path))
+    return out
 
 
 def start_instance(ISAACSIM_PYTHON: str, script_path: Path, mavros_ns: Optional[str], env: Dict[str, str], log_path: Path, prefix: Optional[str] = None, to_console: bool = False) -> sp.Popen:
@@ -255,7 +256,7 @@ def main():
     parser.add_argument("--console-logs", action="store_true", default=True, help="Stream child logs to console with prefixes while saving to files")
     parser.add_argument("--ready-timeout", type=float, default=500.0, help="Timeout for waiting for process to be ready (seconds)")
     parser.add_argument("--kill-isaac", action="store_true", help="启动前杀掉已有 Isaac Sim 进程")
-    parser.add_argument("--parallel", type=int, default=4, help="控制器并行分组数（每组内顺序等待 OFFBOARD）")
+    parser.add_argument("--parallel", type=int, default=3, help="控制器并行分组数（每组内顺序等待 OFFBOARD）")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -342,6 +343,7 @@ def main():
                         p.kill()
             except Exception:
                 os.kill(pid, signal.SIGKILL if hard else signal.SIGTERM)
+                pass
         else:
             os.kill(pid, signal.SIGKILL if hard else signal.SIGTERM)
         cleaned_pids.append(pid)
@@ -436,20 +438,26 @@ def main():
             print(f"[WARN] Failed to kill IsaacSim processes: {e}")
 
     procs: List[sp.Popen] = []
-    mavros_proc = None
+    mavros_procs: Dict[int, sp.Popen] = {}
 
     def _signal_handler(sig, frame):
         print(f"\n[SIGNAL] Received {sig}. Cleaning up child processes...")
         terminate_all(procs)
         try:
-            if mavros_proc is not None:
-                pgid = os.getpgid(mavros_proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                time.sleep(0.5)
-                os.killpg(pgid, signal.SIGKILL)
-                lf = getattr(mavros_proc, "_log_file", None)
-                if lf:
-                    lf.close()
+            for vid, mp in list(mavros_procs.items()):
+                try:
+                    pgid = os.getpgid(mp.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    os.killpg(pgid, signal.SIGKILL)
+                except Exception:
+                    pass
+                try:
+                    lf = getattr(mp, "_log_file", None)
+                    if lf:
+                        lf.close()
+                except Exception:
+                    pass
         except Exception:
             pass
         # also stop isaac sim if running
@@ -580,31 +588,39 @@ def main():
     # --- Start MAVROS multi after readiness gate ---
     try:
         cfg_path = Path(args.config)
-        launch_path = _generate_mavros_launch_from_config(cfg_path)
+        launch_paths = _generate_mavros_launch_from_config(cfg_path)
         mavros_log_dir = log_root / str(session_ts) / 'mavros'
         ensure_dir(mavros_log_dir)
-        mavros_log = mavros_log_dir / 'ros2_mavros_launch.log'
-        mavros_log_f = mavros_log.open('w')
 
         isaac_log_path = log_root / str(session_ts) / 'isaac' / 'isaacsim.log'
         ok_px4 = wait_log_count(isaac_log_path, r"Startup script returned successfully", expected_aircraft, timeout=float(args.ready_timeout), interval=1.0, label="'Startup script returned successfully'")
         if not ok_px4:
             print(f"[WARN] Did not observe {expected_aircraft} 'Startup script returned successfully' entries within timeout; proceeding to launch MAVROS anyway.")
 
-        mavros_cmd = [ISAACSIM_PYTHON, ISAACSIM_ROS2_CMD, "launch", launch_path]
-        print(f"[LAUNCH] MAVROS multi cmd: {mavros_cmd}")
-        mavros_proc = sp.Popen(mavros_cmd, stdout=mavros_log_f, stderr=sp.STDOUT, preexec_fn=os.setsid)
-        setattr(mavros_proc, '_log_file', mavros_log_f)
-        procs.append(mavros_proc)
-        print(f"[LAUNCH] MAVROS multi started: {launch_path} pid={mavros_proc.pid} logs: {mavros_log}")
+        mavros_procs: Dict[int, sp.Popen] = {}
+        for vid, lp in launch_paths:
+            log_path_i = mavros_log_dir / f'uav{vid}.log'
+            log_f_i = log_path_i.open('w')
+            cmd_i = [ISAACSIM_PYTHON, ISAACSIM_ROS2_CMD, "launch", lp]
+            print(f"[LAUNCH] MAVROS cmd: {cmd_i}")
+            p_i = sp.Popen(cmd_i, stdout=log_f_i, stderr=sp.STDOUT, preexec_fn=os.setsid)
+            setattr(p_i, '_log_file', log_f_i)
+            mavros_procs[vid] = p_i
+            procs.append(p_i)
+            print(f"[LAUNCH] MAVROS started: {lp} pid={p_i.pid} logs: {log_path_i}")
     except Exception as e:
         print(f"[WARN] Failed to start MAVROS multi: {e}")
     
     # Wait until all mavros connected
     print(f"[INFO] 等待所有MAVROS连接就绪（Connected）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
-    ok_mavros = wait_log_count(mavros_log, r"UID", expected_aircraft, timeout=float(args.ready_timeout), interval=2.0, label="MAVROS Connected")
-    if not ok_mavros:
-        print(f"[WARN] Did not observe {expected_aircraft} 'Connected to' messages within timeout; proceeding anyway.")
+    connected = 0
+    for vid, p in mavros_procs.items():
+        log_path_i = mavros_log_dir / f'uav{vid}.log'
+        ok_m_i = wait_log_count(log_path_i, r"UID", 1, timeout=float(args.ready_timeout), interval=2.0, label=f"MAVROS Connected uav{vid}")
+        if ok_m_i:
+            connected += 1
+    if connected < expected_aircraft:
+        print(f"[WARN] MAVROS connected count: {connected}/{expected_aircraft}")
     
     import threading
     def _launch_group(group_list: List[Dict[str, Any]], group_name: str):
@@ -780,16 +796,16 @@ def main():
 
     print("[INFO] All controllers finished.")
     try:
-        if mavros_proc is not None:
+        for vid, mp in list(mavros_procs.items()):
             try:
-                pgid = os.getpgid(mavros_proc.pid)
+                pgid = os.getpgid(mp.pid)
                 os.killpg(pgid, signal.SIGTERM)
                 time.sleep(0.5)
                 os.killpg(pgid, signal.SIGKILL)
             except Exception:
                 pass
             try:
-                lf = getattr(mavros_proc, "_log_file", None)
+                lf = getattr(mp, "_log_file", None)
                 if lf:
                     lf.close()
             except Exception:

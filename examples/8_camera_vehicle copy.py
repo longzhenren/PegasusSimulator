@@ -91,7 +91,7 @@ class MultiUAVManager:
                 "px4_autolaunch": bool(v.get("px4_autolaunch", True)),
                 "px4_dir": v.get("px4_dir", self.pg.px4_path),
                 "px4_vehicle_model": v.get("px4_vehicle_model", "gazebo-classic_iris_pg"),
-                # Use backend defaults for MAVLink connection (PX4 rcS offboard → UDP 14540+id)
+                # Use backend defaults for MAVLink connection (PX4 rcS offboard → UDP 14740+id)
             }
             mavlink_config = PX4MavlinkBackendConfig(px4_cfg_dict)
 

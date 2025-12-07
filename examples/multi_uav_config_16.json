@@ -153,6 +153,158 @@
       "publish_graphical_sensors": true,
       "sim_speed_factor": 5.0,
       "px4_vehicle_model": "gazebo-classic_iris_pg"
+    },{
+      "vehicle_id": 8,
+      "initial_position": [
+        3.0,
+        0.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_namespace": "uav8",
+      "ros2_namespace": "uav8",
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 5.0,
+      "px4_vehicle_model": "gazebo-classic_iris_pg"
+    },{
+      "vehicle_id": 9,
+      "initial_position": [
+        -3.0,
+        0.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_namespace": "uav9",
+      "ros2_namespace": "uav9",
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 5.0,
+      "px4_vehicle_model": "gazebo-classic_iris_pg"
+    },{
+      "vehicle_id": 10,
+      "initial_position": [
+        3.0,
+        -3.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_namespace": "uav10",
+      "ros2_namespace": "uav10",
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 5.0,
+      "px4_vehicle_model": "gazebo-classic_iris_pg"
+    },{
+      "vehicle_id": 11,
+      "initial_position": [
+        -3.0,
+        3.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_namespace": "uav11",
+      "ros2_namespace": "uav11",
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 5.0,
+      "px4_vehicle_model": "gazebo-classic_iris_pg"
+    },{
+      "vehicle_id": 12,
+      "initial_position": [
+        4.0,
+        0.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_namespace": "uav12",
+      "ros2_namespace": "uav12",
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 5.0,
+      "px4_vehicle_model": "gazebo-classic_iris_pg"
+    },{
+      "vehicle_id": 13,
+      "initial_position": [
+        -4.0,
+        0.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_namespace": "uav13",
+      "ros2_namespace": "uav13",
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 5.0,
+      "px4_vehicle_model": "gazebo-classic_iris_pg"
+    },{
+      "vehicle_id": 14,
+      "initial_position": [
+        4.0,
+        -4.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_namespace": "uav14",
+      "ros2_namespace": "uav14",
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 5.0,
+      "px4_vehicle_model": "gazebo-classic_iris_pg"
+    },{
+      "vehicle_id": 15,
+      "initial_position": [
+        -4.0,
+        4.0,
+        0.07
+      ],
+      "initial_orientation_euler_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "mavros_namespace": "uav15",
+      "ros2_namespace": "uav15",
+      "publish_graphical_sensors": true,
+      "sim_speed_factor": 5.0,
+      "px4_vehicle_model": "gazebo-classic_iris_pg"
     }
   ]
 }

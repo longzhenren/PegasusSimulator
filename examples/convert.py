@@ -13,7 +13,7 @@ def _generate_mavros_launch_from_config(cfg_path: Path) -> Path:
         vid = int(v.get("vehicle_id", 0))
         ns = v.get("mavros_namespace", f"uav{vid}")
         tcp_port = 5760 + vid
-        fcu_local = 14540 + vid
+        fcu_local = 14740 + vid
         fcu_remote = 14580 + vid
         use_tcp = bool(v.get("mavros_use_tcp", False))
         if use_tcp:

@@ -28,6 +28,9 @@ import threading
 from urllib.parse import unquote
 import urllib.request, urllib.error
 from flask import Flask, request, jsonify, Response
+import subprocess as sp
+import signal
+from pathlib import Path
 
 # Directory where recordings (session_*) are saved by 8_camera_vehicle.py
 RECORD_DIR = os.path.join(os.path.dirname(__file__), "recordings")
@@ -305,7 +308,47 @@ def health():
 def uav_forward(uid: int, sub: str):
     if sub not in ("reset", "step", "command"):
         return jsonify({"error": "unknown endpoint"}), 404
-    return _route_to_controller(uid, sub)
+    resp = _route_to_controller(uid, sub)
+    try:
+        if sub == "reset" and getattr(resp, "status_code", 500) < 300:
+            _restart_mavros(uid)
+    except Exception:
+        pass
+    return resp
+
+def _find_mavros_pids(uid: int):
+    try:
+        out = sp.check_output(["ps", "-eo", "pid,args"], stderr=sp.DEVNULL).decode().splitlines()
+    except Exception:
+        return []
+    hits = []
+    token = f"pegasus_uav_{uid}.launch"
+    for line in out:
+        low = line.lower()
+        if ("ros2" in low) and ("launch" in low) and (token in low):
+            try:
+                pid = int(low.split()[0])
+                hits.append(pid)
+            except Exception:
+                pass
+    return list(sorted(set(hits)))
+
+def _restart_mavros(uid: int) -> bool:
+    try:
+        ros2_cmd = os.environ.get("ISAACSIM_ROS2_CMD", "/home/user/IsaacSim-ros_workspaces/build_ws/humble/humble_ws/install/bin/ros2")
+        launch_file = str(Path(os.path.dirname(__file__)) / "launch" / f"pegasus_uav_{uid}.launch")
+        for pid in _find_mavros_pids(uid):
+            try:
+                pgid = os.getpgid(int(pid))
+                os.killpg(pgid, signal.SIGTERM)
+                time.sleep(0.5)
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+        sp.Popen([ros2_cmd, "launch", launch_file], preexec_fn=os.setsid)
+        return True
+    except Exception:
+        return False
 
 @app.route('/', methods=['GET'])
 def index():

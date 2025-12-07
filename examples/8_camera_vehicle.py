@@ -103,7 +103,7 @@ RENDER_MAX_FPS = 10.0
 CAMERA_RESOLUTION = (640, 640)
 # USD_PATH = SIMULATION_ENVIRONMENTS['Curved Gridroom']
 # USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
-USD_PATH = "/home/user/export/Demo_Environment.usda"
+USD_PATH = "/home/user/export/extract.usd"
 # -------------------------
 # Recording (global switch)
 # -------------------------
@@ -124,11 +124,11 @@ ROS2_SENSOR_ENABLE = False
 ROS2_STATE_ENABLE = False
 
 APP_CONFIG = {
-    "width": 600,
-    "height": 600,
+    # "width": 600,
+    # "height": 600,
     "window_width": 1280,
     "window_height": 720,
-    "headless": True,
+    "headless": False,
     "max_bounces": 0 if USE_RASTERIZATION else 1,  # RT 模式里 bounces 越低越快
     "samples_per_pixel_per_frame": 1 if USE_RASTERIZATION else 16,  # 默认 64，很吃GPU，先降
     "anti_aliasing": 1,  # 0/1 更快（3=高质量）
@@ -194,7 +194,7 @@ class MultiUAVManager:
         
         for v in self.config.get("vehicles", []):
             vid = int(v.get("vehicle_id", 0))
-            init_pos = v.get("initial_position", [-88.0, 8.0, 5.0])
+            init_pos = v.get("initial_position", [0.0, 0.0, 5.0])
             euler = v.get("initial_orientation_euler_deg", [0.0, 0.0, 0.0])
             quat = Rotation.from_euler("XYZ", euler, degrees=True).as_quat()
 
