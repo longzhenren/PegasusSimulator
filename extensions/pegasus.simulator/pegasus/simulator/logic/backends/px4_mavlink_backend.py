@@ -554,9 +554,7 @@ class PX4MavlinkBackend(Backend):
                     carb.log_warn(f"{self._log_prefix} PID/alive check failed: {e}; autolaunch anyway")
                     carb.log_warn(traceback.format_exc())
                     self.px4_tool.launch_px4()
-            # Internal MAVROS launch disabled
             
-
     def stop(self):
         """Method that when called will handle the stopping of the simulation of vehicle. It will make sure that any open
         mavlink connection will be closed and also that the PX4 background process gets killed (if it was auto-initialized)
@@ -753,9 +751,11 @@ class PX4MavlinkBackend(Backend):
             try:
                 os.kill(pid, 0)
                 return True
-            except Exception as e:
-                carb.log_warn(f"{self._log_prefix} os.kill(0) check failed: {e}")
-                carb.log_warn(traceback.format_exc())
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            except Exception:
                 return False
         except Exception as e:
             carb.log_warn(f"{self._log_prefix} _is_px4_alive error: {e}")

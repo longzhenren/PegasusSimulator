@@ -102,8 +102,8 @@ RENDER_THROTTLE = True
 RENDER_MAX_FPS = 10.0
 CAMERA_RESOLUTION = (640, 640)
 # USD_PATH = SIMULATION_ENVIRONMENTS['Curved Gridroom']
-USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
-# USD_PATH = "/home/user/export/Demo_Environment.usda"
+# USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
+USD_PATH = "/home/user/export/Demo_Environment.usda"
 # -------------------------
 # Recording (global switch)
 # -------------------------
@@ -128,7 +128,7 @@ APP_CONFIG = {
     "height": 600,
     "window_width": 1280,
     "window_height": 720,
-    "headless": False,
+    "headless": True,
     "max_bounces": 0 if USE_RASTERIZATION else 1,  # RT 模式里 bounces 越低越快
     "samples_per_pixel_per_frame": 1 if USE_RASTERIZATION else 16,  # 默认 64，很吃GPU，先降
     "anti_aliasing": 1,  # 0/1 更快（3=高质量）
@@ -158,7 +158,7 @@ simulation_app = SimulationApp(APP_CONFIG)
 import omni.timeline
 from isaacsim.core.api.world import World
 
-sys.path.insert(0, os.path.expanduser("~/PegasusSimulator/extensions/pegasus.simulator/"))
+sys.path.insert(0, os.path.expanduser("~/PegasusSimulator-5.1/extensions/pegasus.simulator/"))
 
 # Import the Pegasus API for simulating drones
 from pegasus.simulator.params import ROBOTS
@@ -204,6 +204,7 @@ class MultiUAVManager:
                 "px4_autolaunch": bool(v.get("px4_autolaunch", True)),
                 "px4_dir": v.get("px4_dir", self.pg.px4_path),
                 "sim_speed_factor": v.get("sim_speed_factor", 2.0),
+                "px4_vehicle_type": v.get("px4_vehicle_model", "gazebo-classic_iris_pg"),
             }
             mavlink_config = PX4MavlinkBackendConfig(px4_cfg_dict)
 
@@ -259,10 +260,7 @@ class PegasusApp:
         # spawning asset primitives, etc.
         # Ensure the rendering_dt matches our desired render rate semantics per Isaac Sim API
         if RENDER_THROTTLE:
-            try:
-                self.pg.set_world_settings(rendering_dt=1.0 / max(RENDER_MAX_FPS, 0.1))
-            except Exception:
-                pass
+            self.pg.set_world_settings(rendering_dt=1.0 / max(RENDER_MAX_FPS, 0.1))
         self.pg._world = World(**self.pg._world_settings)
         self.world = self.pg.world
 
@@ -270,8 +268,6 @@ class PegasusApp:
         cfg = load_config_strict()
         self.manager = MultiUAVManager(self.pg, self.world, cfg)
         self.manager.spawn()
-
-        self.mavros_proc = None
 
         self.flask_app = Flask(__name__)
         self._flask_server = None

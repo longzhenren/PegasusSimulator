@@ -32,11 +32,11 @@ class PX4LaunchTool:
         Args:
             px4_dir (str): A string with the path to the PX4-Autopilot directory
             vehicle_id (int): The ID of the vehicle. Defaults to 0.
-            px4_model (str): The vehicle model. Defaults to "iris".
+            px4_model (str): The vehicle model. Defaults to "gazebo-classic_iris".
             sim_speed_factor (float): The speed factor for the simulation. Defaults to 1.0.
         """
 
-        print(f"[PX4LaunchTool] {vehicle_id}")
+        print(f"[PX4LaunchTool] vehicle_id={vehicle_id}")
         # Attribute that will hold the px4 process once it is running
         self.px4_process = None
 
@@ -46,12 +46,13 @@ class PX4LaunchTool:
         # Configurations to whether autostart px4 (SITL) automatically or have the user launch it manually on another
         # terminal
         self.px4_dir = px4_dir
-        self.rc_script = self.px4_dir + "/ROMFS/px4fmu_common/init.d-posix/rcS"
+        # self.rc_script = self.px4_dir + "/ROMFS/px4fmu_common/init.d-posix/rcS"
+        self.rc_script = "/home/user/PegasusSimulator-5.1/examples/px4/rcS_minmal"
 
         # Create a temporary filesystem for px4 to write data to/from (and modify the origin rcS files)
-        self.root_fs = tempfile.TemporaryDirectory()
+        self.root_fs = tempfile.TemporaryDirectory(prefix=f"px4_{self.vehicle_id}_")
 
-        # Set the environement variables that let PX4 know which vehicle model to use internally
+        # Set the environment variables that let PX4 know which vehicle model to use internally
         self.environment = os.environ
         self.environment["PX4_SIM_MODEL"] = px4_model
         # Unique UXRCE-DDS port per instance

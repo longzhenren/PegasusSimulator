@@ -1,0 +1,349 @@
+#!/bin/sh
+# ============================================================================
+#   Minimal rcS for Pegasus / IsaacSim 多机仿真
+#   - 保留核心功能：参数系统、airframe、模拟器、传感器、控制、导航、MAVLink
+#   - 删除/关闭：load_mon, battery_simulator, tone_alarm, FFT, gyro_cal, gimbal,
+#                camera_trigger/feedback, payload_deliverer, logger 等
+#   - 配合你修改的 airframe（10021_gazebo-classic_iris_pg）一起使用
+# ============================================================================
+
+# 出错不退出（避免某个模块失败导致整个 PX4 直接退出）
+set +e
+
+# 如需调试脚本，可取消注释下一行：
+# set -x
+
+# px4 命令别名（px4-commander, px4-param 等）
+# shellcheck disable=SC1091
+. px4-alias.sh
+
+# rc.* 搜索路径
+PATH="$PATH:${R}etc/init.d-posix"
+
+# ----------------------------------------------------------------------------
+# 1. EKF2 replay 模式（保持原逻辑，正常仿真时不会走这里）
+# ----------------------------------------------------------------------------
+# shellcheck disable=SC2154
+if [ "$replay_mode" = "ekf2" ]
+then
+    . ${R}etc/init.d-posix/rc.replay
+    exit 0
+fi
+
+# ----------------------------------------------------------------------------
+# 2. 变量初始化
+# ----------------------------------------------------------------------------
+set VEHICLE_TYPE                none
+set SYS_AUTOSTART               10021
+set RUN_MINIMAL_SHELL           no
+
+# ----------------------------------------------------------------------------
+# 3. 决定 SYS_AUTOSTART（决定 airframe 文件）
+#    - 你现在用的是 10021_gazebo-classic_iris_pg
+#    - 这里依然支持：PX4_SYS_AUTOSTART / PX4_SIM_MODEL 这两种方式
+# ----------------------------------------------------------------------------
+
+if [ "$PX4_SIM_MODEL" = "shell" ]
+then
+    # 仅运行极简 shell（一般用于手动调试）
+    set RUN_MINIMAL_SHELL yes
+
+elif [ -n "$PX4_SYS_AUTOSTART" ]
+then
+    echo "env SYS_AUTOSTART: ${PX4_SYS_AUTOSTART}"
+    SYS_AUTOSTART=${PX4_SYS_AUTOSTART}
+
+elif [ "$PX4_SIM_MODEL" = "none" ] || [ -z "$PX4_SIM_MODEL" ]
+then
+    # 不自动选择 airframe
+    SYS_AUTOSTART=0
+
+elif [ -n "$PX4_SIM_MODEL" ]
+then
+    # 根据 PX4_SIM_MODEL 名字去 airframes 目录里查找对应 id
+    # 文件名形如：10021_gazebo-classic_iris_pg
+    # shellcheck disable=SC2012
+    REQUESTED_AUTOSTART=$(ls "${R}etc/init.d-posix/airframes" | sed -n 's/^\([0-9][0-9]*\)_'${PX4_SIM_MODEL}'$/\1/p')
+    if [ -z "$REQUESTED_AUTOSTART" ]; then
+        echo "ERROR [init] Unknown model $PX4_SIM_MODEL (not found on ${R}etc/init.d-posix/airframes)"
+        exit 1
+    else
+        SYS_AUTOSTART=$REQUESTED_AUTOSTART
+        echo "INFO  [init] found model autostart file as SYS_AUTOSTART=$REQUESTED_AUTOSTART"
+    fi
+fi
+
+# ----------------------------------------------------------------------------
+# 4. 加载参数文件（保持原有安全逻辑）
+# ----------------------------------------------------------------------------
+set PARAM_FILE parameters.bson
+set PARAM_BACKUP_FILE parameters_backup.bson
+
+param select $PARAM_FILE
+if [ -f $PARAM_FILE ]; then
+
+    if ! param import
+    then
+        echo "ERROR [init] param import failed"
+
+        bsondump $PARAM_FILE
+
+        # 备份错误文件
+        cp $PARAM_FILE param_import_fail.bson
+
+        # 从备份恢复
+        if [ -f $PARAM_BACKUP_FILE ]
+        then
+            echo "[init] importing from parameter backup"
+            bsondump $PARAM_BACKUP_FILE
+            param import $PARAM_BACKUP_FILE
+            cp $PARAM_BACKUP_FILE $PARAM_FILE
+        fi
+
+        param status
+    fi
+
+elif [ -f $PARAM_BACKUP_FILE ]; then
+    echo "ERROR [init] primary param file $PARAM_FILE unavailable, using backup $PARAM_BACKUP_FILE"
+    param import $PARAM_BACKUP_FILE
+fi
+
+param select-backup $PARAM_BACKUP_FILE
+
+# 若只想要最小交互 shell，则到此结束
+[ $RUN_MINIMAL_SHELL = yes ] && exit 0
+
+# ----------------------------------------------------------------------------
+# 5. AUTOCONFIG / RESET 参数逻辑（保持原逻辑，保证多机一致性）
+# ----------------------------------------------------------------------------
+
+if param compare SYS_AUTOSTART $SYS_AUTOSTART
+then
+    set AUTOCNF no
+
+elif [ "$SYS_AUTOSTART" -eq 0 ]
+then
+    set AUTOCNF no
+else
+    set AUTOCNF yes
+    param set SYS_AUTOCONFIG 1
+fi
+
+if param compare SYS_AUTOCONFIG 1
+then
+    # 重置除了气动配置、校准、模式等以外的参数
+    param reset_all SYS_AUTOSTART RC* CAL_* COM_FLTMODE* LND_FLIGHT* TC_* COM_FLIGHT*
+    set AUTOCNF yes
+fi
+
+# ----------------------------------------------------------------------------
+# 6. 多实例设置（你多机时非常关键）
+#    px4_instance 在 posix 启动时由 px4 主程序传入
+# ----------------------------------------------------------------------------
+
+# shellcheck disable=SC2154
+param set MAV_SYS_ID $((px4_instance+1))
+param set UXRCE_DDS_KEY $((px4_instance+1))
+
+if [ $AUTOCNF = yes ]
+then
+    param set SYS_AUTOSTART $SYS_AUTOSTART
+
+    # 模拟 IMU / MAG 设备 ID
+    param set CAL_ACC0_ID  1310988
+    param set CAL_GYRO0_ID 1310988
+    param set CAL_ACC1_ID  1310996
+    param set CAL_GYRO1_ID 1310996
+    param set CAL_ACC2_ID  1311004
+    param set CAL_GYRO2_ID 1311004
+
+    param set CAL_MAG0_ID 197388
+    param set CAL_MAG0_PRIO 50
+    param set CAL_MAG1_ID 197644
+    param set CAL_MAG1_PRIO 50
+
+    param set SENS_BOARD_X_OFF 0.000001
+    param set SENS_DPRES_OFF 0.001
+fi
+
+# 一些基础默认参数（电池等，保持简单）
+param set-default BAT1_N_CELLS 4
+
+param set-default CBRK_AIRSPD_CHK 0
+param set-default CBRK_SUPPLY_CHK 894281
+
+# 不用 CPU load 限制
+param set-default COM_CPU_MAX -1
+
+# 不要求 RC 校准
+param set-default COM_RC_IN_MODE 1
+
+# 仿真里 EKF GPS 高度要求放宽一点
+param set-default EKF2_REQ_GPS_H 0.5
+
+# Multi-EKF
+param set-default EKF2_MULTI_IMU 3
+param set-default SENS_IMU_MODE 0
+
+# 你在 10021 airframe 里已经把 IMU_GYRO_FFT_EN 设为 0，这里不再 default=1
+
+# 默认 MAVLink 2
+param set-default MAV_PROTO_VER 2
+
+# 仅在需要时才启用 MC AT 控制（保持默认）
+param set-default -s MC_AT_EN 1
+
+# 日志相关默认值你在 airframe 里已经调成 “不记录”：
+# SDLOG_MODE=0, SDLOG_PROFILE=0, SDLOG_DIRS_MAX=1
+
+# 失联时间随仿真时间缩放（保留，代价很小）
+if [ -n "$PX4_SIM_SPEED_FACTOR" ]; then
+    COM_DL_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 10" | bc)
+    echo "COM_DL_LOSS_T set to $COM_DL_LOSS_T_LONGER"
+    param set COM_DL_LOSS_T $COM_DL_LOSS_T_LONGER
+
+    COM_RC_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 0.5" | bc)
+    echo "COM_RC_LOSS_T set to $COM_RC_LOSS_T_LONGER"
+    param set COM_RC_LOSS_T $COM_RC_LOSS_T_LONGER
+
+    COM_OF_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 0.5" | bc)
+    echo "COM_OF_LOSS_T set to $COM_OF_LOSS_T_LONGER"
+    param set COM_OF_LOSS_T $COM_OF_LOSS_T_LONGER
+
+    COM_OBC_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 5.0" | bc)
+    echo "COM_OBC_LOSS_T set to $COM_OBC_LOSS_T_LONGER"
+    param set COM_OBC_LOSS_T $COM_OBC_LOSS_T_LONGER
+fi
+
+# ----------------------------------------------------------------------------
+# 7. 选择并加载 airframe（对你来说就是 10021_gazebo-classic_iris_pg）
+# ----------------------------------------------------------------------------
+
+autostart_file=''
+# shellcheck disable=SC2231
+for f in ${R}etc/init.d-posix/airframes/"$(param show -q SYS_AUTOSTART)"_*
+do
+    filename=$(basename "$f")
+    case "$filename" in
+        *\.*)
+            # 忽略带后缀的（如 .post）
+            ;;
+        *)
+            autostart_file="$f"
+            ;;
+    esac
+done
+
+if [ -e "$autostart_file" ]
+then
+    . "$autostart_file"
+
+elif [ ! -e "$autostart_file" ] && [ "$SYS_AUTOSTART" -ne "0" ]
+then
+    echo "Error: no autostart file found ($autostart_file)"
+    exit 1
+fi
+
+# 用户自定义参数（可放在 PATH 里）
+. px4-rc.params
+
+# ----------------------------------------------------------------------------
+# 8. 启动核心服务：dataman + 模拟器
+# ----------------------------------------------------------------------------
+
+dataman start
+
+# 不是 replay 模式就启动仿真 backend（lockstep 时间）
+if ! replay tryapplyparams
+then
+    . px4-rc.simulator
+fi
+
+# ----------------------------------------------------------------------------
+# 9. 启动飞控核心模块（极简）
+# ----------------------------------------------------------------------------
+
+# 以下模块几乎是必须的：
+#   sensors       : 传感器融合入口
+#   commander     : 状态机 / 安全逻辑
+#   rc_update     : RC 输入处理
+#   manual_control: 手动 / offboard 控制输入
+#   pwm_out_sim   : 模拟电机输出
+#   rc.vehicle_setup: 多旋翼控制器等参数配置
+#   navigator     : 任务 / 导航逻辑
+
+# 明确 **不再启动**：
+#   load_mon, battery_simulator, tone_alarm,
+#   gimbal, camera_trigger, camera_feedback,
+#   gyro_fft, gyro_calibration, payload_deliverer,
+#   rc.logging (logger)，replay trystart 等
+
+sensors start
+commander start
+rc_update start
+manual_control start
+
+if ! pwm_out_sim start -m sim
+then
+    echo "pwm_out_sim start failed"
+fi
+
+# 车辆类型相关配置（multicopter / VTOL / plane 等）
+. ${R}etc/init.d/rc.vehicle_setup
+
+navigator start
+
+# ----------------------------------------------------------------------------
+# 10. （可选）UXRCE-DDS 客户端（默认关闭，极简 + MAVROS 场景通常不需要）
+# ----------------------------------------------------------------------------
+# 如果你以后需要 ROS 2 DDS 直连（而不是 MAVROS-MAVLink），可以：
+#   在环境中设置 PX4_ENABLE_DDS=1，然后这一段就会启用。
+
+if [ "$PX4_ENABLE_DDS" = "1" ]
+then
+    uxrce_dds_ns=""
+    if [ "$px4_instance" -ne "0" ]
+    then
+        uxrce_dds_ns="-n px4_$px4_instance"
+    fi
+    if [ -n "$PX4_UXRCE_DDS_NS" ]
+    then
+        uxrce_dds_ns="-n $PX4_UXRCE_DDS_NS"
+    fi
+    if [ -n "$ROS_DOMAIN_ID" ]
+    then
+        param set UXRCE_DDS_DOM_ID $ROS_DOMAIN_ID
+    else
+        param set UXRCE_DDS_DOM_ID 0
+    fi
+    uxrce_dds_port=8888
+    if [ -n "$PX4_UXRCE_DDS_PORT" ]
+    then
+        uxrce_dds_port="$PX4_UXRCE_DDS_PORT"
+    fi
+
+    uxrce_dds_client start -t udp -h 127.0.0.1 -p $uxrce_dds_port $uxrce_dds_ns
+fi
+
+# ----------------------------------------------------------------------------
+# 11. MAVLink（给 MAVROS / GCS）
+# ----------------------------------------------------------------------------
+
+# 用户自定义 mavlink stream 设置
+. px4-rc.mavlink
+
+# autostart 后置脚本（若存在）
+[ -e "$autostart_file".post ] && . "$autostart_file".post
+
+# ----------------------------------------------------------------------------
+# 12. 不启 logger / replay / load_mon 等，以达到“极简 + 高并发”目的
+# ----------------------------------------------------------------------------
+
+# 不再调用 rc.logging（避免启动 logger 线程）
+# 不再调用 load_mon start
+# 不再调用 battery_simulator start
+tone_alarm start
+replay trystart
+
+# 通知 MAVLink 端“启动完成”
+mavlink boot_complete

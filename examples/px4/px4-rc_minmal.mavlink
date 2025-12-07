@@ -1,0 +1,42 @@
+#!/bin/sh
+# Minimal rc.mavlink for Pegasus / IsaacSim multi-UAV
+# 只保留一条 Onboard MAVLink 链路给 MAVROS，关闭所有 GCS/相机/云台链接
+# shellcheck disable=SC2154
+
+# px4_instance 由 rcS 传入：0,1,2,3...
+instance=${px4_instance:-0}
+
+# -----------------------------
+# 只保留 Offboard/MAVROS 链路
+# -----------------------------
+# 本地端口：14580 + instance
+# 远端端口：14540 + instance  （对齐 MAVROS 的 fcu_url）
+udp_offboard_port_local=$((14580 + instance))
+udp_offboard_port_remote=$((14540 + instance))
+
+# 超过 10 架时，统一复用 14549 以避免端口爆炸（和原始逻辑一致）
+[ "$instance" -gt 9 ] && udp_offboard_port_remote=14549
+
+# 可选：先停掉已有 mavlink 防止重复（旧版本不一定有 stop-all，可以按需保留/删掉）
+# mavlink stop-all > /dev/null 2>&1
+
+# 启动唯一一条 Onboard 链路给 MAVROS
+# -x  : 不自动配置 stream，由 MAVROS 自己配置
+# -m  : onboard 模式
+# -u  : PX4 本地端口
+# -o  : 远端端口（MAVROS 监听端口）
+mavlink start -x \
+    -u "$udp_offboard_port_local" \
+    -r 4000000 \
+    -m onboard \
+    -o "$udp_offboard_port_remote"
+
+echo "INFO [rc.mavlink] started onboard link: local=$udp_offboard_port_local -> remote=$udp_offboard_port_remote"
+
+# 这里不再启动：
+#  - GCS link（原来是 18570+instance → remote 14550）
+#  - Onboard payload link
+#  - Onboard gimbal link
+#  - sihsim 专用 link
+#
+# boot_complete 仍由 rcS 里的 `mavlink boot_complete` 调用

@@ -193,6 +193,9 @@ POSITION_READY_TIMEOUT_S = float(os.environ.get("PEGASUS_POSITION_READY_TIMEOUT_
 POSITION_READY_WINDOW_S = float(os.environ.get("PEGASUS_POSITION_READY_WINDOW_S", "1.5"))
 POSITION_READY_EPS = float(os.environ.get("PEGASUS_POSITION_READY_EPS", "0.05"))
 
+SETMODE_TIMEOUT_S = float(os.environ.get("PEGASUS_SETMODE_TIMEOUT_S", "10.0"))
+ARMING_TIMEOUT_S = float(os.environ.get("PEGASUS_ARMING_TIMEOUT_S", "10.0"))
+
 MAX_PITCH_DEG = 20.0
 MAX_ROLL_DEG = 20.0
 
@@ -524,6 +527,10 @@ class IsaacSimEnv(Node):
         def _http_log_pre():
             try:
                 g._http_start = time.time()
+                if request.path == '/health':
+                    g._skip_http_log = True
+                    return
+                g._skip_http_log = False
                 payload = request.get_json(silent=True)
                 if isinstance(payload, (dict, list)):
                     body = json.dumps(payload, ensure_ascii=False)
@@ -539,6 +546,8 @@ class IsaacSimEnv(Node):
                 start = getattr(g, "_http_start", None)
                 end = time.time()
                 dur_ms = int(((end - start) if start else 0.0) * 1000)
+                if getattr(g, "_skip_http_log", False) and request.path == '/health':
+                    return resp
                 try:
                     text = resp.get_data(as_text=True)
                 except Exception:
@@ -807,7 +816,7 @@ class IsaacSimEnv(Node):
         self.arm_cmd.value = True
         while not self.current_state.armed:
             self.get_logger().info("[reset] Sending arm command...")
-            resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
+            resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
             if resp and getattr(resp, "success", False):
                 self.get_logger().info("[reset] ***** Vehicle armed *****")
                 break
@@ -823,7 +832,7 @@ class IsaacSimEnv(Node):
         
         self.offb_set_mode.custom_mode = "OFFBOARD"
         while self.current_state.mode != "OFFBOARD":
-            resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=5.0)
+            resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
             if resp and getattr(resp, "mode_sent", False):
                 self.get_logger().info("[reset] ***** OFFBOARD enabled *****")
             spin_sleep(self, 2.0)
@@ -907,7 +916,7 @@ class IsaacSimEnv(Node):
                     land_mode = SetMode.Request()
                     land_mode.custom_mode = "AUTO.LAND"
                     try:
-                        call_service_sync(self, self.set_mode_client, land_mode, timeout_sec=5.0)
+                        call_service_sync(self, self.set_mode_client, land_mode, timeout_sec=SETMODE_TIMEOUT_S)
                     except Exception as e:
                         self.get_logger().warn(f"[reboot] UAV{vid} land failed. {e}")
                     landed_ok = self.wait_until_landed(timeout_s=60.0, window_s=2.0, eps=0.03)
@@ -915,11 +924,11 @@ class IsaacSimEnv(Node):
                     raise RuntimeError("[reboot] Landing failed or timed out during PX4 reset")
             if bool(getattr(self.current_state, "armed", False)):
                 self.get_logger().info(f"[reboot] UAV{vid} disarming...")
-                if self.arming_client.wait_for_service(timeout_sec=5.0):
+                if self.arming_client.wait_for_service(timeout_sec=ARMING_TIMEOUT_S):
                     disarm_req = CommandBool.Request()
                     disarm_req.value = False
                     try:
-                        call_service_sync(self, self.arming_client, disarm_req, timeout_sec=5.0)
+                        call_service_sync(self, self.arming_client, disarm_req, timeout_sec=ARMING_TIMEOUT_S)
                         self.get_logger().info(f"[reboot] UAV{vid} disarmed.")
                     except Exception:
                         self.get_logger().warn(f"[reboot] UAV{vid} disarm failed.")
@@ -960,10 +969,10 @@ class IsaacSimEnv(Node):
             time.sleep(10.0)
             
             
-        self.get_logger().info(f"[reboot] UAV{vid} arming_client.wait_for_service(timeout_sec=20.0)")
-        self.arming_client.wait_for_service(timeout_sec=20.0)
-        self.get_logger().info(f"[reboot] UAV{vid} set_mode_client.wait_for_service(timeout_sec=20.0)")
-        self.set_mode_client.wait_for_service(timeout_sec=20.0)
+        self.get_logger().info(f"[reboot] UAV{vid} arming_client.wait_for_service(timeout_sec={ARMING_TIMEOUT_S})")
+        self.arming_client.wait_for_service(timeout_sec=ARMING_TIMEOUT_S)
+        self.get_logger().info(f"[reboot] UAV{vid} set_mode_client.wait_for_service(timeout_sec={SETMODE_TIMEOUT_S})")
+        self.set_mode_client.wait_for_service(timeout_sec=SETMODE_TIMEOUT_S)
         # 输出当前sys状态和位置信息
         self.get_logger().info(f"[reboot] UAV{vid} current_state={self.current_state}")
         self.get_logger().info(f"[reboot] UAV{vid} current_pose={self.current_pose}")
@@ -980,7 +989,7 @@ class IsaacSimEnv(Node):
         off_start = time.time()
         while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 60.0:
             try:
-                resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=5.0)
+                resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
                 if resp and getattr(resp, "mode_sent", False):
                     self.get_logger().info("[reboot] ***** OFFBOARD enabled *****")
             except Exception as e:
@@ -1014,7 +1023,7 @@ class IsaacSimEnv(Node):
         arm_start = time.time()
         while not self.current_state.armed and (time.time() - arm_start) < 60.0:
             try:
-                resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
+                resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
                 # self.get_logger().info(f"[reboot] UAV{vid} arming resp={resp}")
                 if resp and getattr(resp, "success", False):
                     self.get_logger().info(f"[reboot] UAV{vid} ***** Vehicle armed *****")
@@ -1053,13 +1062,20 @@ class IsaacSimEnv(Node):
         time.sleep(5.0)
         self.wait_for_fcu_connection()
         
+        ok_att = self.wait_until_attitude_stable(
+            timeout_s=POSITION_READY_TIMEOUT_S,
+            window_s=POSITION_READY_WINDOW_S,
+            eps=POSITION_READY_EPS,
+        )
+        self.get_logger().info(f"[reboot_hard] UAV{vid} attitude stable={ok_att}")
+        
         # Wait for arming service to be available.
         self.arming_client.wait_for_service(timeout_sec=20.0)
         self.arm_cmd.value = True
         arm_start = time.time()
         while not self.current_state.armed and (time.time() - arm_start) < 60.0:
             try:
-                resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=5.0)
+                resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
                 if resp and getattr(resp, "success", False):
                     self.get_logger().info(f"[reboot_hard] UAV{vid} ***** Vehicle armed *****")
                     break
@@ -1074,33 +1090,27 @@ class IsaacSimEnv(Node):
             spin_sleep(self, 20.0)
         
         # Send OFFBOARD mode command.
-        self.set_mode_client.wait_for_service(timeout_sec=20.0)
+        self.set_mode_client.wait_for_service(timeout_sec=SETMODE_TIMEOUT_S)
         self.offb_set_mode.custom_mode = "OFFBOARD"
         off_start = time.time()
         while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 60.0:
             try:
-                resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=5.0)
+                resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
                 if resp and getattr(resp, "mode_sent", False):
                     self.get_logger().info("[reboot_hard] ***** OFFBOARD enabled *****")
             except Exception as e:
-                self.get_logger().warn(f"UAV{vid} OFFBOARD enable failed. Exception: {e}")
+                self.get_logger().warn(f"[reboot_hard] UAV{vid} OFFBOARD enable failed. Exception: {e}")
             spin_sleep(self, 2.0)
         if self.current_state.mode != "OFFBOARD":
             raise TimeoutError("OFFBOARD not enabled within 60s")
-        ok_att = self.wait_until_attitude_stable(
-            timeout_s=POSITION_READY_TIMEOUT_S,
-            window_s=POSITION_READY_WINDOW_S,
-            eps=POSITION_READY_EPS,
-        )
-        self.get_logger().info(f"[reboot_hard] UAV{vid} attitude stable={ok_att}")
-        target_x = float(self.current_pose.pose.position.x)
-        target_y = float(self.current_pose.pose.position.y)
-        z0 = float(self.current_pose.pose.position.z)
-        target_z = float(z0) + float(self.init_height)
-        self._perform_takeoff(target_x, target_y, target_z, "[reboot_hard]")
+        
+        target_x = float(position[0])
+        target_y = float(position[1])
+        takeoff_z = float(self.current_pose.pose.position.z) + float(self.init_height)
+        target_z = float(position[2])
+        self._perform_takeoff(target_x, target_y, takeoff_z, "[reboot_hard]")
         if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
-            x, y, z = float(position[0]), float(position[1]), float(position[2])
-            ok_mv = self.move_to_and_wait(x, y, z, threshold=MOVE_REACH_THRESHOLD, timeout_s=60.0)
+            ok_mv = self.move_to_and_wait(target_x, target_y, target_z, threshold=MOVE_REACH_THRESHOLD, timeout_s=60.0)
             self.get_logger().info(f"[reboot_hard] UAV{vid} moved to target={position} ok={ok_mv}")
 
     def wait_for_fcu_connection(self):
@@ -1332,8 +1342,8 @@ class IsaacSimEnv(Node):
                     land_mode = SetMode.Request()
                     land_mode.custom_mode = "AUTO.LAND"
                     self.get_logger().info(f"UAV{vid} fallback: set_mode AUTO.LAND")
-                    resp2 = call_service_sync(self, self.set_mode_client, land_mode, timeout_sec=5.0)
-                    self.get_logger().info(f"UAV{vid} set_mode AUTO.LAND resp: {resp2}")
+                    resp2 = call_service_sync(self, self.set_mode_client, land_mode, timeout_sec=SETMODE_TIMEOUT_S)
+                    self.get_logger().info(f"UAV{vid} fallback set_mode AUTO.LAND resp: {resp2}")
                 except Exception as e:
                     self.get_logger().warn(f"UAV{vid} fallback set_mode AUTO.LAND failed: {e}")
 
@@ -1399,7 +1409,7 @@ class IsaacSimEnv(Node):
                 try:
                     disarm_req = CommandBool.Request()
                     disarm_req.value = False
-                    resp3 = call_service_sync(self, self.arming_client, disarm_req, timeout_sec=5.0)
+                    resp3 = call_service_sync(self, self.arming_client, disarm_req, timeout_sec=ARMING_TIMEOUT_S)
                     self.get_logger().info(f"UAV{vid} disarm resp: {resp3}")
                 except Exception as e:
                     mode = getattr(self.current_state, "mode", "")

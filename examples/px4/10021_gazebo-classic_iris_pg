@@ -1,0 +1,106 @@
+#!/bin/sh
+#
+# @name 3DR Iris Quadrotor SITL (Pegasus minimal)
+#
+# @type Quadrotor Wide
+# @class Copter
+#
+# @maintainer Julian Oes <julian@oes.ch>
+#
+
+# 加载多旋翼默认参数（姿态控制等基础参数）
+. ${R}etc/init.d/rc.mc_defaults
+
+#
+# === 机体 / 电机几何配置（保持原样） ===
+#
+
+param set-default CA_AIRFRAME 0
+
+param set-default CA_ROTOR_COUNT 4
+param set-default CA_ROTOR0_PX 0.1515
+param set-default CA_ROTOR0_PY 0.245
+param set-default CA_ROTOR0_KM 0.05
+param set-default CA_ROTOR1_PX -0.1515
+param set-default CA_ROTOR1_PY -0.1875
+param set-default CA_ROTOR1_KM 0.05
+param set-default CA_ROTOR2_PX 0.1515
+param set-default CA_ROTOR2_PY -0.245
+param set-default CA_ROTOR2_KM -0.05
+param set-default CA_ROTOR3_PX -0.1515
+param set-default CA_ROTOR3_PY 0.1875
+param set-default CA_ROTOR3_KM -0.05
+
+# 主电机输出功能映射（保持原样）
+param set-default PWM_MAIN_FUNC1 101
+param set-default PWM_MAIN_FUNC2 102
+param set-default PWM_MAIN_FUNC3 103
+param set-default PWM_MAIN_FUNC4 104
+
+
+#
+# === 性能与速度参数（结合你之前的需求） ===
+# 用于提升 OFFBOARD 响应速度，但保持在比较安全的范围，
+# 在 SITL + IsaacSim + MAVROS 多机下比较合适。
+#
+
+# 起飞上升速度 [m/s]
+param set-default MPC_TKO_SPEED     8.0
+
+# 上升 / 下降最大速度 [m/s]
+param set-default MPC_Z_VEL_MAX_UP  8.0
+param set-default MPC_Z_VEL_MAX_DN  8.0
+
+# 水平最大速度 [m/s]
+param set-default MPC_XY_VEL_MAX   20.0
+
+
+#
+# === 降低 CPU 开销 & 加快启动：关掉用不到的模块开关 ===
+# 这些参数和 rcS 里的条件语句配合使用：
+#   - IMU_GYRO_FFT_EN   -> gyro_fft start
+#   - IMU_GYRO_CAL_EN   -> gyro_calibration start
+#   - MNT_MODE_IN       -> gimbal start
+#   - TRIG_MODE         -> camera_trigger / camera_feedback start
+#   - PD_GRIPPER_EN     -> payload_deliverer start
+#
+
+# 关闭陀螺 FFT 分析（对真机减振有帮助，但仿真+多机完全可以关）
+param set-default IMU_GYRO_FFT_EN   0
+
+# 关闭自动陀螺标定模块
+param set-default IMU_GYRO_CAL_EN   0
+
+# 关闭云台控制模块（没有挂云台就关掉）
+param set-default MNT_MODE_IN      -1
+
+# 关闭相机触发 / 回调模块
+param set-default TRIG_MODE         0
+
+# 关闭抓取器 / 载荷投放模块
+param set-default PD_GRIPPER_EN     0
+
+
+#
+# === 日志开销优化（大规模多机时强烈建议） ===
+# 默认为 SD 卡日志全开，SITL + 多机会有很多不必要 IO 和线程。
+# 如果你暂时不关心 PX4 内部 log，可以完全关掉；若要保留，酌情改数值。
+#
+
+# 0 = 不记录飞行日志（最省资源）
+param set-default SDLOG_MODE        0
+
+# 不启用任何 logging profile
+param set-default SDLOG_PROFILE     0
+
+# 最大日志目录数量（关掉日志后其实无所谓，这里设 1 最小化目录管理）
+param set-default SDLOG_DIRS_MAX    1
+
+
+#
+# === 可选：仿真用的一点“更宽松”设置（按需打开） ===
+# 如果你后面想进一步放开 EKF、低电保护等，可以在这里追加，比如：
+#
+param set-default COM_LOW_BAT_ACT  0   # 关闭低电量动作（只建议纯仿真环境）
+param set-default GF_ACTION        0   # 关闭 geofence 动作
+param set-default GF_ENABLE        0   # 关闭 geofence

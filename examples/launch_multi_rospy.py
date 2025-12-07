@@ -1,28 +1,31 @@
-#!/usr/bin/env python3
 """
 多机启动器（launch_multi_rospy.py）
 
 概述
 - 根据 `multi_uav_config.json` 启动多架载具：生成 MAVROS 多机启动文件并为每架载具启动控制器 `rospy_isaacsim.py`。
 - 支持统一 HTTP 网关（`recording_server.py`），将 `/uav/<id>/...` 转发到各控制器端口，便于多机统一入口与录制。
-- 提供预清理（端口/进程占用）与信号处理，确保异常退出时清理子进程与日志文件句柄。
+- 并行分组启动：通过 `--parallel` 控制并行分组数（默认 4），每组内按顺序等待上一架日志 `Takeoff complete` 再启动下一架。
+- 端口健康与自动重启：控制器 HTTP 端口（5009+id）如 60s 未就绪，自动清理端口并重启控制器（10s 冷却）。
+- 快速预清理：并行收集并强杀端口占用与进程名匹配（mavros/px4）的残留进程；支持 `--force` 跳过确认。
+- 退出清理：在退出信号与正常结束时强杀 MAVROS 进程组，关闭日志句柄，并清理所有子进程；可选清理现有 Isaac Sim。
 
 启动时序与稳定性
-- 先启动仿真 `8_camera_vehicle.py`；等待日志出现 `'Startup script returned successfully'`，且数量达到载具数。
-- 再启动 MAVROS；若需要可等待 `'Ready for takeoff!'` 信息达到载具数以保证控制器更稳定地进入 OFFBOARD。
+- 先启动仿真 `8_camera_vehicle.py`；可监控日志 `Ready for takeoff!` 达到载具数以提升稳定性。
+- 启动 MAVROS；可监控 `Startup script returned successfully` 达到载具数后进入连接检查。
+- 启动控制器：按 `--parallel` 并行分组启动，组内顺序等待上一架 `Takeoff complete` 日志再继续。
 
 使用示例
-  python3 examples/launch_multi_rospy.py \
+  ISAACSIM_PYTHON examples/launch_multi_rospy.py \
     --config examples/multi_uav_config.json \
     --script examples/rospy_isaacsim.py \
     --isaac examples/8_camera_vehicle.py \
-    --pre-clean --force
+    --parallel 4 --pre-clean --force
 
 日志位置
 - 控制器：`examples/logs/<session_ts>/<namespace>/rospy.log`
 - 仿真：`examples/logs/<session_ts>/isaac/isaacsim.log`
 - MAVROS：`examples/logs/<session_ts>/mavros/ros2_mavros_launch.log`
-- 网关：控制台输出健康映射与转发状态
+- 网关：控制台输出健康映射与转发状态（端口 5008）
 """
 
 import argparse
@@ -35,13 +38,9 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import subprocess as sp
-
-try:
-    import psutil  # optional, used for robust port/name scanning
-except Exception:
-    psutil = None
-
-CONTROL_UP_INTERVAL = 2.0
+import urllib.request
+import concurrent.futures as cf
+import psutil
 
 def load_config(path: Path) -> Dict[str, Any]:
     if not path.exists():
@@ -51,13 +50,50 @@ def load_config(path: Path) -> Dict[str, Any]:
     except Exception as e:
         raise RuntimeError(f"Failed to read JSON config {path}: {e}")
 
+def build_env(base: Dict[str, str], vid: int, mavros_ns: str, session_ts: Optional[str]) -> Dict[str, str]:
+    env = dict(base)
+    env["MAVROS_NS"] = mavros_ns
+    # Per-controller HTTP port; gateway will route '/uavX/*' to these
+    env["ROS_NAMESPACE"] = f"/{mavros_ns}"
+    # Reserve 5008 for gateway; controllers start from 5009
+    env["PEGASUS_HTTP_PORT"] = str(5009 + int(vid))
+    if session_ts:
+        env["PEGASUS_SESSION_TS"] = str(session_ts)
+    return env
 
-def ensure_dir(p: Path):
-    try:
-        p.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+def _source_env(paths: List[str]) -> Dict[str, str]:
+    cmd_parts: List[str] = []
+    for p in paths:
+        p_abs = os.path.expanduser(p)
+        cmd_parts.append(f"source {p_abs}")
+    cmd = " && ".join(cmd_parts + ["env -0"])
+    out = sp.check_output(['bash', '-lc', cmd])
+    env_out: Dict[str, str] = {}
+    for item in out.split(b'\0'):
+        if not item:
+            continue
+        k, _, v = item.partition(b'=')
+        env_out[k.decode()] = v.decode()
+    return env_out
 
+# For ISAACSIM version >= 5.0 work together with ros2 humble
+# DO NOT use or source system ros2 and packages (linked with system Python 3.10)
+# USE separate Python 3.11 installed with ISAACSIM instead
+# Ref: https://github.com/isaac-sim/IsaacSim-ros_workspaces
+ISAACSIM_PYTHON = '/home/user/isaacsim-5.1.0/python.sh'
+SYS_PYTHON = '/usr/bin/python3'
+ISAACSIM_ROS2_CMD = '/home/user/IsaacSim-ros_workspaces/build_ws/humble/humble_ws/install/bin/ros2'
+PYTHON311_ENV = _source_env([
+        "~/IsaacSim-ros_workspaces/build_ws/humble/humble_ws/install/local_setup.bash",
+        "~/IsaacSim-ros_workspaces/build_ws/humble/isaac_sim_ros_ws/install/local_setup.bash",
+        ])
+PYTHON310_ENV = _source_env([
+        "/opt/ros/humble/setup.bash",
+        ])
+
+def ensure_dir(p: Path): 
+    p.mkdir(parents=True, exist_ok=True)
+    
 def wait_log_count(log_path: Path, regex: str, expected_count: int, timeout: float, interval: float = 1.0, label: str = "") -> bool:
     start = time.time()
     last_len = 0
@@ -65,21 +101,25 @@ def wait_log_count(log_path: Path, regex: str, expected_count: int, timeout: flo
     seen = 0
     last_seen = -1
     while time.time() - start < timeout:
-        try:
-            if log_path.exists():
-                data = log_path.read_text(errors="ignore")
-                if len(data) != last_len:
-                    last_len = len(data)
-                    seen = len(pat.findall(data))
-                    if seen != last_seen:
-                        last_seen = seen
-                        print(f"[READY] {label or regex} count: {seen}/{expected_count}")
-                    if seen >= expected_count:
-                        return True
-        except Exception:
-            pass
+        if log_path.exists():
+            data = log_path.read_text(errors="ignore")
+            if len(data) != last_len:
+                last_len = len(data)
+                seen = len(pat.findall(data))
+                if seen != last_seen:
+                    last_seen = seen
+                    print(f"[READY] {label or regex} count: {seen}/{expected_count}")
+                if seen >= expected_count:
+                    return True
         time.sleep(interval)
     return False
+
+def _probe_port(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as resp:
+            return resp.getcode() == 200
+    except Exception:
+        return False
 
 def _generate_mavros_launch_from_config(cfg_path: Path) -> Path:
     try:
@@ -104,36 +144,23 @@ def _generate_mavros_launch_from_config(cfg_path: Path) -> Path:
         lines.append("    <group>")
         lines.append(f"        <arg name=\"id\" default=\"{vid}\" />")
         lines.append(f"        <arg name=\"fcu_url\" default=\"{fcu_url}\" />")
-        lines.append("        <include file=\"$(find-pkg-share mavros)/launch/px4.launch\">")
+        lines.append(f"        <include file=\"{cfg_path.parent}/launch/px4_custom.launch\">")
         lines.append(f"            <arg name=\"tgt_system\" value=\"{tgt_system}\" />")
         lines.append(f"            <arg name=\"namespace\" value=\"/{ns}/mavros\" />")
         lines.append("            <arg name=\"time_sync\" value=\"False\" />")
+        lines.append(f"            <arg name=\"timesync_rate\" value=\"0.0\" />")
         lines.append("        </include>")
         lines.append("    </group>")
     lines.append("</launch>")
     content = "\n".join(lines)
     # 和cfg_path保存到相同目录
-    path = cfg_path.parent / f"pegasus_multi_uav.launch"
-    try:
-        path.write_text(content)
-    except Exception:
-        pass
+    path = cfg_path.parent / f"launch/pegasus_multi_uav.launch"
+    path.write_text(content)
     return path
 
-def build_env(base: Dict[str, str], vid: int, mavros_ns: str, session_ts: Optional[str]) -> Dict[str, str]:
-    env = dict(base)
-    env["MAVROS_NS"] = mavros_ns
-    # Per-controller HTTP port; gateway will route '/uavX/*' to these
-    env["ROS_NAMESPACE"] = f"/{mavros_ns}"
-    # Reserve 5008 for gateway; controllers start from 5009
-    env["PEGASUS_HTTP_PORT"] = str(5009 + int(vid))
-    if session_ts:
-        env["PEGASUS_SESSION_TS"] = str(session_ts)
-    return env
 
-
-def start_instance(python_exe: str, script_path: Path, mavros_ns: Optional[str], env: Dict[str, str], log_path: Path, prefix: Optional[str] = None, to_console: bool = False) -> sp.Popen:
-    cmd: List[str] = [python_exe, str(script_path)]
+def start_instance(ISAACSIM_PYTHON: str, script_path: Path, mavros_ns: Optional[str], env: Dict[str, str], log_path: Path, prefix: Optional[str] = None, to_console: bool = False) -> sp.Popen:
+    cmd: List[str] = [ISAACSIM_PYTHON, str(script_path)]
     if mavros_ns:
         cmd += ["--mavros-ns", mavros_ns]    
     # Print the command that will be executed
@@ -171,20 +198,15 @@ def start_instance(python_exe: str, script_path: Path, mavros_ns: Optional[str],
         def _reader(stream, file, tag: str):
             color = _pick_color(tag or "")
             pre = f"\033[{color}m{tag}\033[0m" if tag else ""
-            try:
-                for line in stream:
-                    line = line.rstrip("\n")
-                    if tag:
-                        print(f"{pre} {line}")
-                    else:
-                        print(line)
-                    try:
-                        file.write(line + "\n")
-                        file.flush()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            for line in stream:
+                line = line.rstrip("\n")
+                if tag:
+                    print(f"{pre} {line}")
+                else:
+                    print(line)
+                file.write(line + "\n")
+                file.flush()
+
 
         t = threading.Thread(target=_reader, args=(proc.stdout, log_f, prefix or ""), daemon=True)
         t.start()
@@ -202,10 +224,7 @@ def terminate_all(procs: List[sp.Popen], timeout: float = 5.0):
     # Graceful terminate, then kill if needed
     for p in procs:
         if p.poll() is None:
-            try:
-                p.terminate()
-            except Exception:
-                pass
+            p.terminate()
     t0 = time.time()
     while time.time() - t0 < timeout:
         if all(p.poll() is not None for p in procs):
@@ -213,25 +232,20 @@ def terminate_all(procs: List[sp.Popen], timeout: float = 5.0):
         time.sleep(0.2)
     for p in procs:
         if p.poll() is None:
-            try:
-                p.kill()
-            except Exception:
-                pass
+            p.kill()
         # close log files
         lf = getattr(p, "_log_file", None)
-        try:
-            if lf:
-                lf.close()
-        except Exception:
-            pass
+        if lf:
+            lf.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Launch multiple rospy_isaacsim.py controllers from JSON config")
     default_dir = Path(__file__).resolve().parent
+    isaacsim_path_default = os.environ.get("ISAACSIM_PATH", "/home/user/isaacsim-5.1.0")
     parser.add_argument("--config", type=str, default=str(default_dir / "multi_uav_config.json"), help="Path to multi-UAV JSON config")
     parser.add_argument("--script", type=str, default=str(default_dir / "rospy_isaacsim.py"), help="Path to control script")
-    parser.add_argument("--python", type=str, default=sys.executable, help="Python executable for child processes")
+    parser.add_argument("--python", type=str, default=os.path.join(isaacsim_path_default, "python.sh"), help="Python executable for child processes")
     parser.add_argument("--isaac", type=str, default=str(default_dir / "8_camera_vehicle.py"), help="IsaacSim scene script to run before controllers")
     parser.add_argument("--session-ts", type=str, default=None, help="Override session timestamp (string or int)")
     parser.add_argument("--log-root", type=str, default=str(default_dir / "logs"), help="Root directory for logs")
@@ -241,11 +255,11 @@ def main():
     parser.add_argument("--console-logs", action="store_true", default=True, help="Stream child logs to console with prefixes while saving to files")
     parser.add_argument("--ready-timeout", type=float, default=500.0, help="Timeout for waiting for process to be ready (seconds)")
     parser.add_argument("--kill-isaac", action="store_true", help="启动前杀掉已有 Isaac Sim 进程")
+    parser.add_argument("--parallel", type=int, default=4, help="控制器并行分组数（每组内顺序等待 OFFBOARD）")
     args = parser.parse_args()
 
     config_path = Path(args.config)
     script_path = Path(args.script)
-    python_exe = args.python
 
     if not script_path.exists():
         print(f"[ERROR] Control script not found: {script_path}")
@@ -265,6 +279,7 @@ def main():
     expected_aircraft = len(vehicles)
 
     # Unify session timestamp across instances: cli > env > now
+    t_start = time.time()
     session_ts = args.session_ts or os.environ.get("PEGASUS_SESSION_TS") or str(int(time.time()))
     base_env = os.environ.copy()
     base_env["PEGASUS_SESSION_TS"] = session_ts
@@ -289,87 +304,82 @@ def main():
         pids: List[int] = []
         # Try psutil first
         if psutil is not None:
-            try:
-                for conn in psutil.net_connections(kind='tcp'):
-                    if conn.laddr and conn.laddr.port == port and conn.pid:
-                        pids.append(conn.pid)
-                for conn in psutil.net_connections(kind='udp'):
-                    if conn.laddr and conn.laddr.port == port and conn.pid:
-                        pids.append(conn.pid)
-            except Exception:
-                pass
+            for conn in psutil.net_connections(kind='tcp'):
+                if conn.laddr and conn.laddr.port == port and conn.pid:
+                    pids.append(conn.pid)
+            for conn in psutil.net_connections(kind='udp'):
+                if conn.laddr and conn.laddr.port == port and conn.pid:
+                    pids.append(conn.pid)
         # Fallback to lsof
         if not pids:
             try:
                 out = sp.check_output(["lsof", "-i", f":{port}", "-t"], stderr=sp.DEVNULL).decode().strip()
                 for line in out.splitlines():
-                    try:
-                        pids.append(int(line))
-                    except Exception:
-                        pass
+                    pids.append(int(line))
             except Exception:
                 # Fallback to ss
-                try:
-                    out = sp.check_output(["ss", "-lnptu"], stderr=sp.DEVNULL).decode().splitlines()
-                    for line in out:
-                        if f":{port} " in line or line.strip().endswith(f":{port}"):
-                            # Extract pid via users:(("name",pid=123,fd=...))
-                            if "pid=" in line:
-                                try:
-                                    seg = line.split("pid=")[1]
-                                    pid = int(seg.split(",")[0])
-                                    pids.append(pid)
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
+                out = sp.check_output(["ss", "-lnptu"], stderr=sp.DEVNULL).decode().splitlines()
+                for line in out:
+                    if f":{port} " in line or line.strip().endswith(f":{port}"):
+                        # Extract pid via users:(("name",pid=123,fd=...))
+                        if "pid=" in line:
+                            seg = line.split("pid=")[1]
+                            pid = int(seg.split(",")[0])
+                            pids.append(pid)
         return list(sorted(set(pids)))
 
-    def _kill_pid(pid: int):
-        try:
-            if psutil is not None:
-                p = psutil.Process(pid)
-                p.terminate()
-                try:
-                    p.wait(timeout=3)
-                except Exception:
-                    p.kill()
-            else:
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(0.2)
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except Exception:
-                    pass
-            cleaned_pids.append(pid)
-        except Exception:
-            pass
-
-    def _find_pids_by_name(substrs: List[str]) -> List[int]:
-        hits: List[int] = []
+    def _kill_pid(pid: int, hard: bool = False):
         if psutil is not None:
             try:
-                for p in psutil.process_iter(['pid', 'name', 'cmdline']):
-                    name = (p.info.get('name') or '').lower()
-                    cmd = ' '.join(p.info.get('cmdline') or []).lower()
-                    if any(s in name or s in cmd for s in substrs):
-                        hits.append(p.info['pid'])
+                p = psutil.Process(pid)
+                if hard:
+                    p.kill()
+                else:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=1)
+                    except Exception:
+                        p.kill()
             except Exception:
-                pass
+                os.kill(pid, signal.SIGKILL if hard else signal.SIGTERM)
         else:
-            try:
-                out = sp.check_output(["ps", "-eo", "pid,comm,args"], stderr=sp.DEVNULL).decode().splitlines()
-                for line in out:
-                    low = line.lower()
-                    if any(s in low for s in substrs):
-                        try:
-                            pid = int(low.split()[0])
-                            hits.append(pid)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-        return list(sorted(set(hits)))
+            os.kill(pid, signal.SIGKILL if hard else signal.SIGTERM)
+        cleaned_pids.append(pid)
+
+    def _find_pids_by_name(substrs: List[str]) -> List[int]:
+        hits: set[int] = set()
+        if psutil is not None:
+            for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+                name = (p.info.get('name') or '').lower()
+                cmd = ' '.join(p.info.get('cmdline') or []).lower()
+                if any(s in name or s in cmd for s in substrs):
+                    hits.add(int(p.info['pid']))
+        out = sp.check_output(["ps", "-eo", "pid,comm,args"], stderr=sp.DEVNULL).decode().splitlines()
+        for line in out:
+            low = line.lower()
+            if any(s in low for s in substrs):
+                pid = int(low.split()[0])
+                hits.add(pid)
+        return list(sorted(hits))
+
+    def _restart_px4_for_vid(vid: int, base_url: str = "http://127.0.0.1:8080") -> bool:
+        try:
+            url_hr = f"{base_url}/uav/{vid}/px4/hard_reset"
+            req_hr = urllib.request.Request(url_hr, data=b"{}", method="POST")
+            req_hr.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req_hr, timeout=15) as resp:
+                _ = resp.read()
+            time.sleep(1.0)
+            url_rl = f"{base_url}/uav/{vid}/px4/relaunch"
+            req_rl = urllib.request.Request(url_rl, data=b"{}", method="POST")
+            req_rl.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req_rl, timeout=15) as resp:
+                _ = resp.read()
+            print(f"[PX4] UAV{vid} hard_reset + relaunch requested")
+            return True
+        except Exception as e:
+            print(f"[PX4] UAV{vid} reset/relaunch failed: {e}")
+            return False
 
     if args.pre_clean:
         # Aggregate candidate ports (command ports and PX4 MAVLink base ports)
@@ -384,28 +394,27 @@ def main():
             candidate_ports.add(4560 + vid) 
             candidate_ports.add(8888 + vid) # ROS2 UXRCE DDS Port
             candidate_ports.add(5009 + vid) # HTTP Command Port
-        name_patterns = ["mavros", "px4", "px4-sitl", "mavros_node", "ros2 launch mavros"]
+        name_patterns = ["mavros", "px4", "px4-sitl", "mavros_node", "ros2 launch", "mavlink"]
         print(f"[CLEAN] Candidate ports: {sorted(candidate_ports)}; names: {name_patterns}")
-        if _confirm("Proceed to kill processes occupying listed ports and matching names?"):
-            # kill by port
-            for port in sorted(candidate_ports):
-                pids = _find_pids_by_port(port)
-                for pid in pids:
-                    # don't kill self
-                    if pid != os.getpid():
-                        _kill_pid(pid)
-            # kill by name
-            for pid in _find_pids_by_name(name_patterns):
-                if pid != os.getpid():
-                    _kill_pid(pid)
-            print(f"[CLEAN] Killed PIDs: {sorted(set(cleaned_pids))}")
-        else:
-            print("[CLEAN] Skipped by user.")
+        # if _confirm("Proceed to kill processes occupying listed ports and matching names?"):
+            # aggregate PIDs then kill in parallel to speed up
+        agg_pids: set[int] = set()
+            # collect by ports quickly via ss/psutil
+        for port in candidate_ports:
+            for pid in _find_pids_by_port(port):
+                agg_pids.add(int(pid))
+        for pid in _find_pids_by_name(name_patterns):
+            agg_pids.add(int(pid))
+        to_kill = [pid for pid in sorted(agg_pids) if pid != os.getpid()]
+        if to_kill:
+            with cf.ThreadPoolExecutor(max_workers=16) as ex:
+                list(ex.map(lambda pid: _kill_pid(pid, True), to_kill))
+        print(f"[CLEAN] Killed PIDs: {sorted(set(cleaned_pids))}")
 
     # --- Optional: kill existing Isaac Sim processes before launching scene ---
     if args.kill_isaac:
         try:
-            isaac_path_hint = os.environ.get("ISAACSIM_PATH", "")
+            isaac_path_hint = "/home/user/isaacsim-5.1.0"
             isaac_patterns = [
                 "isaacsim",
                 "Isaac-Sim",
@@ -427,22 +436,28 @@ def main():
             print(f"[WARN] Failed to kill IsaacSim processes: {e}")
 
     procs: List[sp.Popen] = []
+    mavros_proc = None
 
     def _signal_handler(sig, frame):
         print(f"\n[SIGNAL] Received {sig}. Cleaning up child processes...")
         terminate_all(procs)
-        # also stop isaac sim if running
         try:
-            if 'isaac_proc' in globals() or 'isaac_proc' in locals():
-                if isaac_proc is not None:
-                    try:
-                        isaac_proc.terminate()
-                        time.sleep(0.5)
-                        isaac_proc.kill()
-                    except Exception:
-                        pass
+            if mavros_proc is not None:
+                pgid = os.getpgid(mavros_proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                time.sleep(0.5)
+                os.killpg(pgid, signal.SIGKILL)
+                lf = getattr(mavros_proc, "_log_file", None)
+                if lf:
+                    lf.close()
         except Exception:
             pass
+        # also stop isaac sim if running
+        if 'isaac_proc' in globals() or 'isaac_proc' in locals():
+            if isaac_proc is not None:
+                isaac_proc.terminate()
+                time.sleep(0.5)
+                isaac_proc.kill()
         sys.exit(0)
 
     # Register signal handlers for graceful shutdown
@@ -453,24 +468,26 @@ def main():
     isaac_proc = None
     if args.isaac:
         try:
-            isaac_py = os.environ.get("ISAACSIM_PYTHON")
-            if not isaac_py:
-                # fallback to ISAACSIM_PATH/python.sh, else to repo tools/packman/python.sh
-                candidate = os.path.join(os.environ.get("ISAACSIM_PATH", ""), "python.sh")
-                if os.path.isfile(candidate):
-                    isaac_py = candidate
-                else:
-                    repo_py = Path(__file__).resolve().parents[1] / "tools" / "packman" / "python.sh"
-                    isaac_py = str(repo_py)
-            isaac_cmd = [isaac_py, str(Path(args.isaac))]
+            isaac_cmd = [ISAACSIM_PYTHON, str(Path(args.isaac))]
             isaac_log_dir = log_root / str(session_ts) / "isaac"
             ensure_dir(isaac_log_dir)
             isaac_log = isaac_log_dir / "isaacsim.log"
             isaac_log_f = isaac_log.open("w")
             now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[提示] 场景加载中... 当前时间: {now_str}")
+            print(f"[INFO] 场景加载中... 当前时间: {now_str} | 耗时: {int(time.time() - t_start)}s")
             # Start Isaac, capture stdout for filtering
-            isaac_proc = sp.Popen(isaac_cmd, stdout=sp.PIPE, stderr=sp.STDOUT, env=base_env, bufsize=1, universal_newlines=True)
+            try:
+                isaac_env = _source_env([
+                    "~/IsaacSim-ros_workspaces/build_ws/humble/humble_ws/install/local_setup.bash",
+                    "~/IsaacSim-ros_workspaces/build_ws/humble/isaac_sim_ros_ws/install/local_setup.bash",
+                ])
+                if session_ts:
+                    isaac_env["PEGASUS_SESSION_TS"] = str(session_ts)
+            except Exception as e:
+                print(f"[WARN] Failed to source Isaac ROS env: {e}")
+                isaac_env = dict(base_env)
+            print(f"[LAUNCH] ISAACSIM scene: {args.isaac} cmd: {isaac_cmd}")
+            isaac_proc = sp.Popen(isaac_cmd, stdout=sp.PIPE, stderr=sp.STDOUT, env=isaac_env, bufsize=1, universal_newlines=True)
             setattr(isaac_proc, "_log_file", isaac_log_f)
             print(f"[LAUNCH] ISAACSIM scene: {args.isaac} pid={isaac_proc.pid} logs: {isaac_log}")
 
@@ -499,7 +516,12 @@ def main():
                             "[Warning] [omni.replicator]",
                             "[Warning] [omni.isaac]",
                             "startup",
-                            "has been deprecated",
+                            "deprecated",
+                            "usd",
+                            "USD",
+                            "mdl",
+                            "MDL",
+                            "hydra",
                             "[omni.neuraylib.plugin]",
                         ]
                         if any(f in line for f in filter_list):
@@ -508,21 +530,15 @@ def main():
                             continue
                         if not line.strip():
                             continue
-                        try:
-                            file.write(line + "\n")
-                            file.flush()
-                        except Exception:
-                            pass
+                        file.write(line + "\n")
+                        file.flush()
                         if args.console_logs:
-                            try:
-                                if tag:
-                                    print(f"{pre} {line}")
-                                else:
-                                    print(line)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                            if tag:
+                                print(f"{pre} {line}")
+                            else:
+                                print(line)
+                except Exception as e:
+                    print(f"[WARN] Isaac log filter error: {e}")
             t = threading.Thread(target=_isaac_log_filter, args=(isaac_proc, isaac_log_f, "[isaac]"), daemon=True)
             t.start()
 
@@ -545,8 +561,8 @@ def main():
                                 low = data.lower()
                                 if any(m.lower() in low for m in ready_markers):
                                     return True
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[WARN] Isaac log reader error: {e}")
                     time.sleep(1.0)
                 return False
 
@@ -554,23 +570,17 @@ def main():
                 print("[WARN] Isaac Sim readiness not confirmed within timeout; continuing to launch controllers.")
         except Exception as e:
             print(f"[WARN] Failed to start ISAACSIM scene: {e}")
+        
+    if expected_aircraft > 0 and args.isaac:
+        isaac_log_path = log_root / str(session_ts) / "isaac" / "isaacsim.log"
+        print(f"[INFO] 等待所有飞机就绪（Ready for takeoff!）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
+        ok = wait_log_count(isaac_log_path, r"INFO\s*\[commander\].*?Ready for takeoff!", expected_aircraft, timeout=float(args.ready_timeout), interval=2.0, label="Commander Ready for takeoff!")
+        if not ok:
+            print(f"[WARN] Did not observe '{expected_aircraft}' Ready for takeoff! messages within timeout; proceeding anyway.")
     # --- Start MAVROS multi after readiness gate ---
     try:
         cfg_path = Path(args.config)
         launch_path = _generate_mavros_launch_from_config(cfg_path)
-        ros_env = dict(base_env)
-        try:
-            out = sp.check_output(['bash', '-lc', 'source /opt/ros/humble/setup.bash && env -0'])
-            for item in out.split(b'\0'):
-                if not item:
-                    continue
-                k, _, v = item.partition(b'=')
-                try:
-                    ros_env[k.decode()] = v.decode()
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[WARN] Failed to source ROS 2 env: {e}")
         mavros_log_dir = log_root / str(session_ts) / 'mavros'
         ensure_dir(mavros_log_dir)
         mavros_log = mavros_log_dir / 'ros2_mavros_launch.log'
@@ -581,56 +591,104 @@ def main():
         if not ok_px4:
             print(f"[WARN] Did not observe {expected_aircraft} 'Startup script returned successfully' entries within timeout; proceeding to launch MAVROS anyway.")
 
-        mavros_cmd = ['bash', '-lc', f'source /opt/ros/humble/setup.bash && ros2 launch {launch_path}']
-        mavros_proc = sp.Popen(mavros_cmd, env=ros_env, stdout=mavros_log_f, stderr=sp.STDOUT, preexec_fn=os.setsid)
+        mavros_cmd = [ISAACSIM_PYTHON, ISAACSIM_ROS2_CMD, "launch", launch_path]
+        print(f"[LAUNCH] MAVROS multi cmd: {mavros_cmd}")
+        mavros_proc = sp.Popen(mavros_cmd, stdout=mavros_log_f, stderr=sp.STDOUT, preexec_fn=os.setsid)
         setattr(mavros_proc, '_log_file', mavros_log_f)
         procs.append(mavros_proc)
         print(f"[LAUNCH] MAVROS multi started: {launch_path} pid={mavros_proc.pid} logs: {mavros_log}")
     except Exception as e:
         print(f"[WARN] Failed to start MAVROS multi: {e}")
-    if expected_aircraft > 0 and args.isaac:
-        isaac_log_path = log_root / str(session_ts) / "isaac" / "isaacsim.log"
-        print(f"[提示] 等待所有飞机就绪（Ready for takeoff!）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        ok = wait_log_count(isaac_log_path, r"INFO\s*\[commander\].*?Ready for takeoff!", expected_aircraft, timeout=float(args.ready_timeout), interval=2.0, label="Commander Ready for takeoff!")
-        if not ok:
-            print(f"[WARN] Did not observe '{expected_aircraft}' Ready for takeoff! messages within timeout; proceeding anyway.")
-
-    # Launch per vehicle (controllers)
-    for idx, v in enumerate(vehicles):
-        vid = int(v.get("vehicle_id", 0))
-        mavros_ns = v.get("mavros_namespace", f"uav{vid}")
-
-        env = build_env(base_env, vid, mavros_ns, session_ts)
-
-        # logs/<session_ts>/<ns>/rospy.log
-        log_dir = log_root / str(session_ts)
-        ensure_dir(log_dir)
-        log_path = log_dir / f"{mavros_ns}_rospy.log"
-        try:
-            print(f"[PARAMS] vehicle_id={vid} mavros_ns={mavros_ns}")
-            proc = start_instance(python_exe, script_path, mavros_ns, env, log_path, prefix=f"[uav{vid}]", to_console=args.console_logs)
-            setattr(proc, "_is_controller", True)
-            setattr(proc, "_vehicle_id", vid)
-            setattr(proc, "_mavros_ns", mavros_ns)
-            procs.append(proc)
-            print(f"[LAUNCH] vehicle_id= {vid} pid= {proc.pid} logs: {log_path}")
-            time.sleep(CONTROL_UP_INTERVAL)
-        except Exception as e:
-            print(f"[ERROR] Failed to launch vehicle_id={vid}: {e}")
-
-    print(f"[提示] 等待所有控制器HTTP端口就绪（Healthy）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Wait until all mavros connected
+    print(f"[INFO] 等待所有MAVROS连接就绪（Connected）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
+    ok_mavros = wait_log_count(mavros_log, r"UID", expected_aircraft, timeout=float(args.ready_timeout), interval=2.0, label="MAVROS Connected")
+    if not ok_mavros:
+        print(f"[WARN] Did not observe {expected_aircraft} 'Connected to' messages within timeout; proceeding anyway.")
+    
+    import threading
+    def _launch_group(group_list: List[Dict[str, Any]], group_name: str):
+        prev_log_path: Optional[Path] = None
+        for v in group_list:
+            vid = int(v.get("vehicle_id", 0))
+            mavros_ns = v.get("mavros_namespace", f"uav{vid}")
+            env = build_env(PYTHON311_ENV, vid, mavros_ns, session_ts)
+            log_dir = log_root / str(session_ts)
+            ensure_dir(log_dir)
+            log_path = log_dir / f"{mavros_ns}_rospy.log"
+            try:
+                if prev_log_path is not None:
+                    ok_prev = wait_log_count(prev_log_path, r"Takeoff complete", 1, timeout=float(args.ready_timeout), interval=1.0, label=f"{group_name} prev Takeoff complete")
+                    if not ok_prev:
+                        print(f"[WARN] {group_name} previous vehicle did not reach Takeoff complete within timeout; continuing")
+                print(f"[PARAMS] vehicle_id={vid} mavros_ns={mavros_ns} group={group_name}")
+                proc = start_instance(ISAACSIM_PYTHON, script_path, mavros_ns, env, log_path, prefix=f"[uav{vid}]", to_console=args.console_logs)
+                setattr(proc, "_is_controller", True)
+                setattr(proc, "_vehicle_id", vid)
+                setattr(proc, "_mavros_ns", mavros_ns)
+                procs.append(proc)
+                print(f"[LAUNCH] vehicle_id= {vid} pid= {proc.pid} logs: {log_path} group={group_name}")
+                prev_log_path = log_path
+            except Exception as e:
+                print(f"[ERROR] Failed to launch vehicle_id={vid} in {group_name}: {e}")
+    par = max(1, int(args.parallel))
+    groups: List[List[Dict[str, Any]]] = [vehicles[i::par] for i in range(par)]
+    threads: List[threading.Thread] = []
+    for idx, grp in enumerate(groups):
+        t = threading.Thread(target=_launch_group, args=(grp, f"group{idx+1}"), daemon=True)
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+            
+    print(f"[INFO] 等待所有控制器HTTP端口就绪（Healthy）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
     # 循环检测，直到所有端口健康检查通过
+    NS_PORT_MAP = {}
+    for v in vehicles:
+        vid = int(v.get("vehicle_id", 0))
+        ns = v.get("mavros_namespace", f"uav{vid}")
+        NS_PORT_MAP[ns] = 5009 + vid
+    last_healthy_time: Dict[str, float] = {ns: time.time() if _probe_port(p) else time.time() for ns, p in NS_PORT_MAP.items()}
+    restart_cooldown: Dict[str, float] = {ns: 0.0 for ns in NS_PORT_MAP.keys()}
+    timeout_sec = 60.0
+    cooldown_sec = 10.0
     while True:
-        try:
-            PORT_STATUS = {ns: _probe_port(p) for ns, p in NS_PORT_MAP.items()}
-            print(f"[GW] namespaces={ {ns: {'port': p, 'alive': PORT_STATUS.get(ns)} for ns, p in NS_PORT_MAP.items()} }")
-            if all(PORT_STATUS.values()):
-                break
-        except Exception:
-            pass
+        PORT_STATUS = {ns: _probe_port(p) for ns, p in NS_PORT_MAP.items()}
+        now = time.time()
+        for ns, ok in PORT_STATUS.items():
+            if ok:
+                last_healthy_time[ns] = now
+            else:
+                if (now - last_healthy_time[ns]) >= timeout_sec and (now - restart_cooldown[ns]) >= cooldown_sec:
+                    try:
+                        vid = int(ns.replace('uav', ''))
+                        port = NS_PORT_MAP[ns]
+                        print(f"[RESTART] Timeout: ns={ns} port={port} not healthy for {timeout_sec}s; restarting controller and PX4")
+                        # Kill processes occupying the command port
+                        pids = _find_pids_by_port(port)
+                        for kpid in pids:
+                            if kpid != os.getpid():
+                                _kill_pid(kpid)
+                        _restart_px4_for_vid(vid)
+                        # Relaunch controller
+                        env = build_env(PYTHON311_ENV, vid, ns, session_ts)
+                        log_dir = log_root / str(session_ts)
+                        ensure_dir(log_dir)
+                        log_path = log_dir / f"{ns}_rospy.log"
+                        new_p = start_instance(ISAACSIM_PYTHON, script_path, ns, env, log_path, prefix=f"[uav{vid}]", to_console=args.console_logs)
+                        setattr(new_p, "_is_controller", True)
+                        setattr(new_p, "_vehicle_id", vid)
+                        setattr(new_p, "_mavros_ns", ns)
+                        procs.append(new_p)
+                        restart_cooldown[ns] = now
+                        print(f"[RESTART] ns={ns} vehicle_id={vid} pid={new_p.pid} logs: {log_path}")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to restart controller for ns={ns}: {e}")
+        if all(PORT_STATUS.values()):
+            break
         time.sleep(1.0)
-    print(f"[提示] 所有控制器HTTP端口已就绪（Healthy）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[提示] 开始启动记录 + 网关服务器（Recording+Gateway）| 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"[INFO] 所有控制器HTTP端口已就绪（Healthy）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
+    print(f"[INFO] 开始启动记录 + 网关服务器（Recording+Gateway）| 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
     # Start recording+gateway server on base port 5008
     try:
         import json as _json
@@ -648,7 +706,7 @@ def main():
         gw_env['PEGASUS_GATEWAY_PORT'] = '5008'
         # Run integrated recording+gateway server
         rec_srv = Path(__file__).resolve().parent / 'recording_server.py'
-        gateway_proc = sp.Popen([python_exe, str(rec_srv)], env=gw_env)
+        gateway_proc = sp.Popen([ISAACSIM_PYTHON, str(rec_srv)], env=gw_env)
         print(f"[LAUNCH] Recording+Gateway pid={gateway_proc.pid} port=5008")
     except Exception as e:
         print(f"[WARN] Failed to start gateway: {e}")
@@ -658,7 +716,7 @@ def main():
         return
 
     print("[INFO] Waiting for child processes. Press Ctrl+C to stop.")
-    print(f"[INFO] Session TS: {session_ts} | Log root: {log_root}")
+    print(f"[INFO] Session TS: {session_ts} | Log root: {log_root} | 耗时: {int(time.time() - t_start)}s")
     # Wait for children and report exits
     try:
         restart_backoff = {}
@@ -671,20 +729,14 @@ def main():
                 else:
                     print(f"[EXIT] PID {p.pid} finished with code {rc}")
                     lf = getattr(p, "_log_file", None)
-                    try:
-                        if lf:
-                            lf.close()
-                    except Exception:
-                        pass
-                    try:
-                        procs.remove(p)
-                    except Exception:
-                        pass
+                    if lf:
+                        lf.close()
+                    procs.remove(p)
                     try:
                         if getattr(p, "_is_controller", False):
                             vid = int(getattr(p, "_vehicle_id", 0))
                             mavros_ns = getattr(p, "_mavros_ns", f"uav{vid}")
-                            env = build_env(base_env, vid, mavros_ns, session_ts)
+                            env = build_env(PYTHON311_ENV, vid, mavros_ns, session_ts)
                             log_dir = log_root / str(session_ts)
                             ensure_dir(log_dir)
                             log_path = log_dir / f"{mavros_ns}_rospy.log"
@@ -694,16 +746,13 @@ def main():
                                 time.sleep(5.0 - (now - last))
                             if rc != 0:
                                 print(f"[RESTART] vehicle_id={vid} namespace={mavros_ns}")
-                                try:
-                                    port = 5009 + vid
-                                    pids = _find_pids_by_port(port)
-                                    for kpid in pids:
-                                        if kpid != os.getpid():
-                                            _kill_pid(kpid)
-                                    print(f"[RESTART] cleaned port {port} PIDs: {sorted(set(pids))}")
-                                except Exception:
-                                    pass
-                                new_p = start_instance(python_exe, script_path, mavros_ns, env, log_path, prefix=f"[uav{vid}]", to_console=args.console_logs)
+                                port = 5009 + vid
+                                pids = _find_pids_by_port(port)
+                                for kpid in pids:
+                                    if kpid != os.getpid():
+                                        _kill_pid(kpid)
+                                print(f"[RESTART] cleaned port {port} PIDs: {sorted(set(pids))}")
+                                new_p = start_instance(ISAACSIM_PYTHON, script_path, mavros_ns, env, log_path, prefix=f"[uav{vid}]", to_console=args.console_logs)
                                 setattr(new_p, "_is_controller", True)
                                 setattr(new_p, "_vehicle_id", vid)
                                 setattr(new_p, "_mavros_ns", mavros_ns)
@@ -720,11 +769,8 @@ def main():
                 if rc is not None:
                     print(f"[EXIT] ISAACSIM PID {isaac_proc.pid} finished with code {rc}")
                     lf = getattr(isaac_proc, "_log_file", None)
-                    try:
-                        if lf:
-                            lf.close()
-                    except Exception:
-                        pass
+                    if lf:
+                        lf.close()
                     isaac_proc = None
             if alive == 0 and (isaac_proc is None):
                 break
@@ -733,11 +779,24 @@ def main():
         _signal_handler("KeyboardInterrupt", None)
 
     print("[INFO] All controllers finished.")
-    # Ensure MAVROS process group is terminated when leaving
     try:
-        terminate_all(procs)
+        if mavros_proc is not None:
+            try:
+                pgid = os.getpgid(mavros_proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                time.sleep(0.5)
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                lf = getattr(mavros_proc, "_log_file", None)
+                if lf:
+                    lf.close()
+            except Exception:
+                pass
     except Exception:
         pass
+    terminate_all(procs)
     if cleaned_pids:
         print(f"[INFO] Cleaned PIDs at start: {sorted(set(cleaned_pids))}")
 
