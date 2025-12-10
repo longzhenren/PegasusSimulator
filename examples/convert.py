@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import time
+from typing import List
 def _generate_mavros_launch_from_config(cfg_path: Path) -> Path:
     try:
         cfg = json.loads(cfg_path.read_text())
@@ -35,8 +36,8 @@ def _generate_mavros_launch_from_config(cfg_path: Path) -> Path:
     path = Path("/tmp") / f"pegasus_multi_uav_{int(time.time())}.launch"
     try:
         path.write_text(content)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] write launch failed: {e}")
     return path
 
 if __name__ == "__main__":

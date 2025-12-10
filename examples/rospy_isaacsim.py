@@ -29,7 +29,7 @@ Pegasus ROS2 控制器（rospy_isaacsim.py）
   - 每步将高度向 `start_height` 下降，调用 `wait_until_landed()` 做窗口稳定检测；着陆后调用 `disarm` 并 `wait_until_disarmed()`。
 - `reboot_px4(position,yaw_deg)`：
   - 若已 `armed`：先 `land()`，必要时 `disarm` 并等待解除。
-  - 可选移动仿真载具位置：向仿真端 `http://127.0.0.1:8080/uav/<vid>/reset` 提交位置与 yaw。
+  - 可选移动仿真载具位置：向仿真端 `http://127.0.0.1:8081/uav/<vid>/reset` 提交位置与 yaw。
   - 检查服务 `/<ns>/mavros/cmd/command` 是否存在；存在则下发 `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN (246)`、`param1=1.0` 重启 PX4。
   - 若发起重启：等待 `/<ns>/mavros/state.connected` 恢复；随后重复预热、`OFFBOARD`、`arm`、起飞至 `INIT_HEIGHT` 并设定 `hover_target`。
 
@@ -54,12 +54,12 @@ HTTP 接口与示例
 
 图像来源
 - ROS2：`ImageService` 自动选择彩色图像主题并编码。
-- 仿真 HTTP：读取 `http://127.0.0.1:8080/uav/<vid>/image` 的 JSON 并解析 `data` 字段。
+- 仿真 HTTP：读取 `http://127.0.0.1:8081/uav/<vid>/image` 的 JSON 并解析 `data` 字段。
 
 端口与网关
 - 控制器端口：`PEGASUS_HTTP_PORT`（默认 `5009 + vid`）。
 - 网关端口：`5008`；统一将 `/uav/<vid>/...` 转发到对应控制器端口。
-- 仿真端口：`8080`（`8_camera_vehicle.py`）。
+- 仿真端口：`8081`（`8_camera_vehicle.py`）。
 
 时间同步与稳定性
 - 配置文件 `px4_config.yaml` 设置 `timesync_rate=0.0`、`system_time_rate=10.0`；本文件还提供 `configure_mavros_time_plugin()` 运行时调整（优先在 `/<ns>/mavros/time`，回退到 `/<ns>/mavros`）。
@@ -72,7 +72,7 @@ HTTP 接口与示例
 - 控制器会记录起飞进度、模式切换、解锁与降落事件；配套脚本 `tools/log_status_report.py` 可提取统计指标。
 
 端到端关系
-- 仿真端在 `8080` 暴露 `/uav/<id>/all|image|pose|reset`；控制器在 `5009+id` 暴露控制接口；网关在 `5008` 统一转发。
+- 仿真端在 `8081` 暴露 `/uav/<id>/all|image|pose|reset`；控制器在 `5009+id` 暴露控制接口；网关在 `5008` 统一转发。
 
 接口用法示例（Python）
 - 以 `uav0` 为例控制端口默认 `5009`（可被 `PEGASUS_HTTP_PORT` 覆写）：
@@ -179,9 +179,9 @@ def spin_sleep(node: Node, hz: float):
 DEFAULT_HTTP_PORT = int(os.environ.get("PEGASUS_HTTP_PORT", "5008"))
 # 图像来源开关：True=从ROS2 topic读取；False=从8_camera_vehicle的HTTP接口读取
 IMAGE_FROM_ROS = os.environ.get("PEGASUS_IMAGE_FROM_ROS", "1") not in ("0", "false", "False")
-IMAGE_HTTP_URL = os.environ.get("PEGASUS_IMAGE_HTTP_URL", "http://127.0.0.1:8080")
+IMAGE_HTTP_URL = os.environ.get("PEGASUS_IMAGE_HTTP_URL", "http://127.0.0.1:8081")
 STEP_RETURN_EACH = os.environ.get("PEGASUS_STEP_RETURN_EACH", "0") in ("1", "true", "True")
-INIT_HEIGHT = float(os.environ.get("PEGASUS_INIT_HEIGHT", "5.0"))
+INIT_HEIGHT = float(os.environ.get("PEGASUS_INIT_HEIGHT", "2.0"))
 TAKEOFF_REACH_THRESHOLD = float(os.environ.get("PEGASUS_TAKEOFF_REACH_THRESHOLD", "0.1"))
 MOVE_REACH_THRESHOLD = float(os.environ.get("PEGASUS_MOVE_REACH_THRESHOLD", "0.1"))
 CONTROL_LOOP_HZ = float(os.environ.get("PEGASUS_HOVER_HZ", "30.0"))
@@ -262,9 +262,6 @@ class IsaacSimEnv(Node):
         
         super().__init__(f"isaac_sim_nav_node_{self._vid}")
 
-        # --- params / buffers ---
-        self.depth_max_dis = 10.0
-        # self.bridge = CvBridge()
         self.current_pose = PoseStamped()
         self.current_state = State()
         self._reset_target_position = None
@@ -348,6 +345,7 @@ class IsaacSimEnv(Node):
         self._setup_http_server()
         self._http_api = HttpApi(self)
         self._image_service = ImageService(self._image_from_ros, self._image_http_base, self._vid)
+        self._reset_cancel_event = threading.Event()
         # --- helper: configure MAVROS time sync after launch (as a method) ---
         # Intention: reduce/disable TIMESYNC to avoid PX4 "RTT too high" warnings
         # Tries setting params on '/<ns>/mavros/time', then falls back to '/<ns>/mavros'
@@ -708,6 +706,8 @@ class IsaacSimEnv(Node):
         last_progress = None
         stagnant_since = None
         while not has_reached_initial_point:
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             self.pub_position(target_x, target_y, target_z)
             cur_z = float(self.current_pose.pose.position.z)
             climb = max(0.0, cur_z - float(self.start_height))
@@ -776,6 +776,8 @@ class IsaacSimEnv(Node):
         stable_since = None
         last_q = None
         while rclpy.ok() and (time.time() - start) < float(timeout_s):
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             q = self.current_pose.pose.orientation
             curr = (float(q.x), float(q.y), float(q.z), float(q.w))
             if last_q is not None:
@@ -797,6 +799,8 @@ class IsaacSimEnv(Node):
     def move_to_and_wait(self, x: float, y: float, z: float, threshold: float = MOVE_REACH_THRESHOLD, timeout_s: float = 60.0) -> bool:
         start = time.time()
         while rclpy.ok() and (time.time() - start) < float(timeout_s):
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             self.pub_position(x, y, z)
             self.hover_target = (x, y, z)
             dx = self.current_pose.pose.position.x - x
@@ -812,9 +816,14 @@ class IsaacSimEnv(Node):
     def reset(self, target_z: float = None):
         if target_z is None:
             target_z = self.init_height
-        
+
+        if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+            raise InterruptedError("reset cancelled")
+
         self.arm_cmd.value = True
         while not self.current_state.armed:
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             self.get_logger().info("[reset] Sending arm command...")
             resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
             if resp and getattr(resp, "success", False):
@@ -825,6 +834,8 @@ class IsaacSimEnv(Node):
 
         self.get_logger().info("[reset] Publishing initial dummy setpoints to prevent RTL...")
         for _ in range(60): 
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             self.pub_position(0.0, 0.0, target_z)
             spin_sleep(self, 20.0)
         
@@ -832,6 +843,8 @@ class IsaacSimEnv(Node):
         
         self.offb_set_mode.custom_mode = "OFFBOARD"
         while self.current_state.mode != "OFFBOARD":
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
             if resp and getattr(resp, "mode_sent", False):
                 self.get_logger().info("[reset] ***** OFFBOARD enabled *****")
@@ -847,6 +860,8 @@ class IsaacSimEnv(Node):
             return False
         try:
             import urllib.request, json as _json, traceback as _tb
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             url = f"{self._image_http_base}/uav/{vid}/reset"
             payload = _json.dumps({"position": [float(position[0]), float(position[1]), float(position[2])], "yaw_deg": yaw_deg}).encode("utf-8")
             req = urllib.request.Request(url, data=payload, method="POST")
@@ -873,6 +888,8 @@ class IsaacSimEnv(Node):
         vid = int(self._vid)
         try:
             import urllib.request, traceback as _tb
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             url = f"{self._image_http_base}/uav/{vid}/px4/hard_reset"
             req = urllib.request.Request(url, data=b"{}", method="POST")
             req.add_header("Content-Type", "application/json")
@@ -890,6 +907,8 @@ class IsaacSimEnv(Node):
         vid = int(self._vid)
         try:
             import urllib.request
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             url = f"{self._image_http_base}/uav/{vid}/px4/relaunch"
             req = urllib.request.Request(url, data=b"{}", method="POST")
             req.add_header("Content-Type", "application/json")
@@ -903,163 +922,175 @@ class IsaacSimEnv(Node):
             self.get_logger().warn(_tb.format_exc())
             return False
 
-    def reboot_px4(self, position: Optional[List[float]] = None, yaw_deg: Optional[float] = None):
-        vid = int(self._vid)
-        try:
-            landed_ok = True
-            if bool(getattr(self.current_state, "armed", False)):
-                self.get_logger().info(f"[reboot] UAV{vid} landing before reset...")
+    # def reboot_px4(self, position: Optional[List[float]] = None, yaw_deg: Optional[float] = None):
+    #     vid = int(self._vid)
+    #     try:
+    #         if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+    #             raise InterruptedError("reset cancelled")
+    #         landed_ok = True
+    #         if bool(getattr(self.current_state, "armed", False)):
+    #             self.get_logger().info(f"[reboot] UAV{vid} landing before reset...")
+
+    #             landed_ok = self.land()
                 
-                landed_ok = self.land()
-                
-                if not landed_ok:
-                    land_mode = SetMode.Request()
-                    land_mode.custom_mode = "AUTO.LAND"
-                    try:
-                        call_service_sync(self, self.set_mode_client, land_mode, timeout_sec=SETMODE_TIMEOUT_S)
-                    except Exception as e:
-                        self.get_logger().warn(f"[reboot] UAV{vid} land failed. {e}")
-                    landed_ok = self.wait_until_landed(timeout_s=60.0, window_s=2.0, eps=0.03)
-                if not landed_ok:
-                    raise RuntimeError("[reboot] Landing failed or timed out during PX4 reset")
-            if bool(getattr(self.current_state, "armed", False)):
-                self.get_logger().info(f"[reboot] UAV{vid} disarming...")
-                if self.arming_client.wait_for_service(timeout_sec=ARMING_TIMEOUT_S):
-                    disarm_req = CommandBool.Request()
-                    disarm_req.value = False
-                    try:
-                        call_service_sync(self, self.arming_client, disarm_req, timeout_sec=ARMING_TIMEOUT_S)
-                        self.get_logger().info(f"[reboot] UAV{vid} disarmed.")
-                    except Exception:
-                        self.get_logger().warn(f"[reboot] UAV{vid} disarm failed.")
-                self.wait_until_disarmed(timeout_s=10.0)
-        except Exception as e:
-            mode = getattr(self.current_state, "mode", "")
-            armed = bool(getattr(self.current_state, "armed", False))
-            z = float(self.current_pose.pose.position.z)
-            ls = int(getattr(self.extended_state, "landed_state", 0))
-            srv = getattr(self.arming_client, "srv_name", "<unknown>")
-            ready = bool(self.arming_client.service_is_ready())
-            self.get_logger().warn(f"[reboot] UAV{vid} disarm service failed: {e}; srv={srv} ready={ready} mode={mode} armed={armed} z={z:.3f} landed_state={ls}")
+    #             if not landed_ok:
+    #                 land_mode = SetMode.Request()
+    #                 land_mode.custom_mode = "AUTO.LAND"
+    #                 try:
+    #                     call_service_sync(self, self.set_mode_client, land_mode, timeout_sec=SETMODE_TIMEOUT_S)
+    #                 except Exception as e:
+    #                     self.get_logger().warn(f"[reboot] UAV{vid} land failed. {e}")
+    #                 landed_ok = self.wait_until_landed(timeout_s=60.0, window_s=2.0, eps=0.03)
+    #             if not landed_ok:
+    #                 raise RuntimeError("[reboot] Landing failed or timed out during PX4 reset")
+    #         if bool(getattr(self.current_state, "armed", False)):
+    #             self.get_logger().info(f"[reboot] UAV{vid} disarming...")
+    #             if self.arming_client.wait_for_service(timeout_sec=ARMING_TIMEOUT_S):
+    #                 disarm_req = CommandBool.Request()
+    #                 disarm_req.value = False
+    #                 try:
+    #                     if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+    #                         raise InterruptedError("reset cancelled")
+    #                     call_service_sync(self, self.arming_client, disarm_req, timeout_sec=ARMING_TIMEOUT_S)
+    #                     self.get_logger().info(f"[reboot] UAV{vid} disarmed.")
+    #                 except Exception:
+    #                     self.get_logger().warn(f"[reboot] UAV{vid} disarm failed.")
+    #             self.wait_until_disarmed(timeout_s=10.0)
+    #     except Exception as e:
+    #         mode = getattr(self.current_state, "mode", "")
+    #         armed = bool(getattr(self.current_state, "armed", False))
+    #         z = float(self.current_pose.pose.position.z)
+    #         ls = int(getattr(self.extended_state, "landed_state", 0))
+    #         srv = getattr(self.arming_client, "srv_name", "<unknown>")
+    #         ready = bool(self.arming_client.service_is_ready())
+    #         self.get_logger().warn(f"[reboot] UAV{vid} disarm service failed: {e}; srv={srv} ready={ready} mode={mode} armed={armed} z={z:.3f} landed_state={ls}")
         
-        srv_name = self._mavros_prefix + "/mavros/cmd/command"
-        reboot_attempted = False
-        try:
-            names_types = self.get_service_names_and_types()
-            if any(n == srv_name for n, _ in names_types):
-                if self.cmdlong_client.wait_for_service(timeout_sec=10.0):
-                    req = CommandLong.Request()
-                    req.command = 246
-                    req.param1 = 1.0
-                    try:
-                        self.get_logger().info(f"[reboot] UAV{vid} rebooting by command long...")
-                        call_service_sync(self, self.cmdlong_client, req, timeout_sec=10.0)
-                        reboot_attempted = True
-                    except Exception as e:
-                        self.get_logger().warn(f"[reboot] PX4 reboot command failed: {e}")
-                else:
-                    self.get_logger().warn("[reboot] cmd/command service not ready; skip reboot")
-            else:
-                self.get_logger().warn(f"[reboot] Service {srv_name} not found; skip reboot")
-        except Exception:
-            self.get_logger().warn("[reboot] Service discovery failed; skip reboot")
+    #     srv_name = self._mavros_prefix + "/mavros/cmd/command"
+    #     reboot_attempted = False
+    #     try:
+    #         names_types = self.get_service_names_and_types()
+    #         if any(n == srv_name for n, _ in names_types):
+    #             if self.cmdlong_client.wait_for_service(timeout_sec=10.0):
+    #                 req = CommandLong.Request()
+    #                 req.command = 246
+    #                 req.param1 = 1.0
+    #                 try:
+    #                     if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+    #                         raise InterruptedError("reset cancelled")
+    #                     self.get_logger().info(f"[reboot] UAV{vid} rebooting by command long...")
+    #                     call_service_sync(self, self.cmdlong_client, req, timeout_sec=10.0)
+    #                     reboot_attempted = True
+    #                 except Exception as e:
+    #                     self.get_logger().warn(f"[reboot] PX4 reboot command failed: {e}")
+    #             else:
+    #                 self.get_logger().warn("[reboot] cmd/command service not ready; skip reboot")
+    #         else:
+    #             self.get_logger().warn(f"[reboot] Service {srv_name} not found; skip reboot")
+    #     except Exception:
+    #         self.get_logger().warn("[reboot] Service discovery failed; skip reboot")
             
-        if reboot_attempted:
-            self.get_logger().info(f"[reboot] UAV{vid} waiting PX4 reboot completion, sleep 10s...")
-            time.sleep(10.0)
+    #     if reboot_attempted:
+    #         self.get_logger().info(f"[reboot] UAV{vid} waiting PX4 reboot completion, sleep 10s...")
+    #         time.sleep(10.0)
             
             
-        self.get_logger().info(f"[reboot] UAV{vid} arming_client.wait_for_service(timeout_sec={ARMING_TIMEOUT_S})")
-        self.arming_client.wait_for_service(timeout_sec=ARMING_TIMEOUT_S)
-        self.get_logger().info(f"[reboot] UAV{vid} set_mode_client.wait_for_service(timeout_sec={SETMODE_TIMEOUT_S})")
-        self.set_mode_client.wait_for_service(timeout_sec=SETMODE_TIMEOUT_S)
-        # 输出当前sys状态和位置信息
-        self.get_logger().info(f"[reboot] UAV{vid} current_state={self.current_state}")
-        self.get_logger().info(f"[reboot] UAV{vid} current_pose={self.current_pose}")
-        # 3) 发布初始setpoints → 切换OFFBOARD→ 解锁 → 起飞到 INIT_HEIGHT（各60s超时）
-        self.get_logger().info(f"[reboot] UAV{vid} Publishing initial dummy setpoints to prevent RTL...")
-        warmup_count = 80
-        for _ in range(warmup_count):
-            self.pub_position(0.0, 0.0, self.init_height)
-            spin_sleep(self, 20.0)
+    #     self.get_logger().info(f"[reboot] UAV{vid} arming_client.wait_for_service(timeout_sec={ARMING_TIMEOUT_S})")
+    #     self.arming_client.wait_for_service(timeout_sec=ARMING_TIMEOUT_S)
+    #     self.get_logger().info(f"[reboot] UAV{vid} set_mode_client.wait_for_service(timeout_sec={SETMODE_TIMEOUT_S})")
+    #     self.set_mode_client.wait_for_service(timeout_sec=SETMODE_TIMEOUT_S)
+    #     # 输出当前sys状态和位置信息
+    #     self.get_logger().info(f"[reboot] UAV{vid} current_state={self.current_state}")
+    #     self.get_logger().info(f"[reboot] UAV{vid} current_pose={self.current_pose}")
+    #     # 3) 发布初始setpoints → 切换OFFBOARD→ 解锁 → 起飞到 INIT_HEIGHT（各60s超时）
+    #     self.get_logger().info(f"[reboot] UAV{vid} Publishing initial dummy setpoints to prevent RTL...")
+    #     warmup_count = 80
+    #     for _ in range(warmup_count):
+    #         if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+    #             raise InterruptedError("reset cancelled")
+    #         self.pub_position(0.0, 0.0, self.init_height)
+    #         spin_sleep(self, 20.0)
 
-        self.get_logger().info(f"[reboot] UAV{vid} Initial setpoints published.")
+    #     self.get_logger().info(f"[reboot] UAV{vid} Initial setpoints published.")
 
-        self.offb_set_mode.custom_mode = "OFFBOARD"
-        off_start = time.time()
-        while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 60.0:
-            try:
-                resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
-                if resp and getattr(resp, "mode_sent", False):
-                    self.get_logger().info("[reboot] ***** OFFBOARD enabled *****")
-            except Exception as e:
-                self.get_logger().warn(f"UAV{vid} OFFBOARD enable failed. Exception: {e}")
-            spin_sleep(self, 2.0)
-        if self.current_state.mode != "OFFBOARD":
-            raise TimeoutError("OFFBOARD not enabled within 60s")
-        try:
-            self.get_logger().info(f"[reboot] UAV{vid} Vehicle in OFFBOARD mode.")
-        except Exception as e:
-            self.get_logger().warn(f"[reboot] UAV{vid} Vehicle in OFFBOARD mode failed. Exception: {e}")
+    #     self.offb_set_mode.custom_mode = "OFFBOARD"
+    #     off_start = time.time()
+    #     while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 60.0:
+    #         try:
+    #             if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+    #                 raise InterruptedError("reset cancelled")
+    #             resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
+    #             if resp and getattr(resp, "mode_sent", False):
+    #                 self.get_logger().info("[reboot] ***** OFFBOARD enabled *****")
+    #         except Exception as e:
+    #             self.get_logger().warn(f"UAV{vid} OFFBOARD enable failed. Exception: {e}")
+    #         spin_sleep(self, 2.0)
+    #     if self.current_state.mode != "OFFBOARD":
+    #         raise TimeoutError("OFFBOARD not enabled within 60s")
+    #     try:
+    #         self.get_logger().info(f"[reboot] UAV{vid} Vehicle in OFFBOARD mode.")
+    #     except Exception as e:
+    #         self.get_logger().warn(f"[reboot] UAV{vid} Vehicle in OFFBOARD mode failed. Exception: {e}")
 
-        # Wait for local position estimate to be stable before arming to avoid
-        # preflight "position estimate error" after PX4 reboot.
-        # pos_ready = self.wait_until_local_position_ready(
-        #     timeout_s=POSITION_READY_TIMEOUT_S,
-        #     window_s=POSITION_READY_WINDOW_S,
-        #     eps=POSITION_READY_EPS,
-        # )
-        # self.get_logger().info(
-        #     f"[reboot] UAV{vid} local position ready={pos_ready} (timeout={POSITION_READY_TIMEOUT_S}s, window={POSITION_READY_WINDOW_S}s, eps={POSITION_READY_EPS})"
-        # )
-        ok_att = self.wait_until_attitude_stable(
-            timeout_s=POSITION_READY_TIMEOUT_S,
-            window_s=POSITION_READY_WINDOW_S,
-            eps=POSITION_READY_EPS,
-        )
-        self.get_logger().info(f"[reboot] UAV{vid} attitude stable={ok_att}")
+    #     # Wait for local position estimate to be stable before arming to avoid
+    #     # preflight "position estimate error" after PX4 reboot.
+    #     # pos_ready = self.wait_until_local_position_ready(
+    #     #     timeout_s=POSITION_READY_TIMEOUT_S,
+    #     #     window_s=POSITION_READY_WINDOW_S,
+    #     #     eps=POSITION_READY_EPS,
+    #     # )
+    #     # self.get_logger().info(
+    #     #     f"[reboot] UAV{vid} local position ready={pos_ready} (timeout={POSITION_READY_TIMEOUT_S}s, window={POSITION_READY_WINDOW_S}s, eps={POSITION_READY_EPS})"
+    #     # )
+    #     ok_att = self.wait_until_attitude_stable(
+    #         timeout_s=POSITION_READY_TIMEOUT_S,
+    #         window_s=POSITION_READY_WINDOW_S,
+    #         eps=POSITION_READY_EPS,
+    #     )
+    #     self.get_logger().info(f"[reboot] UAV{vid} attitude stable={ok_att}")
 
-        self.arm_cmd.value = True
-        arm_start = time.time()
-        while not self.current_state.armed and (time.time() - arm_start) < 60.0:
-            try:
-                resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
-                # self.get_logger().info(f"[reboot] UAV{vid} arming resp={resp}")
-                if resp and getattr(resp, "success", False):
-                    self.get_logger().info(f"[reboot] UAV{vid} ***** Vehicle armed *****")
-                    break
-            except Exception as e:
-                self.get_logger().warn(f"[reboot] UAV{vid} arming failed. Exception: {e}")
-            spin_sleep(self, 2.0)
-        # if not self.current_state.armed:
-            # raise TimeoutError("Vehicle not armed within 60s")
-        self.get_logger().info(f"[reboot] UAV{vid} armed.")
+    #     self.arm_cmd.value = True
+    #     arm_start = time.time()
+    #     while not self.current_state.armed and (time.time() - arm_start) < 60.0:
+    #         try:
+    #             resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
+    #             # self.get_logger().info(f"[reboot] UAV{vid} arming resp={resp}")
+    #             if resp and getattr(resp, "success", False):
+    #                 self.get_logger().info(f"[reboot] UAV{vid} ***** Vehicle armed *****")
+    #                 break
+    #         except Exception as e:
+    #             self.get_logger().warn(f"[reboot] UAV{vid} arming failed. Exception: {e}")
+    #         spin_sleep(self, 2.0)
+    #     # if not self.current_state.armed:
+    #         # raise TimeoutError("Vehicle not armed within 60s")
+    #     self.get_logger().info(f"[reboot] UAV{vid} armed.")
 
-        target_x = float(self.current_pose.pose.position.x)
-        target_y = float(self.current_pose.pose.position.y)
-        z0 = float(self.current_pose.pose.position.z)
-        # target_z = float(z0) + float(self.init_height)
-        target_z = float(z0) + float(self.init_height)
-        self._perform_takeoff(target_x, target_y, target_z, "[reboot]")
-        if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
-            x, y, z = float(position[0]), float(position[1]), float(position[2])
-            ok_mv = self.move_to_and_wait(x, y, z, threshold=MOVE_REACH_THRESHOLD, timeout_s=60.0)
-            self.get_logger().info(f"[reboot] UAV{vid} moved to target={position} ok={ok_mv}")
-        self.cmdlong_client.wait_for_service(timeout_sec=10.0)
-        self.get_logger().info("[reboot] PX4 reboot complete; MAVROS reconnected.")
+    #     target_x = float(self.current_pose.pose.position.x)
+    #     target_y = float(self.current_pose.pose.position.y)
+    #     z0 = float(self.current_pose.pose.position.z)
+    #     # target_z = float(z0) + float(self.init_height)
+    #     target_z = float(z0) + float(self.init_height)
+    #     self._perform_takeoff(target_x, target_y, target_z, "[reboot]")
+    #     if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
+    #         x, y, z = float(position[0]), float(position[1]), float(position[2])
+    #         ok_mv = self.move_to_and_wait(x, y, z0, threshold=MOVE_REACH_THRESHOLD, timeout_s=60.0)
+    #         self.get_logger().info(f"[reboot] UAV{vid} moved to target={position} ok={ok_mv}")
+    #     self.cmdlong_client.wait_for_service(timeout_sec=10.0)
+    #     self.get_logger().info("[reboot] PX4 reboot complete; MAVROS reconnected.")
 
     def reboot_px4_hard(self, position: Optional[List[float]] = None, yaw_deg: Optional[float] = None):
         vid = int(self._vid)
+        if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+            raise InterruptedError("reset cancelled")
         ok_reset = self._sim_px4_hard_reset()
         if not ok_reset:
             self.get_logger().warn(f"[reboot_hard] UAV{vid} px4 hard reset failed")
         if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
             self.get_logger().info(f"[reboot_hard] UAV{vid} moving to position {position} yaw={yaw_deg}")
-            self._sim_move_uav(position, yaw_deg)
+            self._sim_move_uav([position[0], position[1], 0.07], yaw_deg)
         ok_relaunch = self._sim_px4_relaunch()
         if not ok_relaunch:
             self.get_logger().warn(f"[reboot_hard] UAV{vid} px4 relaunch failed")
-        time.sleep(5.0)
+        time.sleep(4.0)
         self.wait_for_fcu_connection()
         
         ok_att = self.wait_until_attitude_stable(
@@ -1075,6 +1106,8 @@ class IsaacSimEnv(Node):
         arm_start = time.time()
         while not self.current_state.armed and (time.time() - arm_start) < 60.0:
             try:
+                if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                    raise InterruptedError("reset cancelled")
                 resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
                 if resp and getattr(resp, "success", False):
                     self.get_logger().info(f"[reboot_hard] UAV{vid} ***** Vehicle armed *****")
@@ -1086,7 +1119,7 @@ class IsaacSimEnv(Node):
         # Send warmup position commands before sending OFFBOARD mode command, to avoid fallback into disarm mode.
         warmup_count = 60
         for _ in range(warmup_count):
-            self.pub_position(0.0, 0.0, self.init_height)
+            self.pub_position(position[0], position[1], 0.07)
             spin_sleep(self, 20.0)
         
         # Send OFFBOARD mode command.
@@ -1095,6 +1128,8 @@ class IsaacSimEnv(Node):
         off_start = time.time()
         while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 60.0:
             try:
+                if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                    raise InterruptedError("reset cancelled")
                 resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
                 if resp and getattr(resp, "mode_sent", False):
                     self.get_logger().info("[reboot_hard] ***** OFFBOARD enabled *****")
@@ -1106,12 +1141,12 @@ class IsaacSimEnv(Node):
         
         target_x = float(position[0])
         target_y = float(position[1])
-        takeoff_z = float(self.current_pose.pose.position.z) + float(self.init_height)
+        # takeoff_z = float(self.current_pose.pose.position.z) + float(self.init_height)
         target_z = float(position[2])
-        self._perform_takeoff(target_x, target_y, takeoff_z, "[reboot_hard]")
-        if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
-            ok_mv = self.move_to_and_wait(target_x, target_y, target_z, threshold=MOVE_REACH_THRESHOLD, timeout_s=60.0)
-            self.get_logger().info(f"[reboot_hard] UAV{vid} moved to target={position} ok={ok_mv}")
+        self._perform_takeoff(target_x, target_y, target_z, "[reboot_hard]")
+        # if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
+            # ok_mv = self.move_to_and_wait(target_x, target_y, target_z, threshold=MOVE_REACH_THRESHOLD, timeout_s=60.0)
+        self.get_logger().info(f"[reboot_hard] UAV{vid} moved to target={position}")
 
     def wait_for_fcu_connection(self):
         """在 MAVROS 启动后阻塞等待 FCU 连接成功。"""
@@ -1362,6 +1397,8 @@ class IsaacSimEnv(Node):
 
             landed = False
             while time.time() - start < timeout_s and rclpy.ok():
+                if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                    raise InterruptedError("reset cancelled")
                 z = float(self.current_pose.pose.position.z)
                 try:
                     on_ground = int(getattr(self.extended_state, "landed_state", 0)) == int(ExtendedState.LANDED_STATE_ON_GROUND)
@@ -1443,6 +1480,8 @@ class IsaacSimEnv(Node):
         stable_for = 0.0
         step = 0.1
         while time.time() - start < timeout_s:
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             z = float(self.current_pose.pose.position.z)
             on_ground = False
             try:
@@ -1467,6 +1506,8 @@ class IsaacSimEnv(Node):
     def wait_until_disarmed(self, timeout_s: float = 5.0) -> bool:
         start = time.time()
         while time.time() - start < timeout_s:
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
             if not bool(getattr(self.current_state, "armed", False)):
                 return True
             rclpy.spin_once(self, timeout_sec=0.05)
@@ -1511,9 +1552,29 @@ class IsaacSimEnv(Node):
         return resp
 
 class TaskGuard:
-    def __init__(self, lock: threading.Lock, force: bool):
+    def __init__(self, lock: threading.Lock, force: bool, cancel_event: Optional[threading.Event] = None, timeout_s: float = 10.0):
         self._lock = lock
-        self.acquired = self._lock.acquire(blocking=force)
+        self.acquired = False
+        if force:
+            if self._lock.acquire(blocking=False):
+                self.acquired = True
+                if cancel_event:
+                    cancel_event.clear()
+            else:
+                if cancel_event:
+                    cancel_event.set()
+                start = time.time()
+                while True:
+                    if self._lock.acquire(blocking=False):
+                        self.acquired = True
+                        break
+                    if (time.time() - start) > float(timeout_s):
+                        break
+                    time.sleep(0.05)
+                if self.acquired and cancel_event:
+                    cancel_event.clear()
+        else:
+            self.acquired = self._lock.acquire(blocking=False)
     def release(self):
         if self.acquired:
             try:
@@ -1637,7 +1698,7 @@ class HttpApi:
         try:
             force = bool(data.get("force", True))
             hard = bool(data.get("hard", True))
-            guard = TaskGuard(self.env._task_lock, force)
+            guard = TaskGuard(self.env._task_lock, force, getattr(self.env, "_reset_cancel_event", None), timeout_s=30.0)
             if not guard.acquired:
                 return {"status": "error", "message": "busy"}, 409
             vid = data.get("vid")
@@ -1659,6 +1720,8 @@ class HttpApi:
             self.env._json_name_list = [None]
             self.env._instructions_list = [None]
             try:
+                if getattr(self.env, "_reset_cancel_event", None):
+                    self.env._reset_cancel_event.clear()
                 if hard:
                     self.env.reboot_px4_hard(pos, yaw_deg)
                 else:
@@ -1666,6 +1729,9 @@ class HttpApi:
                 return {"status": "success", "message": "reset ok", "vid": vid, "position": pos}, 200
             finally:
                 guard.release()
+        except InterruptedError as e:
+            self.env.get_logger().warn(f"HTTP /reset interrupted: {e}\n{traceback.format_exc()}")
+            return {"status": "error", "message": "reset interrupted"}, 409
         except TimeoutError as e:
             self.env.get_logger().error(f"HTTP /reset exception: {e}\n{traceback.format_exc()}")
             return {"status": "error", "message": str(e)}, 504

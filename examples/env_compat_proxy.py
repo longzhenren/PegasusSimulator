@@ -16,7 +16,7 @@ class CompatProxy:
         vids = str(os.environ.get("MULTI_ROSPY_VIDS", "0")).strip()
         self.multi_vids: List[int] = [int(x) for x in vids.split(",") if x.strip()]
 
-        self.pgsim_url = str(os.environ.get("PGSIM_BASE_URL", "http://127.0.0.1:8080")).rstrip("/")
+        self.pgsim_url = str(os.environ.get("PGSIM_BASE_URL", "http://127.0.0.1:8081")).rstrip("/")
         pgsim_ids = str(os.environ.get("PGSIM_UAV_IDS", "0")).strip()
         self.pgsim_uav_ids: List[int] = [int(x) for x in pgsim_ids.split(",") if x.strip()]
         self.pgsim_default_pos: List[float] = [
@@ -81,8 +81,8 @@ class CompatProxy:
             try:
                 payload = {"force": True, "hard": True}
                 requests.post(f"{base}/reset", json=payload, timeout=self.timeout)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] reset {base} failed: {e}")
             self.batch_map.append((base, 0))
             json_names.append("uav0")
             images.append([])
@@ -94,8 +94,8 @@ class CompatProxy:
                 try:
                     payload = {"force": True, "hard": True, "vid": int(vid)}
                     requests.post(f"{base}/reset", json=payload, timeout=self.timeout)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[WARN] reset {base} vid={vid} failed: {e}")
                 self.batch_map.append((base, int(vid)))
                 json_names.append(f"uav{int(vid)}")
                 images.append([])
@@ -106,8 +106,8 @@ class CompatProxy:
                 try:
                     payload = {"position": self.pgsim_default_pos}
                     requests.post(f"{self.pgsim_url}/uav/{int(uid)}/reset", json=payload, timeout=self.timeout)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[WARN] reset pgsim uid={uid} failed: {e}")
                 self.batch_map.append((self.pgsim_url, int(uid)))
                 json_names.append(f"uav{int(uid)}")
                 images.append([])
@@ -174,8 +174,8 @@ class CompatProxy:
                                 b64 = obj.get("data") or (obj.get("image") or {}).get("data")
                                 if isinstance(b64, str) and b64:
                                     frames.append(b64)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                print(f"[WARN] pgsim step per_step uid={uid} failed: {e}")
                 else:
                     last = None
                     for pt in seq:
@@ -189,8 +189,8 @@ class CompatProxy:
                         b64 = obj.get("data") or (obj.get("image") or {}).get("data")
                         if isinstance(b64, str) and b64:
                             frames.append(b64)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[WARN] pgsim step uid={uid} failed: {e}")
                 images_batch.append(frames)
                 done_batch.append(False)
             return {"status": "success", "images": images_batch, "done": done_batch, "message": "step ok", "batch_size": len(images_batch)}
@@ -235,4 +235,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -35,6 +35,7 @@ import signal
 import sys
 import time
 import re
+import traceback
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import subprocess as sp
@@ -343,7 +344,7 @@ def main():
                         p.kill()
             except Exception:
                 os.kill(pid, signal.SIGKILL if hard else signal.SIGTERM)
-                pass
+                print(f"[WARN] kill pid fallback for {pid}")
         else:
             os.kill(pid, signal.SIGKILL if hard else signal.SIGTERM)
         cleaned_pids.append(pid)
@@ -364,7 +365,7 @@ def main():
                 hits.add(pid)
         return list(sorted(hits))
 
-    def _restart_px4_for_vid(vid: int, base_url: str = "http://127.0.0.1:8080") -> bool:
+    def _restart_px4_for_vid(vid: int, base_url: str = "http://127.0.0.1:8081") -> bool:
         try:
             url_hr = f"{base_url}/uav/{vid}/px4/hard_reset"
             req_hr = urllib.request.Request(url_hr, data=b"{}", method="POST")
@@ -387,7 +388,7 @@ def main():
         # Aggregate candidate ports (command ports and PX4 MAVLink base ports)
         candidate_ports = set()
         candidate_ports.add(5008) # HTTP Gateway Port
-        candidate_ports.add(8080) # ISAAC HTTP Port
+        candidate_ports.add(8081) # ISAAC HTTP Port
         for v in vehicles:
             vid = int(v.get("vehicle_id", 0))
             candidate_ports.add(14540 + vid) 
@@ -451,15 +452,15 @@ def main():
                     time.sleep(0.5)
                     os.killpg(pgid, signal.SIGKILL)
                 except Exception:
-                    pass
+                    print(traceback.format_exc())
                 try:
                     lf = getattr(mp, "_log_file", None)
                     if lf:
                         lf.close()
                 except Exception:
-                    pass
+                    print(traceback.format_exc())
         except Exception:
-            pass
+            print(traceback.format_exc())
         # also stop isaac sim if running
         if 'isaac_proc' in globals() or 'isaac_proc' in locals():
             if isaac_proc is not None:
@@ -482,7 +483,7 @@ def main():
             isaac_log = isaac_log_dir / "isaacsim.log"
             isaac_log_f = isaac_log.open("w")
             now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[INFO] 场景加载中... 当前时间: {now_str} | 耗时: {int(time.time() - t_start)}s")
+            print(f"[INFO] 场景加载中... | 当前时间: {now_str} | 耗时: {int(time.time() - t_start)}s")
             # Start Isaac, capture stdout for filtering
             try:
                 isaac_env = _source_env([
@@ -591,7 +592,8 @@ def main():
         launch_paths = _generate_mavros_launch_from_config(cfg_path)
         mavros_log_dir = log_root / str(session_ts) / 'mavros'
         ensure_dir(mavros_log_dir)
-
+        
+        print(f"[INFO] 等待所有PX4启动脚本返回成功（Startup script returned successfully）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
         isaac_log_path = log_root / str(session_ts) / 'isaac' / 'isaacsim.log'
         ok_px4 = wait_log_count(isaac_log_path, r"Startup script returned successfully", expected_aircraft, timeout=float(args.ready_timeout), interval=1.0, label="'Startup script returned successfully'")
         if not ok_px4:
@@ -622,6 +624,8 @@ def main():
     if connected < expected_aircraft:
         print(f"[WARN] MAVROS connected count: {connected}/{expected_aircraft}")
     
+    print(f"[INFO] 所有MAVROS连接就绪!（Connected）：{connected} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
+    
     import threading
     def _launch_group(group_list: List[Dict[str, Any]], group_name: str):
         prev_log_path: Optional[Path] = None
@@ -651,6 +655,7 @@ def main():
     groups: List[List[Dict[str, Any]]] = [vehicles[i::par] for i in range(par)]
     threads: List[threading.Thread] = []
     for idx, grp in enumerate(groups):
+        print(f"[INFO] 启动控制器组 {idx+1}/{par}：{len(grp)} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
         t = threading.Thread(target=_launch_group, args=(grp, f"group{idx+1}"), daemon=True)
         threads.append(t)
         t.start()
@@ -727,6 +732,8 @@ def main():
     except Exception as e:
         print(f"[WARN] Failed to start gateway: {e}")
 
+    print(f"[INFO] 记录 + 网关服务器已启动（Recording+Gateway）| 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
+    
     if args.detach:
         print(f"[INFO] Detached mode. Spawned {len(procs)} processes.")
         return
@@ -794,7 +801,7 @@ def main():
     except KeyboardInterrupt:
         _signal_handler("KeyboardInterrupt", None)
 
-    print("[INFO] All controllers finished.")
+    print(f"[INFO] All controllers finished. | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
     try:
         for vid, mp in list(mavros_procs.items()):
             try:
@@ -803,16 +810,17 @@ def main():
                 time.sleep(0.5)
                 os.killpg(pgid, signal.SIGKILL)
             except Exception:
-                pass
+                print(traceback.format_exc())
             try:
                 lf = getattr(mp, "_log_file", None)
                 if lf:
                     lf.close()
             except Exception:
-                pass
+                print(traceback.format_exc())
     except Exception:
-        pass
+        print(traceback.format_exc())
     terminate_all(procs)
+    print(f"[INFO] All MAVROS processes terminated. | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
     if cleaned_pids:
         print(f"[INFO] Cleaned PIDs at start: {sorted(set(cleaned_pids))}")
 

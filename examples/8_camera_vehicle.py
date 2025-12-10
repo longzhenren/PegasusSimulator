@@ -6,7 +6,7 @@ Pegasus 仿真应用（8_camera_vehicle.py）
 - 启动 Isaac Sim（支持 headless）并按 `multi_uav_config.json` 加载多载具与场景；对外暴露仿真 HTTP 接口以供控制器读取图像/位姿与执行位置重置。
 - 支持录制机制：按固定帧率保存 PNG/CSV 到 `recordings/`，可用于后处理或数据集生成。
 
-HTTP 接口（端口 8080）
+HTTP 接口（端口 8081）
 - `GET /uav/<id>/pose`：载具状态快照
 - `GET /uav/<id>/image`、`GET /uav/<id>/image.png`：相机图像（JSON/PNG）
 - `GET /uav/<id>/all`：图像 + 位姿汇总
@@ -37,6 +37,16 @@ HTTP 接口（端口 8080）
 - `GET /uav/0/all` 返回示例键：`{"image": {"data": "<base64>"}, "pose": {...}}`
 - `POST /uav/0/reset` 请求示例：`{"position": [-88.0, 8.0, 5.0], "yaw_deg": 0.0}`
 
+# 提高 UDP buffer
+sudo sysctl -w net.core.rmem_max=26214400
+sudo sysctl -w net.core.wmem_max=26214400
+sudo sysctl -w net.core.rmem_default=26214400
+sudo sysctl -w net.core.wmem_default=26214400
+
+# 减少 TIME_WAIT 连接等（主要偏 TCP，但某些 RMW 配置会用到）
+sudo sysctl -w net.ipv4.tcp_fin_timeout=15
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+
 """
 
 # Imports to start Isaac Sim from this script
@@ -56,6 +66,7 @@ from PIL import Image
 from flask import Flask, jsonify, request, Response
 from werkzeug.serving import make_server
 from scipy.spatial.transform import Rotation
+
 
 SIMULATION_ENVIRONMENTS = {}
 NVIDIA_SIMULATION_ENVIRONMENTS = {
@@ -103,7 +114,8 @@ RENDER_MAX_FPS = 10.0
 CAMERA_RESOLUTION = (640, 640)
 # USD_PATH = SIMULATION_ENVIRONMENTS['Curved Gridroom']
 # USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
-USD_PATH = "/home/user/export/extract.usd"
+# USD_PATH = "/home/user/export/Demo_Environment.usda"
+USD_PATH = "/home/user/Downloads/export/extract.usd"
 # -------------------------
 # Recording (global switch)
 # -------------------------
@@ -128,7 +140,7 @@ APP_CONFIG = {
     # "height": 600,
     "window_width": 1280,
     "window_height": 720,
-    "headless": False,
+    "headless": True,
     "max_bounces": 0 if USE_RASTERIZATION else 1,  # RT 模式里 bounces 越低越快
     "samples_per_pixel_per_frame": 1 if USE_RASTERIZATION else 16,  # 默认 64，很吃GPU，先降
     "anti_aliasing": 1,  # 0/1 更快（3=高质量）
@@ -156,6 +168,8 @@ simulation_app = SimulationApp(APP_CONFIG)
 # -----------------------------------
 
 import omni.timeline
+import omni.usd
+from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Sdf, Vt, UsdShade
 from isaacsim.core.api.world import World
 
 sys.path.insert(0, os.path.expanduser("~/PegasusSimulator-5.1/extensions/pegasus.simulator/"))
@@ -240,6 +254,188 @@ class MultiUAVManager:
 
         # Reset simulation to initialize assets
         self.world.reset()
+
+        # After spawn: configure collision filtering so UAVs don't collide with each other
+        try:
+            self._configure_collision_filtering()
+        except Exception as e:
+            carb.log_warn(f"Collision filtering setup failed: {e}")
+        # Make UAVs semi-transparent for multi-UAV visualization
+        try:
+            self._configure_uav_transparency(alpha=0.0)
+        except Exception as e:
+            carb.log_warn(f"Transparency setup failed: {e}")
+
+    def _iter_uav_colliders(self, prim_root: Usd.Prim):
+        for prim in Usd.PrimRange(prim_root):
+            try:
+                if UsdPhysics.CollisionAPI(prim):
+                    yield prim
+            except Exception:
+                continue
+
+    def _iter_uav_gprims(self, prim_root: Usd.Prim):
+        for prim in Usd.PrimRange(prim_root):
+            try:
+                gp = UsdGeom.Gprim(prim)
+                if gp:
+                    yield gp
+            except Exception:
+                continue
+
+    def _configure_collision_filtering(self):
+        stage = omni.usd.get_context().get_stage()
+        carb.log_info("[CollisionFiltering] start")
+        vm = None
+        try:
+            from pegasus.simulator.logic.vehicle_manager import VehicleManager
+            vm = VehicleManager.get_vehicle_manager()
+        except Exception as e:
+            carb.log_warn(f"[CollisionFiltering] VehicleManager unavailable: {e}")
+            vm = None
+        root = stage.GetDefaultPrim()
+        if not root:
+            root = stage.GetPrimAtPath("/World")
+            carb.log_info("[CollisionFiltering] defaultPrim missing, using /World")
+        base = root.GetPath()
+        uav_group_path = base.AppendChild("UAVCollisionGroup")
+        world_group_path = base.AppendChild("WorldCollisionGroup")
+        uav_group = UsdPhysics.CollisionGroup.Define(stage, uav_group_path)
+        world_group = UsdPhysics.CollisionGroup.Define(stage, world_group_path)
+        carb.log_info(f"[CollisionFiltering] groups created: {uav_group_path} , {world_group_path}")
+        try:
+            rel = uav_group.CreateFilteredGroupsRel()
+            rel.AddTarget(uav_group_path)
+            carb.log_info("[CollisionFiltering] UAVGroup self-filter applied")
+        except Exception as e:
+            carb.log_warn(f"[CollisionFiltering] set self-filter failed: {e}")
+        assigned_uav = 0
+        for v in self.config.get("vehicles", []):
+            vid = int(v.get("vehicle_id", 0))
+            ns = v.get("ros2_namespace", f"uav{vid}")
+            prim_root = stage.GetPrimAtPath(f"/World/{ns}")
+            if not prim_root or not prim_root.IsValid():
+                carb.log_warn(f"[CollisionFiltering] UAV root invalid: /World/{ns}")
+                continue
+            local_count = 0
+            for col in self._iter_uav_colliders(prim_root):
+                try:
+                    api = UsdPhysics.CollisionAPI(col)
+                    if not api:
+                        api = UsdPhysics.CollisionAPI.Apply(col)
+                    # Use CollisionGroup's collection API to add membership
+                    coll_api = uav_group.GetCollidersCollectionAPI()
+                    # Author membership include for this collider prim
+                    includes = coll_api.GetIncludesRel()
+                    includes.AddTarget(col.GetPath())
+                    local_count += 1
+                except Exception as e:
+                    carb.log_warn(f"[CollisionFiltering] assign UAV collider failed at {col.GetPath()}: {e}")
+                    continue
+            assigned_uav += local_count
+            carb.log_info(f"[CollisionFiltering] UAV namespace /World/{ns} assigned {local_count} colliders")
+        assigned_world = 0
+        world_prim = stage.GetPrimAtPath("/World")
+        uav_ns_set = {v.get("ros2_namespace", f"uav{int(v.get('vehicle_id',0))}") for v in self.config.get("vehicles", [])}
+        for prim in Usd.PrimRange(world_prim):
+            try:
+                ppath = prim.GetPath().pathString
+                if any(ppath.startswith(f"/World/{ns}") for ns in uav_ns_set):
+                    continue
+                api = UsdPhysics.CollisionAPI(prim)
+                if api:
+                    coll_api = world_group.GetCollidersCollectionAPI()
+                    includes = coll_api.GetIncludesRel()
+                    includes.AddTarget(prim.GetPath())
+                    assigned_world += 1
+            except Exception:
+                continue
+        carb.log_info(f"[CollisionFiltering] summary: UAV colliders={assigned_uav}, World colliders={assigned_world}")
+
+    def _configure_uav_transparency(self, alpha: float = 0.35):
+        alpha = float(max(0.0, min(alpha, 1.0)))
+        stage = omni.usd.get_context().get_stage()
+        carb.log_info(f"[Transparency] start alpha={alpha}")
+        for v in self.config.get("vehicles", []):
+            vid = int(v.get("vehicle_id", 0))
+            ns = v.get("ros2_namespace", f"uav{vid}")
+            prim_root = stage.GetPrimAtPath(f"/World/{ns}")
+            if not prim_root or not prim_root.IsValid():
+                carb.log_warn(f"[Transparency] UAV root invalid: /World/{ns}")
+                continue
+            hidden_count = 0
+            if alpha <= 0.0:
+                try:
+                    for p in Usd.PrimRange(prim_root):
+                        try:
+                            cam = UsdGeom.Camera(p)
+                            if cam:
+                                continue
+                            img = UsdGeom.Imageable(p)
+                            if img:
+                                vis = img.GetVisibilityAttr()
+                                if not vis:
+                                    vis = img.CreateVisibilityAttr()
+                                vis.Set(UsdGeom.Tokens.invisible)
+                                hidden_count += 1
+                                carb.log_info(f"[Transparency] hidden {p.GetPath().pathString}")
+                        except Exception as e:
+                            carb.log_warn(f"[Transparency] hide failed at {p.GetPath().pathString}: {e}")
+                            continue
+                except Exception as e:
+                    carb.log_warn(f"[Transparency] traversal failed: {e}")
+            gprim_count = 0
+            opacity_set = 0
+            shader_inputs = 0
+            for gp in self._iter_uav_gprims(prim_root):
+                gprim_count += 1
+                try:
+                    attr = gp.GetDisplayOpacityAttr()
+                    if not attr:
+                        attr = gp.CreateDisplayOpacityAttr()
+                    attr.Set(Vt.FloatArray([alpha]))
+                    opacity_set += 1
+                    carb.log_info(f"[Transparency] gprim {gp.GetPrim().GetPath().pathString} opacity={alpha}")
+                except Exception as e:
+                    carb.log_warn(f"[Transparency] opacity set failed at {gp.GetPrim().GetPath().pathString}: {e}")
+                try:
+                    mba = UsdShade.MaterialBindingAPI(gp.GetPrim())
+                    mat = None
+                    try:
+                        res = mba.ComputeBoundMaterial()
+                        if isinstance(res, tuple):
+                            mat = res[0]
+                        else:
+                            mat = res
+                    except Exception:
+                        try:
+                            binding = mba.GetDirectBinding()
+                            mat = binding.GetMaterial()
+                        except Exception:
+                            mat = None
+                    if mat:
+                        for child in mat.GetPrim().GetChildren():
+                            try:
+                                shader = UsdShade.Shader(child)
+                                if not shader:
+                                    continue
+                                sid = shader.GetIdAttr().Get()
+                                sid_str = str(sid).lower() if sid is not None else ""
+                                if "usdpreviewsurface" in sid_str:
+                                    inp = shader.CreateInput("opacity", Sdf.ValueTypeNames.Float)
+                                    inp.Set(alpha)
+                                    shader_inputs += 1
+                                    carb.log_info(f"[Transparency] shader {child.GetPath().pathString} id={sid} input=opacity value={alpha}")
+                                else:
+                                    inp = shader.CreateInput("opacity_constant", Sdf.ValueTypeNames.Float)
+                                    inp.Set(alpha)
+                                    shader_inputs += 1
+                                    carb.log_info(f"[Transparency] shader {child.GetPath().pathString} id={sid} input=opacity_constant value={alpha}")
+                            except Exception as e:
+                                carb.log_warn(f"[Transparency] shader input set failed at {child.GetPath().pathString}: {e}")
+                except Exception as e:
+                    carb.log_warn(f"[Transparency] material binding failed at {gp.GetPrim().GetPath().pathString}: {e}")
+            carb.log_info(f"[Transparency] summary /World/{ns}: hidden={hidden_count}, gprims={gprim_count}, opacity_set={opacity_set}, shader_inputs={shader_inputs}")
 
 class PegasusApp:
     """
@@ -333,7 +529,7 @@ class PegasusApp:
     # ------------------------------
     # HTTP server lifecycle
     # ------------------------------
-    def _start_http_server(self, host: str = "127.0.0.1", port: int = 8080):
+    def _start_http_server(self, host: str = "127.0.0.1", port: int = 8081):
         if self._flask_server is not None:
             return
         self._flask_server = make_server(host, port, self.flask_app)
@@ -597,8 +793,102 @@ class PegasusApp:
                 if getattr(veh, "id", None) == uav_id:
                     return veh
         except Exception:
-            pass
+            carb.log_warn(traceback.format_exc())
         return None
+
+    def _iter_uav_colliders(self, prim_root: Usd.Prim):
+        for prim in Usd.PrimRange(prim_root):
+            try:
+                if UsdPhysics.CollisionAPI(prim):
+                    yield prim
+            except Exception:
+                continue
+
+    def _iter_uav_gprims(self, prim_root: Usd.Prim):
+        for prim in Usd.PrimRange(prim_root):
+            try:
+                gp = UsdGeom.Gprim(prim)
+                if gp:
+                    yield gp
+            except Exception:
+                continue
+
+    def _configure_collision_filtering(self):
+        stage = omni.usd.get_context().get_stage()
+        vm = None
+        try:
+            from pegasus.simulator.logic.vehicle_manager import VehicleManager
+            vm = VehicleManager.get_vehicle_manager()
+        except Exception:
+            vm = None
+        # Define two collision groups: UAVGroup and WorldGroup
+        root = stage.GetDefaultPrim()
+        if not root:
+            root = stage.GetPrimAtPath("/World")
+        base = root.GetPath()
+        uav_group_path = base.AppendChild("UAVCollisionGroup")
+        world_group_path = base.AppendChild("WorldCollisionGroup")
+        uav_group = UsdPhysics.CollisionGroup.Define(stage, uav_group_path)
+        world_group = UsdPhysics.CollisionGroup.Define(stage, world_group_path)
+        # Rule: UAVGroup should NOT collide with UAVGroup, BUT should collide with WorldGroup
+        # Implement by setting filters on the UAV group
+        try:
+            # Exclude self-group collisions
+            rel = uav_group.CreateFilteredGroupsRel()
+            rel.AddTarget(uav_group_path)
+        except Exception:
+            carb.log_warn(traceback.format_exc())
+        # Assign all UAV colliders to UAVGroup; environment colliders to WorldGroup
+        # UAVs live under /World/uavX
+        # Environment assumed to be everything else under /World with collision API
+        # 1) Assign UAV colliders
+        for v in self.config.get("vehicles", []):
+            vid = int(v.get("vehicle_id", 0))
+            ns = v.get("ros2_namespace", f"uav{vid}")
+            prim_root = stage.GetPrimAtPath(f"/World/{ns}")
+            if not prim_root or not prim_root.IsValid():
+                continue
+            for col in self._iter_uav_colliders(prim_root):
+                try:
+                    api = UsdPhysics.CollisionAPI(col)
+                    if not api:
+                        api = UsdPhysics.CollisionAPI.Apply(col)
+                    grp_rel = api.CreateCollisionGroupRel()
+                    grp_rel.SetTargets([uav_group_path])
+                except Exception:
+                    continue
+        # 2) Assign environment colliders (World excluding UAV namespaces)
+        world_prim = stage.GetPrimAtPath("/World")
+        uav_ns_set = {v.get("ros2_namespace", f"uav{int(v.get('vehicle_id',0))}") for v in self.config.get("vehicles", [])}
+        for prim in Usd.PrimRange(world_prim):
+            try:
+                ppath = prim.GetPath().pathString
+                if any(ppath.startswith(f"/World/{ns}") for ns in uav_ns_set):
+                    continue
+                api = UsdPhysics.CollisionAPI(prim)
+                if api:
+                    grp_rel = api.CreateCollisionGroupRel()
+                    grp_rel.SetTargets([world_group_path])
+            except Exception:
+                continue
+
+    def _configure_uav_transparency(self, alpha: float = 0.35):
+        alpha = float(max(0.0, min(alpha, 1.0)))
+        stage = omni.usd.get_context().get_stage()
+        for v in self.config.get("vehicles", []):
+            vid = int(v.get("vehicle_id", 0))
+            ns = v.get("ros2_namespace", f"uav{vid}")
+            prim_root = stage.GetPrimAtPath(f"/World/{ns}")
+            if not prim_root or not prim_root.IsValid():
+                continue
+            for gp in self._iter_uav_gprims(prim_root):
+                try:
+                    attr = gp.GetDisplayOpacityAttr()
+                    if not attr:
+                        attr = gp.CreateDisplayOpacityAttr()
+                    attr.Set(Vt.FloatArray([alpha]))
+                except Exception:
+                    carb.log_warn(traceback.format_exc())
 
     def _get_camera(self, vehicle):
         try:
@@ -606,7 +896,7 @@ class PegasusApp:
                 if getattr(s, "sensor_type", "") == "MonocularCamera":
                     return s
         except Exception:
-            pass
+            carb.log_warn(traceback.format_exc())
         return None
 
     def reset_uav(self, uav_id: int, position: list, yaw_deg: float = None):
@@ -688,7 +978,7 @@ class PegasusApp:
             try:
                 carb.log_warn(f"reset_uav error: {e}")
             except Exception:
-                pass
+                print(traceback.format_exc())
             return False, str(e)
 
     # ------------------------------
@@ -700,7 +990,7 @@ class PegasusApp:
                 if getattr(s, "sensor_type", "") == "MonocularCamera":
                     return s
         except Exception:
-            pass
+            carb.log_warn(traceback.format_exc())
         return None
 
     def _record_if_due(self):

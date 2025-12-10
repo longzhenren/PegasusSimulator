@@ -16,7 +16,7 @@ Gateway Server（统一 HTTP 网关 + 录制浏览）
 - `PEGASUS_GATEWAY_PORT`：网关监听端口，默认 `5008`（由启动器设置）。
 
 与系统的关系
-- 由 `launch_multi_rospy.py` 启动，控制器端口默认 `5009 + vid` 与网关映射一致；仿真端图像服务默认在 `8080`。
+- 由 `launch_multi_rospy.py` 启动，控制器端口默认 `5009 + vid` 与网关映射一致；仿真端图像服务默认在 `8081`。
 """
 import os
 import io
@@ -312,14 +312,15 @@ def uav_forward(uid: int, sub: str):
     try:
         if sub == "reset" and getattr(resp, "status_code", 500) < 300:
             _restart_mavros(uid)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] restart mavros on reset failed: {e}")
     return resp
 
 def _find_mavros_pids(uid: int):
     try:
         out = sp.check_output(["ps", "-eo", "pid,args"], stderr=sp.DEVNULL).decode().splitlines()
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] _find_mavros_pids ps failed: {e}")
         return []
     hits = []
     token = f"pegasus_uav_{uid}.launch"
@@ -329,8 +330,8 @@ def _find_mavros_pids(uid: int):
             try:
                 pid = int(low.split()[0])
                 hits.append(pid)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] parse pid failed: {e}")
     return list(sorted(set(hits)))
 
 def _restart_mavros(uid: int) -> bool:
@@ -343,11 +344,12 @@ def _restart_mavros(uid: int) -> bool:
                 os.killpg(pgid, signal.SIGTERM)
                 time.sleep(0.5)
                 os.killpg(pgid, signal.SIGKILL)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] killpg failed for pid {pid}: {e}")
         sp.Popen([ros2_cmd, "launch", launch_file], preexec_fn=os.setsid)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] _restart_mavros failed: {e}")
         return False
 
 @app.route('/', methods=['GET'])
@@ -460,8 +462,8 @@ def main(host: str = "0.0.0.0", port: int = 5008):
     try:
         PORT_STATUS.update({ns: _probe_port(p) for ns, p in NS_PORT_MAP.items()})
         print(f"[GW] namespaces={ {ns: {'port': p, 'alive': PORT_STATUS.get(ns)} for ns, p in NS_PORT_MAP.items()} }")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] probe port failed: {e}")
     gw_port = int(os.environ.get("PEGASUS_GATEWAY_PORT", str(port)))
     print(f"Recording+Gateway server ready: http://{host}:{gw_port}/ (serving {RECORD_DIR}) namespaces={list(NS_PORT_MAP.keys())}")
     app.run(host=host, port=gw_port, threaded=True)

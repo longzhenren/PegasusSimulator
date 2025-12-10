@@ -26,13 +26,13 @@ class PX4LaunchTool:
     PX4 was already built with 'make px4_sitl_default none'), the vehicle id and the vehicle model. 
     """
 
-    def __init__(self, px4_dir, vehicle_id: int = 0, px4_model: str = "gazebo-classic_iris", sim_speed_factor: float = 1.0):
+    def __init__(self, px4_dir, vehicle_id: int = 0, px4_model: str = "gazebo-classic_iris_pg", sim_speed_factor: float = 1.0):
         """Construct the PX4LaunchTool object
 
         Args:
             px4_dir (str): A string with the path to the PX4-Autopilot directory
             vehicle_id (int): The ID of the vehicle. Defaults to 0.
-            px4_model (str): The vehicle model. Defaults to "gazebo-classic_iris".
+            px4_model (str): The vehicle model. Defaults to "gazebo-classic_iris_pg".
             sim_speed_factor (float): The speed factor for the simulation. Defaults to 1.0.
         """
 

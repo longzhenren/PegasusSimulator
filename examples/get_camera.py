@@ -4,7 +4,7 @@ from io import BytesIO
 from PIL import Image
 
 def fetch_and_save_image(uav_id, save_path):
-    url = f"http://localhost:8080/uav/{uav_id}/all"
+    url = f"http://localhost:8081/uav/{uav_id}/all"
 
     try:
         # 发送 HTTP 请求并获取响应

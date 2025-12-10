@@ -8,7 +8,7 @@ HTTP 接口详测脚本（controller直连与gateway对比）
 
 前置
 - 网关：`http://127.0.0.1:5008`；控制器（默认）：`http://127.0.0.1:5009+vid`。
-- 仿真HTTP：`http://127.0.0.1:8080`。
+- 仿真HTTP：`http://127.0.0.1:8081`。
 """
 import time
 import json
@@ -17,7 +17,7 @@ from http.cookies import SimpleCookie
 
 GATEWAY = "http://127.0.0.1:5008"
 CTRL_BASE = "http://127.0.0.1:{port}"
-SIM_BASE = "http://127.0.0.1:8080"
+SIM_BASE = "http://127.0.0.1:8081"
 
 def print_req_info(label, method, url, json_payload=None, timeout=None):
     print(f"\n[{label}] method={method} url={url}")
