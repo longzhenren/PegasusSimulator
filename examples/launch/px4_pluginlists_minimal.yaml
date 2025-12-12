@@ -1,0 +1,14 @@
+/**:
+  ros__parameters:
+    # 只开核心插件（支持通配符）
+    plugin_allowlist:
+      - 'sys_*'            # sys_status, sys_time
+      # - 'param'
+      - 'command'
+      - 'state'
+      - 'local_position'
+      # - 'global_position'  # 如果你不需要 GPS，可以先注释掉这一行
+      # - 'imu'
+      # - 'setpoint_position'
+      # - 'setpoint_velocity'
+      - 'setpoint_raw'   # 如果你使用 raw setpoint 再打开
