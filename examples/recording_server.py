@@ -153,12 +153,37 @@ def _create_zip_task(session_name: str, ext: str = None, uav: str = None, since:
 NS_PORT_MAP = {}
 PORT_STATUS = {}
 
+# _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+_PORT_PROBE_LOCK = threading.Lock()
+_LAST_PROBE_TS = 0.0
+
+_FORWARD_TIMEOUT_RESET_S = float(os.environ.get("PEGASUS_GATEWAY_TIMEOUT_RESET", "300"))
+_FORWARD_TIMEOUT_STEP_S = float(os.environ.get("PEGASUS_GATEWAY_TIMEOUT_STEP", "120"))
+_FORWARD_TIMEOUT_COMMAND_S = float(os.environ.get("PEGASUS_GATEWAY_TIMEOUT_COMMAND", "60"))
+
 def _probe_port(port: int) -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as resp:
             return resp.getcode() == 200
     except Exception:
         return False
+
+def _refresh_port_status(min_interval_s: float = 0.5) -> None:
+    global _LAST_PROBE_TS
+    now = time.time()
+    if (now - _LAST_PROBE_TS) < float(min_interval_s):
+        return
+    with _PORT_PROBE_LOCK:
+        now2 = time.time()
+        if (now2 - _LAST_PROBE_TS) < float(min_interval_s):
+            return
+        for ns, port in (NS_PORT_MAP or {}).items():
+            try:
+                PORT_STATUS[ns] = _probe_port(int(port))
+            except Exception:
+                PORT_STATUS[ns] = False
+        _LAST_PROBE_TS = now2
 
 # Legacy BaseHTTPRequestHandler implementation removed in favor of Flask app
 
@@ -274,6 +299,12 @@ def _route_to_controller(uid: int, sub: str):
     if not port:
         return jsonify({"error": "namespace not found", "ns": ns}), 404
     url = f"http://127.0.0.1:{port}/{sub}"
+    if sub == "reset":
+        timeout_s = _FORWARD_TIMEOUT_RESET_S
+    elif sub == "step":
+        timeout_s = _FORWARD_TIMEOUT_STEP_S
+    else:
+        timeout_s = _FORWARD_TIMEOUT_COMMAND_S
     body = request.get_data() if request.content_length and request.content_length > 0 else None
     req = urllib.request.Request(url, data=body, method=request.method)
     ct = request.headers.get('Content-Type')
@@ -302,6 +333,7 @@ def _route_to_controller(uid: int, sub: str):
 
 @app.route('/health', methods=['GET', 'POST'])
 def health():
+    _refresh_port_status()
     return jsonify({"status": "ok", "namespaces": {k: {"port": NS_PORT_MAP.get(k), "alive": bool(PORT_STATUS.get(k))} for k in NS_PORT_MAP.keys()}})
 
 @app.route('/uav/<int:uid>/<sub>', methods=['GET', 'POST'])

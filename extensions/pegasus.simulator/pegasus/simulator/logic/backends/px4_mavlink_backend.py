@@ -588,9 +588,9 @@ class PX4MavlinkBackend(Backend):
         The simulator keeps running; other vehicles remain unaffected.
         """
         try:
-            carb.log_warn(f"{self._log_prefix} HARD reboot: killing PX4 process")
+            carb.log_info(f"{self._log_prefix} HARD reboot: killing PX4 process")
             if self.px4_tool is not None:
-                self.px4_tool.kill_px4()
+                self.px4_tool.kill_px4_save()
             else:
                 import os, signal
                 if os.path.exists(self._px4_pid_path):
@@ -778,7 +778,7 @@ class PX4MavlinkBackend(Backend):
             return
         try:
             carb.log_warn(f"{self._log_prefix} PX4 not alive; attempting relaunch")
-            self.soft_relaunch_px4()
+            self.hard_reboot_px4()
         except Exception as e:
             carb.log_warn(f"{self._log_prefix} Periodic relaunch failed: {e}")
             carb.log_warn(traceback.format_exc())

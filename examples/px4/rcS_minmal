@@ -60,13 +60,12 @@ then
 
 elif [ -n "$PX4_SIM_MODEL" ]
 then
-    # 根据 PX4_SIM_MODEL 名字去 airframes 目录里查找对应 id
-    # 文件名形如：10021_gazebo-classic_iris_pg
-    # shellcheck disable=SC2012
+    # 尝试搜索
     REQUESTED_AUTOSTART=$(ls "${R}etc/init.d-posix/airframes" | sed -n 's/^\([0-9][0-9]*\)_'${PX4_SIM_MODEL}'$/\1/p')
     if [ -z "$REQUESTED_AUTOSTART" ]; then
-        echo "ERROR [init] Unknown model $PX4_SIM_MODEL (not found on ${R}etc/init.d-posix/airframes)"
-        exit 1
+        # 搜索不到不要直接 exit，而是使用默认值
+        echo "WARN  [init] Model $PX4_SIM_MODEL not found, using default 10021"
+        SYS_AUTOSTART=10021
     else
         SYS_AUTOSTART=$REQUESTED_AUTOSTART
         echo "INFO  [init] found model autostart file as SYS_AUTOSTART=$REQUESTED_AUTOSTART"

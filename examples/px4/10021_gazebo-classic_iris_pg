@@ -6,7 +6,7 @@
 # @class Copter
 #
 # @maintainer Julian Oes <julian@oes.ch>
-#
+# COPY THIS FILE TO ~/PX4-Autopilot/build/px4_sitl_default/etc/init.d-posix/airframes/ ~/PX4-Autopilot/ROMFS/px4fmu_common/init.d-posix/airframes/
 
 # 加载多旋翼默认参数（姿态控制等基础参数）
 . ${R}etc/init.d/rc.mc_defaults
@@ -88,14 +88,27 @@ param set-default PD_GRIPPER_EN     0
 #
 
 # 0 = 不记录飞行日志（最省资源）
-param set-default SDLOG_MODE        0
+# param set-default SDLOG_MODE        0
 
 # 不启用任何 logging profile
-param set-default SDLOG_PROFILE     0
+# param set-default SDLOG_PROFILE     0
 
 # 最大日志目录数量（关掉日志后其实无所谓，这里设 1 最小化目录管理）
-param set-default SDLOG_DIRS_MAX    1
+# param set-default SDLOG_DIRS_MAX    1
 
+# === 方案一：标准开启模式 ===
+
+# 1 = 从解锁开始记录日志，直到上锁停止（推荐）
+param set-default SDLOG_MODE        1
+
+# 1 = 默认 Profile（包含基础传感器、姿态、位置、控制量）
+param set-default SDLOG_PROFILE     1
+
+# 允许保留的最大目录数（防止撑爆硬盘）
+# param set-default SDLOG_DIRS_MAX    50
+
+# 日志任务标志：不记录额外任务 log（保持精简）
+param set-default SDLOG_MISSION     0
 
 #
 # === 可选：仿真用的一点“更宽松”设置（按需打开） ===
@@ -103,4 +116,4 @@ param set-default SDLOG_DIRS_MAX    1
 #
 param set-default COM_LOW_BAT_ACT  0   # 关闭低电量动作（只建议纯仿真环境）
 param set-default GF_ACTION        0   # 关闭 geofence 动作
-param set-default GF_ENABLE        0   # 关闭 geofence
+# param set-default GF_ENABLE        0   # 关闭 geofence

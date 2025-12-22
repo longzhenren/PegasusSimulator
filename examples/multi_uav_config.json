@@ -4,7 +4,7 @@
     {
       "vehicle_id": 0,
       "initial_position": [
-        1.0,
+        0.0,
         0.0,
         0.07
       ],
@@ -42,7 +42,7 @@
     },{
       "vehicle_id": 2,
       "initial_position": [
-        -1.0,
+        0.0,
         0.0,
         0.07
       ],
@@ -62,7 +62,7 @@
       "vehicle_id": 3,
       "initial_position": [
         0.0,
-        1.0,
+        0.0,
         0.07
       ],
       "initial_orientation_euler_deg": [
@@ -80,8 +80,8 @@
     },{
       "vehicle_id": 4,
       "initial_position": [
-        2.0,
-        2.0,
+        0.0,
+        0.0,
         0.07
       ],
       "initial_orientation_euler_deg": [
@@ -99,8 +99,8 @@
     },{
       "vehicle_id": 5,
       "initial_position": [
-        2.0,
-        -2.0,
+        0.0,
+        0.0,
         0.07
       ],
       "initial_orientation_euler_deg": [
@@ -118,8 +118,8 @@
     },{
       "vehicle_id": 6,
       "initial_position": [
-        -2.0,
-        2.0,
+        0.0,
+        0.0,
         0.07
       ],
       "initial_orientation_euler_deg": [
@@ -137,8 +137,8 @@
     },{
       "vehicle_id": 7,
       "initial_position": [
-        -2.0,
-        -2.0,
+        0.0,
+        0.0,
         0.07
       ],
       "initial_orientation_euler_deg": [

@@ -10,6 +10,7 @@ import os
 import tempfile
 import subprocess
 import traceback
+import signal
 
 
 PX4_PID_DIR = "/tmp/pegasus_px4_sitl"
@@ -67,6 +68,27 @@ class PX4LaunchTool:
     def pid_file_path(vehicle_id: int):
         return os.path.join(PX4_PID_DIR, f"px4_{vehicle_id}.pid")
 
+    def _save_logs(self):
+        """
+        因为 self.root_fs 是临时目录，在 cleanup 之前必须把日志挪出来
+        """
+        save_path = os.path.join(os.getcwd(), "px4_logs", f"uav{self.vehicle_id}")
+        os.makedirs(save_path, exist_ok=True)
+        
+        # PX4 的日志通常在临时目录下的 log/ 文件夹中
+        log_src = os.path.join(self.root_fs.name, "log")
+        if os.path.exists(log_src):
+            # 拷贝整个日志文件夹
+            for folder in os.listdir(log_src):
+                src_folder = os.path.join(log_src, folder)
+                dst_folder = os.path.join(save_path, folder)
+                if os.path.isdir(src_folder):
+                    if os.path.exists(dst_folder):
+                        shutil.rmtree(dst_folder)
+                    shutil.copytree(src_folder, dst_folder)
+            print(f"[uav{self.vehicle_id}] Logs saved to: {save_path}")
+            
+            
     def launch_px4(self):
         """
         Method that will launch a px4 instance with the specified configuration
@@ -108,6 +130,33 @@ class PX4LaunchTool:
             print(f"[PX4LaunchTool] Remove PID file failed: {e}")
             print(traceback.format_exc())
 
+    def kill_px4_save(self):
+        """
+        优雅地关闭 PX4 以保存日志
+        """
+        if self.px4_process is not None:
+            print(f"[uav{self.vehicle_id}] Sending SIGINT for graceful shutdown...")
+            # 1. 发送中断信号，让 PX4 执行清理逻辑（保存日志）
+            self.px4_process.send_signal(signal.SIGINT)
+            try:
+                # 2. 等待进程正常结束（最多等 10 秒）
+                self.px4_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                # 如果超时还没关掉，再强制杀掉
+                print(f"[uav{self.vehicle_id}] Shutdown timed out, forcing kill.")
+                self.px4_process.kill()
+            # 3. 【关键步骤】将日志从临时目录拷贝到永久目录
+            self._save_logs()
+            self.px4_process = None
+        # 清理 PID 文件
+        try:
+            p = self.pid_file_path(self.vehicle_id)
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception as e:
+            print(f"[PX4LaunchTool] Remove PID file failed: {e}")
+            print(traceback.format_exc())
+
     def __del__(self):
         """
         If the px4 process is still running when the PX4 launch tool object is whiped from memory, then make sure
@@ -116,7 +165,7 @@ class PX4LaunchTool:
 
         # Make sure the PX4 process gets killed
         if self.px4_process:
-            self.kill_px4()
+            self.kill_px4_save()
 
         # Make sure we clean the temporary filesystem used for the simulation
         self.root_fs.cleanup()

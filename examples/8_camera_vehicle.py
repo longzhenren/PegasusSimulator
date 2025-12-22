@@ -54,6 +54,7 @@ import carb
 from isaacsim import SimulationApp
 
 import sys, os
+import logging
 import json
 import traceback
 import threading
@@ -66,6 +67,83 @@ from PIL import Image
 from flask import Flask, jsonify, request, Response
 from werkzeug.serving import make_server
 from scipy.spatial.transform import Rotation
+
+
+LOG_ENABLE = True
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+LOG_FILE_PATH = os.path.join(LOG_DIR, f"8_camera_vehicle_{int(time.time())}.log")
+
+
+def _setup_file_logger():
+    if not LOG_ENABLE:
+        return None
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logger = logging.getLogger("pegasus.sim")
+    logger.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        fh = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(fh)
+        logger.propagate = False
+    return logger
+
+
+_FILE_LOGGER = _setup_file_logger()
+
+
+def _log_to_file(level: str, msg):
+    if _FILE_LOGGER is None:
+        return
+    try:
+        text = msg if isinstance(msg, str) else repr(msg)
+        if level == "error":
+            _FILE_LOGGER.error(text)
+        elif level == "warn":
+            _FILE_LOGGER.warning(text)
+        else:
+            _FILE_LOGGER.info(text)
+    except Exception:
+        pass
+
+
+_CARB_ORIG_LOG_INFO = getattr(carb, "log_info", None)
+_CARB_ORIG_LOG_WARN = getattr(carb, "log_warn", None)
+_CARB_ORIG_LOG_ERROR = getattr(carb, "log_error", None)
+
+
+def _carb_log_info(msg):
+    _log_to_file("info", msg)
+    try:
+        if _CARB_ORIG_LOG_INFO is not None:
+            _CARB_ORIG_LOG_INFO(msg)
+    except Exception:
+        pass
+
+
+def _carb_log_warn(msg):
+    _log_to_file("warn", msg)
+    try:
+        if _CARB_ORIG_LOG_WARN is not None:
+            _CARB_ORIG_LOG_WARN(msg)
+    except Exception:
+        pass
+
+
+def _carb_log_error(msg):
+    _log_to_file("error", msg)
+    try:
+        if _CARB_ORIG_LOG_ERROR is not None:
+            _CARB_ORIG_LOG_ERROR(msg)
+    except Exception:
+        pass
+
+
+carb.log_info = _carb_log_info
+carb.log_warn = _carb_log_warn
+carb.log_error = _carb_log_error
+
+_log_to_file("info", f"log_file={LOG_FILE_PATH}")
 
 
 SIMULATION_ENVIRONMENTS = {}
@@ -112,10 +190,10 @@ USE_RASTERIZATION = True
 RENDER_THROTTLE = True
 RENDER_MAX_FPS = 10.0
 CAMERA_RESOLUTION = (640, 640)
-# USD_PATH = SIMULATION_ENVIRONMENTS['Curved Gridroom']
+USD_PATH = SIMULATION_ENVIRONMENTS['Flat Plane']
 # USD_PATH = "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd"
 # USD_PATH = "/home/user/export/Demo_Environment.usda"
-USD_PATH = "/home/user/Downloads/export/extract.usd"
+# USD_PATH = "/home/user/Downloads/export/extract.usd"
 # -------------------------
 # Recording (global switch)
 # -------------------------
@@ -123,6 +201,10 @@ USD_PATH = "/home/user/Downloads/export/extract.usd"
 RECORD_ENABLE = False
 RECORD_FPS = 10.0
 RECORD_DIR = os.path.join(os.path.dirname(__file__), "recordings")
+
+UAV_TRANSPARENCY_ENABLE = True
+UAV_TRANSPARENCY_ALPHA = 0.0
+DISABLE_UAV_UAV_COLLISION = True
 
 # -------------------------
 # Multi-UAV Config (JSON only)
@@ -218,7 +300,8 @@ class MultiUAVManager:
                 "px4_autolaunch": bool(v.get("px4_autolaunch", True)),
                 "px4_dir": v.get("px4_dir", self.pg.px4_path),
                 "sim_speed_factor": v.get("sim_speed_factor", 2.0),
-                "px4_vehicle_type": v.get("px4_vehicle_model", "gazebo-classic_iris_pg"),
+                # "px4_vehicle_type": v.get("px4_vehicle_model", "gazebo-classic_iris_pg"),
+                "px4_vehicle_model": "gazebo-classic_iris_pg",
             }
             mavlink_config = PX4MavlinkBackendConfig(px4_cfg_dict)
 
@@ -255,21 +338,24 @@ class MultiUAVManager:
         # Reset simulation to initialize assets
         self.world.reset()
 
-        # After spawn: configure collision filtering so UAVs don't collide with each other
-        try:
-            self._configure_collision_filtering()
-        except Exception as e:
-            carb.log_warn(f"Collision filtering setup failed: {e}")
-        # Make UAVs semi-transparent for multi-UAV visualization
-        try:
-            self._configure_uav_transparency(alpha=0.0)
-        except Exception as e:
-            carb.log_warn(f"Transparency setup failed: {e}")
+        if DISABLE_UAV_UAV_COLLISION:
+            try:
+                self._configure_collision_filtering()
+            except Exception as e:
+                carb.log_warn(f"Collision filtering setup failed: {e}")
+
+            self.world.reset()
+
+        if UAV_TRANSPARENCY_ENABLE:
+            try:
+                self._configure_uav_transparency(alpha=UAV_TRANSPARENCY_ALPHA)
+            except Exception as e:
+                carb.log_warn(f"Transparency setup failed: {e}")
 
     def _iter_uav_colliders(self, prim_root: Usd.Prim):
         for prim in Usd.PrimRange(prim_root):
             try:
-                if UsdPhysics.CollisionAPI(prim):
+                if prim.HasAPI(UsdPhysics.CollisionAPI) or prim.HasAPI(PhysxSchema.PhysxCollisionAPI):
                     yield prim
             except Exception:
                 continue
@@ -286,13 +372,6 @@ class MultiUAVManager:
     def _configure_collision_filtering(self):
         stage = omni.usd.get_context().get_stage()
         carb.log_info("[CollisionFiltering] start")
-        vm = None
-        try:
-            from pegasus.simulator.logic.vehicle_manager import VehicleManager
-            vm = VehicleManager.get_vehicle_manager()
-        except Exception as e:
-            carb.log_warn(f"[CollisionFiltering] VehicleManager unavailable: {e}")
-            vm = None
         root = stage.GetDefaultPrim()
         if not root:
             root = stage.GetPrimAtPath("/World")
@@ -305,10 +384,18 @@ class MultiUAVManager:
         carb.log_info(f"[CollisionFiltering] groups created: {uav_group_path} , {world_group_path}")
         try:
             rel = uav_group.CreateFilteredGroupsRel()
-            rel.AddTarget(uav_group_path)
+            rel.SetTargets([uav_group_path])
             carb.log_info("[CollisionFiltering] UAVGroup self-filter applied")
         except Exception as e:
             carb.log_warn(f"[CollisionFiltering] set self-filter failed: {e}")
+
+        uav_coll_api = uav_group.GetCollidersCollectionAPI()
+        uav_includes = uav_coll_api.GetIncludesRel()
+        world_coll_api = world_group.GetCollidersCollectionAPI()
+        world_includes = world_coll_api.GetIncludesRel()
+        uav_includes.SetTargets([])
+        world_includes.SetTargets([])
+
         assigned_uav = 0
         for v in self.config.get("vehicles", []):
             vid = int(v.get("vehicle_id", 0))
@@ -320,14 +407,7 @@ class MultiUAVManager:
             local_count = 0
             for col in self._iter_uav_colliders(prim_root):
                 try:
-                    api = UsdPhysics.CollisionAPI(col)
-                    if not api:
-                        api = UsdPhysics.CollisionAPI.Apply(col)
-                    # Use CollisionGroup's collection API to add membership
-                    coll_api = uav_group.GetCollidersCollectionAPI()
-                    # Author membership include for this collider prim
-                    includes = coll_api.GetIncludesRel()
-                    includes.AddTarget(col.GetPath())
+                    uav_includes.AddTarget(col.GetPath())
                     local_count += 1
                 except Exception as e:
                     carb.log_warn(f"[CollisionFiltering] assign UAV collider failed at {col.GetPath()}: {e}")
@@ -342,13 +422,12 @@ class MultiUAVManager:
                 ppath = prim.GetPath().pathString
                 if any(ppath.startswith(f"/World/{ns}") for ns in uav_ns_set):
                     continue
-                api = UsdPhysics.CollisionAPI(prim)
-                if api:
-                    coll_api = world_group.GetCollidersCollectionAPI()
-                    includes = coll_api.GetIncludesRel()
-                    includes.AddTarget(prim.GetPath())
-                    assigned_world += 1
-            except Exception:
+                if not prim.HasAPI(UsdPhysics.CollisionAPI) and not prim.HasAPI(PhysxSchema.PhysxCollisionAPI):
+                    continue
+                world_includes.AddTarget(prim.GetPath())
+                assigned_world += 1
+            except Exception as e:
+                carb.log_warn(f"[CollisionFiltering] assign World collider failed at {prim.GetPath()}: {e}")
                 continue
         carb.log_info(f"[CollisionFiltering] summary: UAV colliders={assigned_uav}, World colliders={assigned_world}")
 
@@ -798,30 +877,21 @@ class PegasusApp:
 
     def _iter_uav_colliders(self, prim_root: Usd.Prim):
         for prim in Usd.PrimRange(prim_root):
-            try:
-                if UsdPhysics.CollisionAPI(prim):
-                    yield prim
-            except Exception:
-                continue
+            if prim.HasAPI(UsdPhysics.CollisionAPI) or prim.HasAPI(PhysxSchema.PhysxCollisionAPI):
+                yield prim
 
     def _iter_uav_gprims(self, prim_root: Usd.Prim):
         for prim in Usd.PrimRange(prim_root):
-            try:
-                gp = UsdGeom.Gprim(prim)
-                if gp:
-                    yield gp
-            except Exception:
-                continue
+            gp = UsdGeom.Gprim(prim)
+            if gp:
+                yield gp
 
     def _configure_collision_filtering(self):
+        mgr = getattr(self, "manager", None)
+        if mgr is not None and hasattr(mgr, "_configure_collision_filtering"):
+            return mgr._configure_collision_filtering()
+
         stage = omni.usd.get_context().get_stage()
-        vm = None
-        try:
-            from pegasus.simulator.logic.vehicle_manager import VehicleManager
-            vm = VehicleManager.get_vehicle_manager()
-        except Exception:
-            vm = None
-        # Define two collision groups: UAVGroup and WorldGroup
         root = stage.GetDefaultPrim()
         if not root:
             root = stage.GetPrimAtPath("/World")
@@ -830,47 +900,45 @@ class PegasusApp:
         world_group_path = base.AppendChild("WorldCollisionGroup")
         uav_group = UsdPhysics.CollisionGroup.Define(stage, uav_group_path)
         world_group = UsdPhysics.CollisionGroup.Define(stage, world_group_path)
-        # Rule: UAVGroup should NOT collide with UAVGroup, BUT should collide with WorldGroup
-        # Implement by setting filters on the UAV group
         try:
-            # Exclude self-group collisions
             rel = uav_group.CreateFilteredGroupsRel()
-            rel.AddTarget(uav_group_path)
+            rel.SetTargets([uav_group_path])
         except Exception:
             carb.log_warn(traceback.format_exc())
-        # Assign all UAV colliders to UAVGroup; environment colliders to WorldGroup
-        # UAVs live under /World/uavX
-        # Environment assumed to be everything else under /World with collision API
-        # 1) Assign UAV colliders
-        for v in self.config.get("vehicles", []):
+
+        uav_coll_api = uav_group.GetCollidersCollectionAPI()
+        uav_includes = uav_coll_api.GetIncludesRel()
+        world_coll_api = world_group.GetCollidersCollectionAPI()
+        world_includes = world_coll_api.GetIncludesRel()
+        uav_includes.SetTargets([])
+        world_includes.SetTargets([])
+
+        cfg = None
+        try:
+            cfg = getattr(getattr(self, "manager", None), "config", None)
+        except Exception:
+            cfg = None
+        if cfg is None:
+            cfg = load_config_strict()
+
+        for v in cfg.get("vehicles", []):
             vid = int(v.get("vehicle_id", 0))
             ns = v.get("ros2_namespace", f"uav{vid}")
             prim_root = stage.GetPrimAtPath(f"/World/{ns}")
             if not prim_root or not prim_root.IsValid():
                 continue
             for col in self._iter_uav_colliders(prim_root):
-                try:
-                    api = UsdPhysics.CollisionAPI(col)
-                    if not api:
-                        api = UsdPhysics.CollisionAPI.Apply(col)
-                    grp_rel = api.CreateCollisionGroupRel()
-                    grp_rel.SetTargets([uav_group_path])
-                except Exception:
-                    continue
-        # 2) Assign environment colliders (World excluding UAV namespaces)
+                uav_includes.AddTarget(col.GetPath())
+
         world_prim = stage.GetPrimAtPath("/World")
-        uav_ns_set = {v.get("ros2_namespace", f"uav{int(v.get('vehicle_id',0))}") for v in self.config.get("vehicles", [])}
+        uav_ns_set = {v.get("ros2_namespace", f"uav{int(v.get('vehicle_id',0))}") for v in cfg.get("vehicles", [])}
         for prim in Usd.PrimRange(world_prim):
-            try:
-                ppath = prim.GetPath().pathString
-                if any(ppath.startswith(f"/World/{ns}") for ns in uav_ns_set):
-                    continue
-                api = UsdPhysics.CollisionAPI(prim)
-                if api:
-                    grp_rel = api.CreateCollisionGroupRel()
-                    grp_rel.SetTargets([world_group_path])
-            except Exception:
+            ppath = prim.GetPath().pathString
+            if any(ppath.startswith(f"/World/{ns}") for ns in uav_ns_set):
                 continue
+            if not prim.HasAPI(UsdPhysics.CollisionAPI) and not prim.HasAPI(PhysxSchema.PhysxCollisionAPI):
+                continue
+            world_includes.AddTarget(prim.GetPath())
 
     def _configure_uav_transparency(self, alpha: float = 0.35):
         alpha = float(max(0.0, min(alpha, 1.0)))

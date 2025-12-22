@@ -257,7 +257,7 @@ def main():
     parser.add_argument("--console-logs", action="store_true", default=True, help="Stream child logs to console with prefixes while saving to files")
     parser.add_argument("--ready-timeout", type=float, default=500.0, help="Timeout for waiting for process to be ready (seconds)")
     parser.add_argument("--kill-isaac", action="store_true", help="启动前杀掉已有 Isaac Sim 进程")
-    parser.add_argument("--parallel", type=int, default=3, help="控制器并行分组数（每组内顺序等待 OFFBOARD）")
+    parser.add_argument("--parallel", type=int, default=4, help="控制器并行分组数（每组内顺序等待 OFFBOARD）")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -373,15 +373,15 @@ def main():
             with urllib.request.urlopen(req_hr, timeout=15) as resp:
                 _ = resp.read()
             time.sleep(1.0)
-            url_rl = f"{base_url}/uav/{vid}/px4/relaunch"
-            req_rl = urllib.request.Request(url_rl, data=b"{}", method="POST")
-            req_rl.add_header("Content-Type", "application/json")
-            with urllib.request.urlopen(req_rl, timeout=15) as resp:
-                _ = resp.read()
-            print(f"[PX4] UAV{vid} hard_reset + relaunch requested")
+            # url_rl = f"{base_url}/uav/{vid}/px4/relaunch"
+            # req_rl = urllib.request.Request(url_rl, data=b"{}", method="POST")
+            # req_rl.add_header("Content-Type", "application/json")
+            # with urllib.request.urlopen(req_rl, timeout=15) as resp:
+            #     _ = resp.read()
+            print(f"[PX4] UAV{vid} hard_reset requested")
             return True
         except Exception as e:
-            print(f"[PX4] UAV{vid} reset/relaunch failed: {e}")
+            print(f"[PX4] UAV{vid} hard_reset failed: {e}")
             return False
 
     if args.pre_clean:
@@ -661,7 +661,26 @@ def main():
         t.start()
     for t in threads:
         t.join()
-            
+        
+    print(f"[INFO] 正在确认所有飞机起飞状态（Takeoff complete）... | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    for p in list(procs):
+        if getattr(p, "_is_controller", False):
+            ctrl_log = getattr(p, "_log_path", None)
+            ctrl_ns = getattr(p, "_mavros_ns", "unknown")
+            if ctrl_log:
+                # 阻塞直到该架飞机完成起飞
+                ok_takeoff = wait_log_count(
+                    ctrl_log, 
+                    r"Takeoff complete", 
+                    1, 
+                    timeout=float(args.ready_timeout), 
+                    interval=1.0, 
+                    label=f"Final sync: {ctrl_ns} Takeoff complete"
+                )
+                if not ok_takeoff:
+                    print(f"[WARN] {ctrl_ns} 未能在超时时间内完成起飞，将继续执行后续检查。")
+    
+    print(f"[INFO] 所有飞机已确认起飞完成！准备进入端口健康检测阶段。 | 耗时: {int(time.time() - t_start)}s")
     print(f"[INFO] 等待所有控制器HTTP端口就绪（Healthy）：{expected_aircraft} 架 | 当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')} | 耗时: {int(time.time() - t_start)}s")
     # 循环检测，直到所有端口健康检查通过
     NS_PORT_MAP = {}
