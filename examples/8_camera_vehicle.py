@@ -1011,9 +1011,9 @@ class PegasusApp:
                 carb.log_warn(f"HTTP reset error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
                 return jsonify({"error": str(e), "endpoint": "reset"}), 500
 
-        @app.route('/uav/<int:uav_id>/px4/hard_reset', methods=['POST'])
-        def px4_hard_reset_route(uav_id: int):
-            """硬重启 PX4（仅重启 PX4 进程，不涉及 MAVROS）"""
+        @app.route('/uav/<int:uav_id>/px4/recover', methods=['POST'])
+        def px4_recover_route(uav_id: int):
+            """PX4 崩溃恢复（原子操作，替代 hard_reset 和 relaunch）"""
             try:
                 vehicle = self._get_vehicle(uav_id)
                 if vehicle is None:
@@ -1026,39 +1026,14 @@ class PegasusApp:
                             break
                     if backend is None:
                         return jsonify({"status": "error", "message": "PX4 backend not found"}), 404
-                    backend.hard_reboot_px4()
+                    backend.recover_px4()
                 except Exception as e:
-                    carb.log_warn(f"HTTP px4 hard_reset exec_error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
-                    return jsonify({"status": "error", "message": f"px4 hard reset failed: {e}"}), 500
-                return jsonify({"status": "success", "uav_id": uav_id, "message": "px4 hard reset ok"})
+                    carb.log_warn(f"HTTP px4 recover exec_error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                    return jsonify({"status": "error", "message": f"px4 recover failed: {e}"}), 500
+                return jsonify({"status": "success", "uav_id": uav_id, "message": "px4 recover ok"})
             except Exception as e:
-                carb.log_warn(f"HTTP px4 hard_reset error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
-                return jsonify({"error": str(e), "endpoint": "px4/hard_reset"}), 500
-
-        @app.route('/uav/<int:uav_id>/px4/relaunch', methods=['POST'])
-        def px4_relaunch_route(uav_id: int):
-            """重新启动 PX4（软重启并重新启动）"""
-            try:
-                vehicle = self._get_vehicle(uav_id)
-                if vehicle is None:
-                    return jsonify({"status": "error", "message": f"Vehicle /World/uav{uav_id} not found"}), 404
-                try:
-                    backend = None
-                    for b in getattr(vehicle, "_backends", []):
-                        if isinstance(b, PX4MavlinkBackend):
-                            backend = b
-                            break
-                    if backend is None:
-                        return jsonify({"status": "error", "message": "PX4 backend not found"}), 404
-                    backend.soft_relaunch_px4()
-                    backend.start()
-                except Exception as e:
-                    carb.log_warn(f"HTTP px4 relaunch exec_error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
-                    return jsonify({"status": "error", "message": f"px4 relaunch failed: {e}"}), 500
-                return jsonify({"status": "success", "uav_id": uav_id, "message": "px4 relaunch ok"})
-            except Exception as e:
-                carb.log_warn(f"HTTP px4 relaunch error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
-                return jsonify({"error": str(e), "endpoint": "px4/relaunch"}), 500
+                carb.log_warn(f"HTTP px4 recover error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                return jsonify({"error": str(e), "endpoint": "px4/recover"}), 500
 
         @app.route('/uav/<int:uav_id>/px4/ready', methods=['GET'])
         def px4_ready_route(uav_id: int):
@@ -1083,6 +1058,56 @@ class PegasusApp:
             except Exception as e:
                 carb.log_warn(f"HTTP px4 ready error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
                 return jsonify({"error": str(e), "endpoint": "px4/ready", "ready": False}), 500
+
+        @app.route('/uav/<int:uav_id>/px4/status', methods=['GET'])
+        def px4_status_route(uav_id: int):
+            """查询 PX4 后端详细状态（用于调试和状态机检测）"""
+            try:
+                vehicle = self._get_vehicle(uav_id)
+                if vehicle is None:
+                    return jsonify({"status": "error", "message": f"Vehicle /World/uav{uav_id} not found"}), 404
+                try:
+                    backend = None
+                    for b in getattr(vehicle, "_backends", []):
+                        if isinstance(b, PX4MavlinkBackend):
+                            backend = b
+                            break
+                    if backend is None:
+                        return jsonify({"status": "error", "message": "PX4 backend not found"}), 404
+
+                    # 收集 PX4 后端状态
+                    px4_status = {
+                        "uav_id": uav_id,
+                        "is_running": getattr(backend, "_is_running", False),
+                        "connection_port": getattr(backend, "_connection_port", ""),
+                        "mavlink_connected": backend._connection is not None,
+                        "received_first_heartbeat": getattr(backend, "_received_first_hearbeat", False),
+                        "received_first_actuator": getattr(backend, "_received_first_actuator", False),
+                        "received_actuator": getattr(backend, "_received_actuator", False),
+                        "px4_ready_to_takeoff": backend.px4_ready_to_takeoff,
+                        "enable_lockstep": getattr(backend, "_enable_lockstep", False),
+                        "px4_autolaunch": getattr(backend, "px4_autolaunch", False),
+                    }
+
+                    # PX4 进程状态
+                    px4_tool = getattr(backend, "px4_tool", None)
+                    if px4_tool is not None:
+                        px4_process = getattr(px4_tool, "px4_process", None)
+                        px4_status["px4_process_alive"] = px4_process is not None and px4_process.poll() is None
+                        px4_status["px4_process_pid"] = px4_process.pid if px4_process else None
+                        px4_status["px4_log_file"] = getattr(px4_tool, "_log_file_path", "")
+                    else:
+                        px4_status["px4_process_alive"] = False
+                        px4_status["px4_process_pid"] = None
+                        px4_status["px4_log_file"] = ""
+
+                    return jsonify({"status": "success", "px4_backend": px4_status})
+                except Exception as e:
+                    carb.log_warn(f"HTTP px4 status exec_error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                    return jsonify({"status": "error", "message": f"px4 status check failed: {e}"}), 500
+            except Exception as e:
+                carb.log_warn(f"HTTP px4 status error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                return jsonify({"error": str(e), "endpoint": "px4/status"}), 500
 
     def _png_bytes_and_b64(self, img):
         arr = np.array(img)

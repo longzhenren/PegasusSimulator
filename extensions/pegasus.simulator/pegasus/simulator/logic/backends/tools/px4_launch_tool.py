@@ -1,3 +1,5 @@
+# Copyright (c) 2024-2026 amurzzb@gmail.com
+# Licensed under the MIT License
 """
 PX4 启动工具（px4_launch_tool.py）
 
@@ -160,6 +162,25 @@ import traceback
 import signal
 import threading
 import time
+from datetime import datetime
+
+
+def ts_log(prefix: str, message: str, level: str = "INFO") -> str:
+    """
+    生成带时间戳的日志消息并输出
+
+    Args:
+        prefix: 日志前缀（如 [PX4LaunchTool uav0]）
+        message: 日志内容
+        level: 日志级别 (INFO, WARN, ERROR, DEBUG)
+
+    Returns:
+        格式化的日志字符串
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    log_msg = f"[{timestamp}] [{level}] {prefix} {message}"
+    print(log_msg)
+    return log_msg
 
 
 PX4_PID_DIR = "/tmp/pegasus_px4_sitl"
@@ -173,21 +194,21 @@ def _get_default_log_dir():
         try:
             os.makedirs(log_dir, exist_ok=True)
             return log_dir
-        except Exception:
-            pass
+        except Exception as e:
+            ts_log("[PX4LaunchTool]", f"Failed to create session log dir: {e}", "WARN")
     # 回退到 /tmp
     fallback = "/tmp/pegasus_px4_logs"
     try:
         os.makedirs(fallback, exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        ts_log("[PX4LaunchTool]", f"Failed to create fallback log dir: {e}", "WARN")
     return fallback
 
 try:
     os.makedirs(PX4_PID_DIR, exist_ok=True)
 except Exception as e:
-    print(f"[PX4LaunchTool] Create PID dir failed: {e}")
-    print(traceback.format_exc())
+    ts_log("[PX4LaunchTool]", f"Create PID dir failed: {e}", "ERROR")
+    ts_log("[PX4LaunchTool]", traceback.format_exc(), "ERROR")
 
 
 class PX4LaunchTool:
@@ -207,7 +228,8 @@ class PX4LaunchTool:
             log_dir (str): Directory to save PX4 logs. If None, uses default from environment.
         """
 
-        print(f"[PX4LaunchTool] vehicle_id={vehicle_id}")
+        self._log_prefix = f"[PX4LaunchTool uav{vehicle_id}]"
+        ts_log(self._log_prefix, f"Initializing, vehicle_id={vehicle_id}")
         # Attribute that will hold the px4 process once it is running
         self.px4_process = None
 
@@ -283,7 +305,7 @@ class PX4LaunchTool:
             old_val = self._ready_to_takeoff
             self._ready_to_takeoff = value
             if value and not old_val:
-                print(f"[PX4LaunchTool uav{self.vehicle_id}] Ready to takeoff detected!")
+                ts_log(self._log_prefix, "Ready to takeoff detected!")
 
     def _log_monitor_worker(self):
         """日志监控线程，检测 'Ready for takeoff' 关键字"""
@@ -297,7 +319,7 @@ class PX4LaunchTool:
                 time.sleep(0.1)
                 wait_count += 1
                 if wait_count > 100:  # 10秒超时
-                    print(f"[PX4LaunchTool uav{self.vehicle_id}] Log file not created after 10s")
+                    ts_log(self._log_prefix, "Log file not created after 10s", "WARN")
                     return
 
             with open(self._log_file_path, "r") as f:
@@ -312,8 +334,8 @@ class PX4LaunchTool:
                         # 没有新内容，短暂等待
                         time.sleep(0.05)
         except Exception as e:
-            print(f"[PX4LaunchTool uav{self.vehicle_id}] Log monitor error: {e}")
-            print(traceback.format_exc())
+            ts_log(self._log_prefix, f"Log monitor error: {e}", "ERROR")
+            ts_log(self._log_prefix, traceback.format_exc(), "ERROR")
 
     def _start_log_monitor(self):
         """启动日志监控线程"""
@@ -351,7 +373,7 @@ class PX4LaunchTool:
                     if os.path.exists(dst_folder):
                         shutil.rmtree(dst_folder)
                     shutil.copytree(src_folder, dst_folder)
-            print(f"[uav{self.vehicle_id}] Logs saved to: {save_path}")
+            ts_log(self._log_prefix, f"Logs saved to: {save_path}")
 
 
     def launch_px4(self):
@@ -370,16 +392,18 @@ class PX4LaunchTool:
         if os.path.exists(pid_path):
             try:
                 os.remove(pid_path)
-                print(f"[PX4LaunchTool uav{self.vehicle_id}] Removed stale PID file: {pid_path}")
+                ts_log(self._log_prefix, f"Removed stale PID file: {pid_path}")
             except Exception as e:
-                print(f"[PX4LaunchTool uav{self.vehicle_id}] Failed to remove stale PID: {e}")
+                ts_log(self._log_prefix, f"Failed to remove stale PID: {e}", "WARN")
+                ts_log(self._log_prefix, traceback.format_exc(), "WARN")
 
         # 打开日志文件用于输出
         try:
             self._log_file = open(self._log_file_path, "w")
-            print(f"[PX4LaunchTool uav{self.vehicle_id}] PX4 log will be saved to: {self._log_file_path}")
+            ts_log(self._log_prefix, f"PX4 log will be saved to: {self._log_file_path}")
         except Exception as e:
-            print(f"[PX4LaunchTool uav{self.vehicle_id}] Failed to open log file: {e}")
+            ts_log(self._log_prefix, f"Failed to open log file: {e}", "ERROR")
+            ts_log(self._log_prefix, traceback.format_exc(), "ERROR")
             self._log_file = None
 
         # 启动日志监控线程
@@ -405,15 +429,16 @@ class PX4LaunchTool:
             pid = int(self.px4_process.pid)
             with open(self.pid_file_path(self.vehicle_id), "w") as f:
                 f.write(str(pid))
-            print(f"[PX4LaunchTool uav{self.vehicle_id}] PX4 launched, pid={pid}, log={self._log_file_path}")
+            ts_log(self._log_prefix, f"PX4 launched, pid={pid}, log={self._log_file_path}")
         except Exception as e:
-            print(f"[PX4LaunchTool] Write PID failed: {e}")
-            print(traceback.format_exc())
+            ts_log(self._log_prefix, f"Write PID failed: {e}", "ERROR")
+            ts_log(self._log_prefix, traceback.format_exc(), "ERROR")
 
     def kill_px4(self):
         """
         Method that will kill a px4 instance with the specified configuration
         """
+        ts_log(self._log_prefix, "Killing PX4 process (hard kill)")
         # 停止日志监控
         self._stop_log_monitor()
 
@@ -425,8 +450,8 @@ class PX4LaunchTool:
         if self._log_file is not None:
             try:
                 self._log_file.close()
-            except:
-                pass
+            except Exception as e:
+                ts_log(self._log_prefix, f"Failed to close log file: {e}", "WARN")
             self._log_file = None
 
         try:
@@ -434,29 +459,32 @@ class PX4LaunchTool:
             if os.path.exists(p):
                 os.remove(p)
         except Exception as e:
-            print(f"[PX4LaunchTool] Remove PID file failed: {e}")
-            print(traceback.format_exc())
+            ts_log(self._log_prefix, f"Remove PID file failed: {e}", "WARN")
+            ts_log(self._log_prefix, traceback.format_exc(), "WARN")
 
         # 重置 ready 状态
         self._set_ready_to_takeoff(False)
+        ts_log(self._log_prefix, "PX4 process killed")
 
     def kill_px4_save(self):
         """
         优雅地关闭 PX4 以保存日志
         """
+        ts_log(self._log_prefix, "Gracefully shutting down PX4 (save logs)")
         # 停止日志监控
         self._stop_log_monitor()
 
         if self.px4_process is not None:
-            print(f"[uav{self.vehicle_id}] Sending SIGINT for graceful shutdown...")
+            ts_log(self._log_prefix, "Sending SIGINT for graceful shutdown...")
             # 1. 发送中断信号，让 PX4 执行清理逻辑（保存日志）
             self.px4_process.send_signal(signal.SIGINT)
             try:
                 # 2. 等待进程正常结束（最多等 10 秒）
                 self.px4_process.wait(timeout=10)
+                ts_log(self._log_prefix, "PX4 exited gracefully")
             except subprocess.TimeoutExpired:
                 # 如果超时还没关掉，再强制杀掉
-                print(f"[uav{self.vehicle_id}] Shutdown timed out, forcing kill.")
+                ts_log(self._log_prefix, "Shutdown timed out, forcing kill", "WARN")
                 self.px4_process.kill()
             # 3. 【关键步骤】将日志从临时目录拷贝到永久目录
             self._save_logs()
@@ -466,8 +494,8 @@ class PX4LaunchTool:
         if self._log_file is not None:
             try:
                 self._log_file.close()
-            except:
-                pass
+            except Exception as e:
+                ts_log(self._log_prefix, f"Failed to close log file: {e}", "WARN")
             self._log_file = None
 
         # 清理 PID 文件
@@ -476,11 +504,12 @@ class PX4LaunchTool:
             if os.path.exists(p):
                 os.remove(p)
         except Exception as e:
-            print(f"[PX4LaunchTool] Remove PID file failed: {e}")
-            print(traceback.format_exc())
+            ts_log(self._log_prefix, f"Remove PID file failed: {e}", "WARN")
+            ts_log(self._log_prefix, traceback.format_exc(), "WARN")
 
         # 重置 ready 状态
         self._set_ready_to_takeoff(False)
+        ts_log(self._log_prefix, "PX4 shutdown complete")
 
     def __del__(self):
         """
@@ -505,10 +534,10 @@ def main():
     import time
 
     # 等待 ready to takeoff
-    print("Waiting for ready to takeoff...")
+    ts_log("[main]", "Waiting for ready to takeoff...")
     for i in range(60):
         if px4_tool.ready_to_takeoff:
-            print(f"Ready to takeoff after {i} seconds!")
+            ts_log("[main]", f"Ready to takeoff after {i} seconds!")
             break
         time.sleep(1)
 

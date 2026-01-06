@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2024-2026 amurzzb@gmail.com
+# Licensed under the MIT License
 """
 轨迹数据采集器（trajectory_data_collector.py）
 
@@ -289,6 +291,25 @@ from geometry_msgs.msg import PoseStamped, TwistStamped, TwistWithCovarianceStam
 from mavros_msgs.msg import State, ExtendedState, Waypoint, WaypointReached
 from mavros_msgs.srv import CommandBool, SetMode, CommandLong, WaypointPush, WaypointClear
 from rosidl_runtime_py.convert import message_to_ordereddict
+from datetime import datetime
+
+
+def ts_log(prefix: str, message: str, level: str = "INFO") -> str:
+    """
+    生成带时间戳的日志消息并输出
+
+    Args:
+        prefix: 日志前缀（如 [MavrosCommander]）
+        message: 日志内容
+        level: 日志级别 (INFO, WARN, ERROR, DEBUG)
+
+    Returns:
+        格式化的日志字符串
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    log_msg = f"[{timestamp}] [{level}] {prefix} {message}"
+    print(log_msg, flush=True)
+    return log_msg
 
 
 @dataclass(frozen=True)
@@ -303,9 +324,10 @@ class TrajPoint:
 
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+
 def _log_exc(context: str, e: BaseException) -> None:
-    print(f"[WARN] {context} err={e}")
-    print(traceback.format_exc())
+    ts_log("[Exception]", f"{context} err={e}", "WARN")
+    ts_log("[Exception]", traceback.format_exc(), "WARN")
 
 
 def _is_local_url(url: str) -> bool:
@@ -401,7 +423,7 @@ def _load_init_point_xyz(json_path: Path) -> TrajPoint:
     if not isinstance(init, (list, tuple)) or len(init) < 3:
         raise ValueError("missing init point")
     try:
-        print(f"init point: {init}")
+        ts_log("[InitPoint]", f"init point: {init}", "DEBUG")
         if len(init) < 6:
             raise ValueError(f"init point expects [x,y,z,roll,yaw,pitch], got len={len(init)}")
         x = float(init[0])
@@ -869,13 +891,13 @@ class MavrosCommander:
             now = time.time()
             if now - last_log_time >= log_interval:
                 status = self.get_ready_status()
-                print(f"[MavrosCommander UAV{self.uav_id}] waiting ready_to_takeoff: {status}")
+                ts_log(f"[MavrosCommander UAV{self.uav_id}]", f"waiting ready_to_takeoff: {status}")
                 last_log_time = now
 
             time.sleep(0.2)
 
         status = self.get_ready_status()
-        print(f"[MavrosCommander UAV{self.uav_id}] wait_ready_to_takeoff timeout, status={status}")
+        ts_log(f"[MavrosCommander UAV{self.uav_id}]", f"wait_ready_to_takeoff timeout, status={status}", "WARN")
         return False
 
     def _call_service(self, client, req, timeout_s: float, max_retries: int = 3):
@@ -1094,11 +1116,11 @@ class MavrosMonitor:
             self._died_since = None
             self.failed_due_to_death = False
             self.recording = True
-        print(f"[MavrosMonitor] Started recording for UAV{self.uav_id}")
+        ts_log(f"[MavrosMonitor UAV{self.uav_id}]", "Started recording")
 
     def stop_recording(self):
         self.recording = False
-        print(f"[MavrosMonitor] Stopped recording for UAV{self.uav_id}, buffer_size={len(self.data_buffer)}")
+        ts_log(f"[MavrosMonitor UAV{self.uav_id}]", f"Stopped recording, buffer_size={len(self.data_buffer)}")
         with self.lock:
             return list(self.data_buffer), self.failed_due_to_death
 
@@ -1142,9 +1164,9 @@ class Worker:
         self.commander = commander
         self.status_log_path = status_log_path
 
-    def _log(self, msg: str) -> None:
+    def _log(self, msg: str, level: str = "INFO") -> None:
         with self.print_lock:
-            print(msg, flush=True)
+            ts_log(f"[Worker UAV{self.uav_id}]", msg, level)
 
     def _notify_controller_ready(self, ready: bool) -> bool:
         """通知控制器 PX4 ready 状态"""
@@ -1655,24 +1677,24 @@ def main() -> None:
             try:
                 pts = _load_preprocessed_xyz(fp)
                 total_pts += len(pts)
-                print(f"{fp}: {len(pts)} points")
+                ts_log("[DryRun]", f"{fp}: {len(pts)} points")
             except Exception as e:
-                print(f"{fp}: error {e}")
-        print(f"files={len(json_files)} total_points={total_pts}")
+                ts_log("[DryRun]", f"{fp}: error {e}", "ERROR")
+        ts_log("[DryRun]", f"files={len(json_files)} total_points={total_pts}")
         return
 
     # Init ROS2 if available
     ros_node = None
     spin_thread = None
     monitors: Dict[int, MavrosMonitor] = {}
-    
+
     if rclpy:
         try:
             rclpy.init()
             ros_node = CollectorNode()
-            print("ROS2 node initialized.")
+            ts_log("[Main]", "ROS2 node initialized")
         except Exception as e:
-            print(f"Failed to initialize ROS2: {e}")
+            ts_log("[Main]", f"Failed to initialize ROS2: {e}", "ERROR")
 
     if args.uav_ids.strip():
         uav_ids = sorted(set(int(x.strip()) for x in args.uav_ids.split(",") if x.strip()))
@@ -1684,19 +1706,19 @@ def main() -> None:
         for vid in uav_ids:
             try:
                 monitors[vid] = MavrosMonitor(ros_node, vid, freq=20.0)
-                print(f"Created MavrosMonitor for UAV{vid}")
+                ts_log("[Main]", f"Created MavrosMonitor for UAV{vid}")
             except Exception as e:
-                print(f"Failed to create monitor for UAV{vid}: {e}")
+                ts_log("[Main]", f"Failed to create monitor for UAV{vid}: {e}", "ERROR")
 
     # Start spinning
     if ros_node:
         def _spin():
             try:
-                print("Starting ROS2 spin...")
+                ts_log("[ROS2]", "Starting ROS2 spin...")
                 rclpy.spin(ros_node)
-                print("ROS2 spin finished.")
+                ts_log("[ROS2]", "ROS2 spin finished")
             except Exception as e:
-                print(f"ROS2 spin error: {e}")
+                ts_log("[ROS2]", f"ROS2 spin error: {e}", "ERROR")
         spin_thread = threading.Thread(target=_spin, name="ros_spin", daemon=True)
         spin_thread.start()
 
@@ -1728,7 +1750,7 @@ def main() -> None:
             try:
                 commander = MavrosCommander(ros_node, vid)
             except Exception as e:
-                print(f"Failed to create commander for UAV{vid}: {e}")
+                ts_log("[Main]", f"Failed to create commander for UAV{vid}: {e}", "ERROR")
         w = Worker(
             uav_id=vid,
             control_base=control_base,

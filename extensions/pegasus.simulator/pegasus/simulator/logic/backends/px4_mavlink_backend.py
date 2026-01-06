@@ -1,3 +1,5 @@
+# Copyright (c) 2024-2026 amurzzb@gmail.com
+# Licensed under the MIT License
 """
 PX4 MAVLink 后端（px4_mavlink_backend.py）
 
@@ -219,18 +221,46 @@ multirotor_config.backends = [backend]
 | Description: File that implements the Mavlink Backend for communication/control with/of the vehicle simulation
 | License: BSD-3-Clause. Copyright (c) 2023, Marcelo Jacinto. All rights reserved.
 """
-__all__ = ["PX4MavlinkBackend", "PX4MavlinkBackendConfig"]
+__all__ = ["PX4MavlinkBackend", "PX4MavlinkBackendConfig", "ts_log", "_wait_for_port_release", "_is_port_in_use"]
 
 import carb
 import time
 import traceback
 import numpy as np
+from datetime import datetime
 from pymavlink import mavutil
 
 from pegasus.simulator.logic.state import State
 from pegasus.simulator.logic.backends.backend import Backend, BackendConfig
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 from pegasus.simulator.logic.backends.tools.px4_launch_tool import PX4LaunchTool
+
+
+def ts_log(prefix: str, message: str, level: str = "INFO") -> str:
+    """
+    生成带时间戳的日志消息并输出到 carb 日志
+
+    Args:
+        prefix: 日志前缀（如 [uav0]）
+        message: 日志内容
+        level: 日志级别 (INFO, WARN, ERROR, DEBUG)
+
+    Returns:
+        格式化的日志字符串
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    log_msg = f"[{timestamp}] {prefix} {message}"
+
+    if level == "ERROR":
+        carb.log_error(log_msg)
+    elif level == "WARN":
+        carb.log_warn(log_msg)
+    elif level == "DEBUG":
+        carb.log_info(log_msg)  # carb 没有 debug 级别
+    else:
+        carb.log_info(log_msg)
+
+    return log_msg
 
 
 def _is_port_in_use(port: int) -> bool:
@@ -842,118 +872,164 @@ class PX4MavlinkBackend(Backend):
                 try:
                     self.px4_tool.kill_px4()
                 except Exception as e:
-                    carb.log_warn(f"{self._log_prefix} PX4 kill failed: {e}")
-                    carb.log_warn(traceback.format_exc())
+                    ts_log(self._log_prefix, f"PX4 kill failed: {e}", "WARN")
+                    ts_log(self._log_prefix, traceback.format_exc(), "WARN")
             # Internal MAVROS termination disabled
             self.px4_tool = None
 
-    def hard_reboot_px4(self):
-        """Immediately terminate PX4 process for this vehicle and clear registry.
-        The simulator keeps running; other vehicles remain unaffected.
+    def recover_px4(self):
         """
+        PX4 崩溃恢复（原子操作）
+
+        此方法用于 PX4 进程异常退出后的恢复，保持仿真循环运行。
+        关键设计：不重置 _received_first_hearbeat，避免死锁。
+
+        恢复步骤：
+        1. 杀死旧 PX4 进程
+        2. 关闭旧 MAVLink 连接
+        3. 等待端口释放
+        4. 创建新 MAVLink 连接（先于 PX4 启动）
+        5. 启动新 PX4 进程
+        """
+        ts_log(self._log_prefix, "=" * 50)
+        ts_log(self._log_prefix, "Starting PX4 recovery")
+        ts_log(self._log_prefix, "=" * 50)
+
         try:
-            carb.log_info(f"{self._log_prefix} HARD reboot: killing PX4 process")
+            # Step 1: 杀死旧 PX4 进程
+            ts_log(self._log_prefix, "Step 1: Killing old PX4 process...")
             if self.px4_tool is not None:
-                self.px4_tool.kill_px4_save()
+                try:
+                    self.px4_tool.kill_px4_save()
+                    ts_log(self._log_prefix, "PX4 process killed successfully")
+                except Exception as e:
+                    ts_log(self._log_prefix, f"Kill PX4 failed: {e}", "WARN")
+                    ts_log(self._log_prefix, traceback.format_exc(), "WARN")
             else:
+                # 尝试通过 PID 文件杀死
                 import os, signal
                 if os.path.exists(self._px4_pid_path):
-                    with open(self._px4_pid_path, "r") as f:
-                        pid = int(f.read().strip() or "0")
-                    if pid > 0:
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except Exception as e:
-                            carb.log_warn(f"{self._log_prefix} SIGKILL PX4 failed: {e}")
-                            carb.log_warn(traceback.format_exc())
                     try:
-                        os.remove(self._px4_pid_path)
+                        with open(self._px4_pid_path, "r") as f:
+                            pid = int(f.read().strip() or "0")
+                        if pid > 0:
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                                ts_log(self._log_prefix, f"Killed PX4 via PID file (pid={pid})")
+                            except ProcessLookupError:
+                                ts_log(self._log_prefix, f"PX4 process (pid={pid}) already dead")
+                            except Exception as e:
+                                ts_log(self._log_prefix, f"SIGKILL PX4 failed: {e}", "WARN")
+                                ts_log(self._log_prefix, traceback.format_exc(), "WARN")
+                        try:
+                            os.remove(self._px4_pid_path)
+                        except Exception as e:
+                            ts_log(self._log_prefix, f"Remove PX4 pid file failed: {e}", "WARN")
+                            ts_log(self._log_prefix, traceback.format_exc(), "WARN")
                     except Exception as e:
-                        carb.log_warn(f"{self._log_prefix} Remove PX4 pid file failed: {e}")
-                        carb.log_warn(traceback.format_exc())
-        except Exception as e:
-            carb.log_warn(f"{self._log_prefix} HARD reboot encountered error: {e}")
-            carb.log_warn(traceback.format_exc())
+                        ts_log(self._log_prefix, f"Read PID file failed: {e}", "WARN")
+                        ts_log(self._log_prefix, traceback.format_exc(), "WARN")
 
-        # Reset MAVLink interface so ports are free to reconnect
-        try:
-            if self._connection is not None:
-                self._connection.close()
-        except Exception as e:
-            carb.log_warn(f"{self._log_prefix} MAVLink close failed: {e}")
-            carb.log_warn(traceback.format_exc())
-        self._connection = None
-        self._is_running = False
-
-        # 等待端口释放
-        mavlink_port = self.config.connection_baseport + self._vehicle_id
-        carb.log_info(f"{self._log_prefix} Waiting for MAVLink port {mavlink_port} to be released...")
-        if _wait_for_port_release(mavlink_port, timeout=30.0, interval=0.5):
-            carb.log_info(f"{self._log_prefix} MAVLink port {mavlink_port} released")
-        else:
-            carb.log_warn(f"{self._log_prefix} MAVLink port {mavlink_port} release timeout, continuing anyway")
-
-        # 注意: 不要重置 _received_first_hearbeat,避免死锁
-        # 后续 soft_relaunch_px4() 会重新建立连接并继续发送数据
-        # 只重置 actuator 相关状态
-        self._received_first_actuator = False
-        self._received_actuator = False
-        self._last_heartbeat_sent_time = 0
-        self._last_waiting_heartbeat_log_time = 0
-
-    def soft_relaunch_px4(self):
-        """Relaunch PX4 using current config without stopping simulator."""
-        try:
-            carb.log_info(f"{self._log_prefix} Relaunching PX4")
-
-            # 先关闭旧的 MAVLink 连接
-            try:
-                if self._connection is not None:
-                    self._connection.close()
-                    carb.log_info(f"{self._log_prefix} Closed existing MAVLink connection")
-            except Exception as e:
-                carb.log_warn(f"{self._log_prefix} Close MAVLink connection failed: {e}")
-            self._connection = None
-            self._is_running = False
-
-            # 等待端口释放
-            mavlink_port = self.config.connection_baseport + self._vehicle_id
-            carb.log_info(f"{self._log_prefix} Waiting for MAVLink port {mavlink_port} to be released...")
-            if _wait_for_port_release(mavlink_port, timeout=30.0, interval=0.5):
-                carb.log_info(f"{self._log_prefix} MAVLink port {mavlink_port} released")
-            else:
-                carb.log_warn(f"{self._log_prefix} MAVLink port {mavlink_port} release timeout, continuing anyway")
-
-            # Ensure previous pid file is cleared to avoid px4 thinking 'server not running'
-            try:
-                import os
-                if os.path.exists(self._px4_pid_path):
-                    os.remove(self._px4_pid_path)
-            except Exception as e:
-                carb.log_warn(f"{self._log_prefix} Remove stale PID before relaunch failed: {e}")
-                carb.log_warn(traceback.format_exc())
-
-            # 重新初始化 MAVLink 接口（先于 PX4 启动）
-            carb.log_info(f"{self._log_prefix} Re-initializing MAVLink interface...")
-            self.re_initialize_interface()
-            self._is_running = True
-
-            # 创建新的 PX4 工具并启动
-            self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model, self.config.sim_speed_factor, log_dir=self._px4_log_dir)
-            self.px4_tool.launch_px4()
-
-            # 注意: 不要重置 _received_first_hearbeat,让 update() 继续发送传感器数据
-            # 这样 PX4 可以收到数据并发送心跳回来
-            # 重置 actuator 相关状态
+            # Step 1.5: 重置关键标志（必须在关闭连接之前！）
+            # 这样可以防止 poll_mavlink_messages() 使用 blocking=True 模式
+            # 避免物理线程在连接关闭时阻塞或抛出异常
+            ts_log(self._log_prefix, "Step 1.5: Resetting flags before closing connection...")
             self._received_first_actuator = False
             self._received_actuator = False
+            self._is_running = False  # 告诉 update() 我们正在恢复中
+
+            # Step 2: 关闭旧 MAVLink 连接
+            ts_log(self._log_prefix, "Step 2: Closing old MAVLink connection...")
+            if self._connection is not None:
+                try:
+                    self._connection.close()
+                    ts_log(self._log_prefix, "MAVLink connection closed")
+                except Exception as e:
+                    ts_log(self._log_prefix, f"Close MAVLink failed: {e}", "WARN")
+                    ts_log(self._log_prefix, traceback.format_exc(), "WARN")
+            self._connection = None
+
+            # Step 3: 等待端口释放
+            mavlink_port = self.config.connection_baseport + self._vehicle_id
+            ts_log(self._log_prefix, f"Step 3: Waiting for port {mavlink_port} to be released...")
+            if _wait_for_port_release(mavlink_port, timeout=30.0, interval=0.5):
+                ts_log(self._log_prefix, f"Port {mavlink_port} released")
+            else:
+                ts_log(self._log_prefix, f"Port {mavlink_port} release timeout, continuing anyway", "WARN")
+
+            # 清理旧 PID 文件
+            import os
+            if os.path.exists(self._px4_pid_path):
+                try:
+                    os.remove(self._px4_pid_path)
+                    ts_log(self._log_prefix, "Removed stale PID file")
+                except Exception as e:
+                    ts_log(self._log_prefix, f"Remove PID file failed: {e}", "WARN")
+                    ts_log(self._log_prefix, traceback.format_exc(), "WARN")
+
+            # 额外等待确保资源完全释放
+            time.sleep(1.0)
+
+            # Step 4: 创建新 MAVLink 连接（先于 PX4 启动，避免连接竞争）
+            ts_log(self._log_prefix, f"Step 4: Creating MAVLink connection: {self._connection_port}")
+            self._connection = mavutil.mavlink_connection(self._connection_port)
+            ts_log(self._log_prefix, "MAVLink connection created")
+
+            # 重置必要的状态
+            # 关键修复：必须重置 _received_first_hearbeat，否则 update() 中不会调用
+            # wait_for_first_hearbeat()，导致 tcpin 连接不会 accept 新 PX4 的连接
+            self._received_first_hearbeat = False
+            self._received_first_actuator = False
+            self._received_actuator = False
+            # 关键修复：不重置 _sensor_data，保留当前传感器数据
+            # 只重置 new_*_data 标志，让下一次 update_sensor 调用时更新数据
+            self._sensor_data.new_imu_data = False
+            self._sensor_data.new_gps_data = False
+            self._sensor_data.new_bar_data = False
+            self._sensor_data.new_mag_data = False
+            self._sensor_data.new_press_data = False
+            self._sensor_data.new_vision_data = False
+            self._sensor_data.new_sim_state = False
+            # 注意：保留 received_first_imu = True（如果之前已接收过）
+            # 这样 lockstep 机制会正确等待新的 IMU 数据
             self._last_heartbeat_sent_time = 0
 
-            carb.log_info(f"{self._log_prefix} PX4 relaunched, MAVLink interface ready")
+            # 标记为运行状态
+            self._is_running = True
+
+            # Step 5: 启动新 PX4 进程
+            ts_log(self._log_prefix, "Step 5: Launching new PX4 process...")
+            self.px4_tool = PX4LaunchTool(
+                self.px4_dir,
+                self._vehicle_id,
+                self.px4_vehicle_model,
+                self.config.sim_speed_factor,
+                log_dir=self._px4_log_dir
+            )
+            self.px4_tool.launch_px4()
+
+            # 重置启动保护期计时器
+            self._px4_start_time = time.time()
+
+            # Step 6: 设置传感器标志（不等待，因为物理循环被阻塞）
+            # 关键修复：HTTP handler 与物理循环同步，等待会阻塞物理循环，
+            # 导致 PX4 无法收到传感器数据（poll timeout），进入不正常状态
+            ts_log(self._log_prefix, "Step 6: Setting sensor flags (no wait - physics blocked)")
+            self._sensor_data.received_first_imu = True  # 让物理循环恢复后处理
+
+            # Step 7: 跳过等待（物理循环恢复后会处理连接）
+            # 关键修复：不要在这里等待，因为物理循环被阻塞，PX4 无法发送 heartbeat
+            # 物理循环恢复后，update() 会调用 wait_for_first_hearbeat() 接受连接
+            ts_log(self._log_prefix, "Step 7: Skipping heartbeat wait (physics thread will handle)")
+
+            ts_log(self._log_prefix, "=" * 50)
+            ts_log(self._log_prefix, "PX4 recovery completed")
+            ts_log(self._log_prefix, "=" * 50)
 
         except Exception as e:
-            carb.log_warn(f"{self._log_prefix} Relaunch PX4 failed: {e}")
-            carb.log_warn(traceback.format_exc())
+            ts_log(self._log_prefix, f"PX4 recovery failed: {e}", "ERROR")
+            ts_log(self._log_prefix, traceback.format_exc(), "ERROR")
+            raise
 
     def reset(self):
         """For now does nothing. Here for compatibility purposes only
@@ -983,14 +1059,14 @@ class PX4MavlinkBackend(Backend):
         # 检查并等待端口释放
         mavlink_port = self.config.connection_baseport + self._vehicle_id
         if _is_port_in_use(mavlink_port):
-            carb.log_info(f"{self._log_prefix} MAVLink port {mavlink_port} is in use, waiting for release...")
+            ts_log(self._log_prefix, f"MAVLink port {mavlink_port} is in use, waiting for release...")
             if _wait_for_port_release(mavlink_port, timeout=30.0, interval=0.5):
-                carb.log_info(f"{self._log_prefix} MAVLink port {mavlink_port} released")
+                ts_log(self._log_prefix, f"MAVLink port {mavlink_port} released")
             else:
-                carb.log_warn(f"{self._log_prefix} MAVLink port {mavlink_port} release timeout, attempting connection anyway")
+                ts_log(self._log_prefix, f"MAVLink port {mavlink_port} release timeout, attempting connection anyway", "WARN")
 
         # Restart the connection
-        carb.log_info(f"{self._log_prefix} Connection to backend at {self._connection_port}")
+        ts_log(self._log_prefix, f"Creating MAVLink connection to {self._connection_port}")
         self._connection = mavutil.mavlink_connection(self._connection_port)
 
         # Auxiliar variables to handle the lockstep between receiving sensor data and actuator control
@@ -1012,18 +1088,18 @@ class PX4MavlinkBackend(Backend):
 
         # Wait for the connection to be established
         if self._connection is None:
-            return 
+            return
 
         # Throttle waiting heartbeat logs
         now = time.time()
         if (now - self._last_waiting_heartbeat_log_time) >= self._waiting_heartbeat_log_interval:
-            carb.log_warn(f"{self._log_prefix} Waiting for first hearbeat")
+            ts_log(self._log_prefix, "Waiting for first heartbeat from PX4...", "WARN")
             self._last_waiting_heartbeat_log_time = now
         result = self._connection.wait_heartbeat(blocking=False)
 
         if result is not None:
             self._received_first_hearbeat = True
-            carb.log_warn(f"{self._log_prefix} Received first hearbeat")
+            ts_log(self._log_prefix, "Received first heartbeat from PX4")
 
     def update(self, dt):
         """
@@ -1045,12 +1121,32 @@ class PX4MavlinkBackend(Backend):
             self.wait_for_first_hearbeat()
             return
 
+        # 调试：定期打印连接状态
+        if not hasattr(self, '_debug_log_count'):
+            self._debug_log_count = 0
+        self._debug_log_count += 1
+        if self._debug_log_count % 500 == 1:  # 每500帧打印一次
+            carb.log_warn(f"{self._log_prefix} update() called: heartbeat={self._received_first_hearbeat}, "
+                         f"first_imu={self._sensor_data.received_first_imu}, "
+                         f"new_imu={self._sensor_data.new_imu_data}, "
+                         f"imu_data=({self._sensor_data.xacc:.2f},{self._sensor_data.yacc:.2f},{self._sensor_data.zacc:.2f}), "
+                         f"is_running={self._is_running}")
+
         # Check if we have already received IMU data. If not, start the lockstep and wait for more data
+        # 关键修复：添加超时机制防止无限等待
         if self._sensor_data.received_first_imu:
-            while not self._sensor_data.new_imu_data and self._is_running:
-                # Just go for the next update and then try to check if we have new simulated sensor data
-                # DO not continue and get mavlink thrusters commands until we have simulated IMU data available
-                return
+            if not self._sensor_data.new_imu_data and self._is_running:
+                # 检查 IMU 数据是否有效（非零）- 即使 new_imu_data 未设置
+                imu_has_valid_data = (
+                    abs(self._sensor_data.xacc) > 0.01 or
+                    abs(self._sensor_data.yacc) > 0.01 or
+                    abs(self._sensor_data.zacc) > 0.01
+                )
+                if not imu_has_valid_data:
+                    # 没有有效 IMU 数据，等待下一个物理步
+                    return
+                # 有有效数据但 new_imu_data=False，可能是恢复后的第一帧
+                # 继续发送数据
 
         # Check if we have received any mavlink messages
         self.poll_mavlink_messages()
@@ -1098,8 +1194,8 @@ class PX4MavlinkBackend(Backend):
             except Exception:
                 return False
         except Exception as e:
-            carb.log_warn(f"{self._log_prefix} _is_px4_alive error: {e}")
-            carb.log_warn(traceback.format_exc())
+            ts_log(self._log_prefix, f"_is_px4_alive error: {e}", "WARN")
+            ts_log(self._log_prefix, traceback.format_exc(), "WARN")
             return False
 
     def _ensure_px4_running_periodic(self):
@@ -1124,12 +1220,12 @@ class PX4MavlinkBackend(Backend):
         if self._is_px4_alive():
             return
         try:
-            carb.log_warn(f"{self._log_prefix} PX4 not alive; attempting relaunch")
-            self.hard_reboot_px4()
+            ts_log(self._log_prefix, "PX4 not alive; attempting auto-recovery...", "WARN")
+            self.recover_px4()
             self._px4_start_time = time.time()  # 重置启动时间
         except Exception as e:
-            carb.log_warn(f"{self._log_prefix} Periodic relaunch failed: {e}")
-            carb.log_warn(traceback.format_exc())
+            ts_log(self._log_prefix, f"Auto-recovery failed: {e}", "ERROR")
+            ts_log(self._log_prefix, traceback.format_exc(), "ERROR")
 
     def poll_mavlink_messages(self):
         """
@@ -1151,27 +1247,38 @@ class PX4MavlinkBackend(Backend):
         self._received_actuator = False
 
         # Use this loop to emulate a do-while loop (make sure this runs at least once)
-        while True:
+        try:
+            while True:
+                # Guard: re-check connection in case it was closed during recovery
+                if self._connection is None:
+                    break
 
-            # Try to get a message
-            msg = self._connection.recv_match(blocking=needs_to_wait_for_actuator)
+                # Try to get a message
+                msg = self._connection.recv_match(blocking=needs_to_wait_for_actuator)
 
-            # If a message was received
-            if msg is not None:
+                # If a message was received
+                if msg is not None:
 
-                # Check if it is of the type that contains actuator controls
-                if msg.id == mavutil.mavlink.MAVLINK_MSG_ID_HIL_ACTUATOR_CONTROLS:
+                    # Check if it is of the type that contains actuator controls
+                    if msg.id == mavutil.mavlink.MAVLINK_MSG_ID_HIL_ACTUATOR_CONTROLS:
 
-                    self._received_first_actuator = True
-                    self._received_actuator = True
+                        self._received_first_actuator = True
+                        self._received_actuator = True
 
-                    # Handle the control of the actuation commands received by PX4
-                    self.handle_control(msg.time_usec, msg.controls, msg.mode, msg.flags)
+                        # Handle the control of the actuation commands received by PX4
+                        self.handle_control(msg.time_usec, msg.controls, msg.mode, msg.flags)
 
-            # Check if we do not need to wait for an actuator message or we just received actuator input
-            # If so, break out of the infinite loop
-            if not needs_to_wait_for_actuator or self._received_actuator:
-                break
+                # Check if we do not need to wait for an actuator message or we just received actuator input
+                # If so, break out of the infinite loop
+                if not needs_to_wait_for_actuator or self._received_actuator:
+                    break
+        except Exception as e:
+            # 连接可能在恢复过程中被关闭，导致 recv_match 抛出异常
+            # 这是正常行为，不需要报错
+            if self._connection is None or not self._is_running:
+                pass  # 恢复中，忽略异常
+            else:
+                carb.log_warn(f"{self._log_prefix} poll_mavlink_messages exception: {e}")
 
     def send_heartbeat(self, mav_type=mavutil.mavlink.MAV_TYPE_GENERIC):
         """
@@ -1207,7 +1314,14 @@ class PX4MavlinkBackend(Backend):
         # Check which sensors have new data to send
         fields_updated: int = 0
 
-        if self._sensor_data.new_imu_data:
+        # 关键修复：除了检查 new_imu_data 标志外，还检查数据是否有效
+        # 这样在恢复后即使标志未设置，只要有有效数据也能发送
+        imu_has_valid_data = (
+            abs(self._sensor_data.xacc) > 0.01 or
+            abs(self._sensor_data.yacc) > 0.01 or
+            abs(self._sensor_data.zacc) > 0.01
+        )
+        if self._sensor_data.new_imu_data or imu_has_valid_data:
             # Set the bit field to signal that we are sending updated accelerometer and gyro data
             fields_updated = fields_updated | SensorSource.ACCEL | SensorSource.GYRO
             self._sensor_data.new_imu_data = False
