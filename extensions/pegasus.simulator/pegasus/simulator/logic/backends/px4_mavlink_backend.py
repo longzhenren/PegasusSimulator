@@ -938,16 +938,23 @@ class PX4MavlinkBackend(Backend):
             self._received_actuator = False
             self._is_running = False  # 告诉 update() 我们正在恢复中
 
+            # 关键修复：先保存旧连接引用，然后立即设置 _connection = None
+            # 这样物理线程的 update() 会立即返回，避免使用正在关闭的连接
+            old_connection = self._connection
+            self._connection = None  # 触发 update() 中的 early return
+
+            # 短暂等待，让物理线程有机会看到 _connection = None 并退出
+            time.sleep(0.1)
+
             # Step 2: 关闭旧 MAVLink 连接
             ts_log(self._log_prefix, "Step 2: Closing old MAVLink connection...")
-            if self._connection is not None:
+            if old_connection is not None:
                 try:
-                    self._connection.close()
+                    old_connection.close()
                     ts_log(self._log_prefix, "MAVLink connection closed")
                 except Exception as e:
                     ts_log(self._log_prefix, f"Close MAVLink failed: {e}", "WARN")
                     ts_log(self._log_prefix, traceback.format_exc(), "WARN")
-            self._connection = None
 
             # Step 3: 等待端口释放
             mavlink_port = self.config.connection_baseport + self._vehicle_id
@@ -994,8 +1001,20 @@ class PX4MavlinkBackend(Backend):
             # 这样 lockstep 机制会正确等待新的 IMU 数据
             self._last_heartbeat_sent_time = 0
 
+            # 关键修复：重置仿真时间戳，新 PX4 进程期望从 0 开始的时间戳
+            # 否则会导致 PX4 检测到 "Time jump"，EKF 重置，姿态估计失败
+            self._current_utime = 0
+            # 关键修复：标记需要跳过下一个大的 dt 值
+            # 因为恢复过程中物理循环暂停，恢复后第一个 dt 可能很大（30+ 秒）
+            # 这会导致 _current_utime 立即跳到很大的值，触发 PX4 的 "Time jump" 检测
+            self._skip_large_dt_count = 10  # 跳过前 10 个帧的大 dt
+            ts_log(self._log_prefix, "Reset simulation time (_current_utime = 0, skip_large_dt_count = 10)")
+
             # 标记为运行状态
             self._is_running = True
+
+            # 重置调试计数器以便追踪恢复后的 update() 调用
+            self._update_call_count = 0
 
             # Step 5: 启动新 PX4 进程
             ts_log(self._log_prefix, "Step 5: Launching new PX4 process...")
@@ -1108,6 +1127,23 @@ class PX4MavlinkBackend(Backend):
         Args:
             dt (float): The time elapsed between the previous and current function calls (s).
         """
+        # 关键修复：包装整个 update() 方法在 try-except 中，防止异常传播到 Isaac Sim
+        # 导致整个物理回调系统崩溃
+        try:
+            self._update_impl(dt)
+        except Exception as e:
+            ts_log(self._log_prefix, f"update() exception: {e}", "ERROR")
+            ts_log(self._log_prefix, traceback.format_exc(), "ERROR")
+
+    def _update_impl(self, dt):
+        # 调试：每次 update() 调用都记录（用于诊断回调是否正常工作）
+        if not hasattr(self, '_update_call_count'):
+            self._update_call_count = 0
+        self._update_call_count += 1
+        if self._update_call_count % 120 == 1:  # 约每秒一次
+            carb.log_warn(f"{self._log_prefix} update() entry #{self._update_call_count}: "
+                         f"_is_running={self._is_running}, "
+                         f"_connection={'OK' if self._connection else 'None'}")
 
         # Ensure PX4 process is running (auto-recover if killed externally)
         self._ensure_px4_running_periodic()
@@ -1117,9 +1153,11 @@ class PX4MavlinkBackend(Backend):
             return
 
         # Check for the first hearbeat on the first few iterations
+        # 关键修复：不要在等待 heartbeat 时提前返回，因为 PX4 在 lockstep 模式下
+        # 需要先收到传感器数据才会发送 heartbeat
         if not self._received_first_hearbeat:
             self.wait_for_first_hearbeat()
-            return
+            # 不要 return，继续发送传感器数据以打破死锁
 
         # 调试：定期打印连接状态
         if not hasattr(self, '_debug_log_count'):
@@ -1157,6 +1195,14 @@ class PX4MavlinkBackend(Backend):
             self._last_heartbeat_sent_time = time.time()
 
         # Update the current u_time for px4
+        # 关键修复：恢复后的前几帧使用固定小 dt，防止时间跳跃
+        if hasattr(self, '_skip_large_dt_count') and self._skip_large_dt_count > 0:
+            self._skip_large_dt_count -= 1
+            # 使用固定的小 dt（基于配置的更新频率）
+            dt = self._time_step
+            if self._skip_large_dt_count == 9:  # 第一次跳过时打印日志
+                ts_log(self._log_prefix, f"Skipping large dt, using fixed dt={dt:.6f}s")
+
         self._current_utime += int(dt * 1000000)
 
         # Send sensor messages
@@ -1249,12 +1295,17 @@ class PX4MavlinkBackend(Backend):
         # Use this loop to emulate a do-while loop (make sure this runs at least once)
         try:
             while True:
-                # Guard: re-check connection in case it was closed during recovery
-                if self._connection is None:
+                # Guard: re-check connection and running state in case recovery started
+                if self._connection is None or not self._is_running:
                     break
 
+                # 关键修复：使用超时防止 blocking recv 无限阻塞
+                # 如果需要等待 actuator，使用 0.1 秒超时而不是无限阻塞
+                # 这样可以在恢复期间及时检测到 _connection=None 或 _is_running=False
+                recv_timeout = 0.1 if needs_to_wait_for_actuator else None
+
                 # Try to get a message
-                msg = self._connection.recv_match(blocking=needs_to_wait_for_actuator)
+                msg = self._connection.recv_match(blocking=needs_to_wait_for_actuator, timeout=recv_timeout)
 
                 # If a message was received
                 if msg is not None:

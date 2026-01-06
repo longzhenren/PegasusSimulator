@@ -1251,8 +1251,11 @@ class IsaacSimEnv(Node):
 
             # 3. 移动 UAV 到目标位置（在 PX4 恢复之前）
             if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
-                ts_log(log_prefix, f"Step 3: Moving UAV to ground position [{position[0]}, {position[1]}, 0.07] yaw={yaw_deg}")
-                self._sim_move_uav([position[0], position[1], 0.07], yaw_deg)
+                # 关键修复：硬重启时必须重置姿态为水平，否则可能保留崩溃时的翻转姿态
+                # 如果 yaw_deg 为 None，使用默认值 0 确保无人机水平
+                reset_yaw = yaw_deg if yaw_deg is not None else 0.0
+                ts_log(log_prefix, f"Step 3: Moving UAV to ground position [{position[0]}, {position[1]}, 0.07] yaw={reset_yaw}")
+                self._sim_move_uav([position[0], position[1], 0.07], reset_yaw)
                 time.sleep(0.5)
             else:
                 ts_log(log_prefix, "Step 3: Skipped (no position specified)")
@@ -1290,6 +1293,36 @@ class IsaacSimEnv(Node):
                 time.sleep(1.0)
             if not px4_backend_ok:
                 ts_log(log_prefix, "PX4 backend not ready after timeout, continuing anyway...", "WARN")
+
+            # 4.6 等待 PX4 完成预检（ready_to_takeoff）
+            # 这是确保 PX4 EKF 收敛并通过所有预检的关键步骤
+            ts_log(log_prefix, "Step 4.6: Waiting for PX4 ready_to_takeoff...")
+            px4_takeoff_timeout = 45.0  # EKF 收敛可能需要更长时间
+            px4_takeoff_start = time.time()
+            px4_takeoff_ok = False
+            while time.time() - px4_takeoff_start < px4_takeoff_timeout:
+                if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                    raise InterruptedError("reset cancelled")
+                try:
+                    import urllib.request, json as _json
+                    url = f"{self._image_http_base}/uav/{self._vid}/px4/status"
+                    req = urllib.request.Request(url, method="GET")
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        data = _json.loads(resp.read().decode("utf-8"))
+                        backend = data.get("px4_backend", {})
+                        ready = backend.get("px4_ready_to_takeoff", False)
+                        if ready:
+                            ts_log(log_prefix, f"PX4 ready_to_takeoff: True")
+                            px4_takeoff_ok = True
+                            break
+                        else:
+                            elapsed = time.time() - px4_takeoff_start
+                            ts_log(log_prefix, f"Waiting for px4_ready_to_takeoff... ({elapsed:.1f}s)")
+                except Exception as e:
+                    ts_log(log_prefix, f"PX4 status check error: {e}", "WARN")
+                time.sleep(1.0)
+            if not px4_takeoff_ok:
+                ts_log(log_prefix, "PX4 ready_to_takeoff not achieved after timeout, continuing anyway...", "WARN")
 
             time.sleep(2.0)
 
