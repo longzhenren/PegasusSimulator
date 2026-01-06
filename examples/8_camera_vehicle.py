@@ -2,48 +2,238 @@
 """
 Pegasus 仿真应用（8_camera_vehicle.py）
 
+==========================
 概述
-- 启动 Isaac Sim（支持 headless）并按 `multi_uav_config.json` 加载多载具与场景；对外暴露仿真 HTTP 接口以供控制器读取图像/位姿与执行位置重置。
-- 支持录制机制：按固定帧率保存 PNG/CSV 到 `recordings/`，可用于后处理或数据集生成。
+==========================
+本脚本是 Pegasus 仿真系统的核心仿真端，负责：
+- 启动 Isaac Sim（支持 headless 无头模式）并加载 USD 场景
+- 按 `multi_uav_config.json` 配置生成多架无人机（含相机传感器）
+- 为每架无人机启动 PX4 SITL 后端（自动启动 PX4 进程）
+- 暴露 HTTP 接口供控制器/外部程序读取图像、位姿、执行重置等操作
+- 支持录制机制：按固定帧率保存 PNG 图像和 CSV 状态数据
 
+==========================
+启动流程与时序
+==========================
+1. SimulationApp 初始化
+   - 解析 APP_CONFIG（含渲染器、加速参数等）
+   - 创建 Isaac Sim 仿真实例
+
+2. PegasusApp.__init__()
+   a) 设置仿真加速参数（禁用实时节流）
+   b) 初始化 PegasusInterface 和 World
+   c) 加载 multi_uav_config.json 配置
+   d) MultiUAVManager.spawn() 生成所有载具：
+      - 加载 USD 环境场景
+      - 为每架 UAV 创建 Multirotor 对象
+      - 配置 MonocularCamera 图形传感器
+      - 配置 PX4MavlinkBackend（自动启动 PX4 SITL）
+      - 配置碰撞过滤（UAV 之间不碰撞）
+      - 配置透明度（可选，用于多机视觉）
+   e) 启动 Flask HTTP 服务器（端口 8081）
+   f) 创建录制会话目录
+
+3. PegasusApp.run() 主循环
+   - 调用 timeline.play() 开始仿真
+   - 循环执行：
+     a) 根据 RENDER_THROTTLE 判断是否渲染
+     b) world.step(render=should_render) 推进物理+渲染
+     c) 若启用录制，调用 _record_if_due() 保存数据
+
+==========================
 HTTP 接口（端口 8081）
-- `GET /uav/<id>/pose`：载具状态快照
-- `GET /uav/<id>/image`、`GET /uav/<id>/image.png`：相机图像（JSON/PNG）
-- `GET /uav/<id>/all`：图像 + 位姿汇总
-- `POST /uav/<id>/reset`：移动载具到指定位置（可选 yaw），并清零速度与角速度
+==========================
+GET /uav/<id>/pose
+  - 返回指定 UAV 的位姿快照
+  - 响应：{"uav_id": 0, "timestamp": 1234.5, "position": [x,y,z],
+           "attitude": [qx,qy,qz,qw], "linear_velocity": [...],
+           "angular_velocity": [...], "linear_acceleration": [...]}
 
-配置与渲染
-- 多机配置：`multi_uav_config.json` 描述 `vehicle_id`、`mavros_namespace`、初始位姿等；启动器用其生成 MAVROS 启动文件。
-- 渲染节流：`RENDER_THROTTLE` 与 `RENDER_MAX_FPS` 控制渲染频率，降低 GPU 负载；相机输出受渲染帧产生频率影响。
+GET /uav/<id>/image
+  - 返回 JSON 格式的相机图像（Base64 编码 PNG）
+  - 响应：{"uav_id": 0, "timestamp": 1234.5, "width": 640, "height": 640,
+           "data": "<base64>", "data_url": "data:image/png;base64,..."}
 
-与控制器的关系
-- 控制器可将图像源切换为仿真 HTTP（`/step_http`）；网关将 `/uav/<id>/...` 统一转发到各控制器端口，形成统一入口。
+GET /uav/<id>/image.png
+  - 直接返回 PNG 二进制图像
 
-架构与类
-- `PegasusApp`：主应用类。
-  - 初始化 Isaac 时间线与 `PegasusInterface`、`World`。
-  - 加载 `multi_uav_config.json` → `MultiUAVManager.spawn()` 生成多载具（含图形传感器与 PX4/MAVROS 后端配置）。
-  - 内置 Flask 应用 `_setup_routes()` 与 `_start_http_server()` 暴露 HTTP 接口。
-  - 主循环 `run()`：按节流策略推进 `world.step(render=should_render)` 并在开启录制时保存 PNG/CSV。
-- `MultiUAVManager`：
-  - 负责读取配置与创建载具；用于定位与状态快照的获取（通过 `VehicleManager`）。
-  - 提供 `reset_uav(uav_id, position, yaw)` 将 USD 中的载具刚体位置与速度重置。
+GET /uav/<id>/all
+  - 返回图像和位姿的综合信息（同步快照）
+  - 响应：{"uav_id": 0, "image": {...}, "pose": {...}}
 
-录制管线
-- 每帧在 `_record_if_due()` 生成相机图像（PNG）与状态快照（CSV）；每个 UAV 在一次会话下独立生成数据文件。
-- CSV 聚合包含位姿、姿态、速度角速度与线加速度，便于后处理。
+POST /uav/<id>/reset
+  - 重置 UAV 到指定位置
+  - 请求体：{"position": [x, y, z], "yaw_deg": 0.0}
+  - 响应：{"status": "success", "uav_id": 0, "position": [...]}
 
-接口示例
-- `GET /uav/0/all` 返回示例键：`{"image": {"data": "<base64>"}, "pose": {...}}`
-- `POST /uav/0/reset` 请求示例：`{"position": [-88.0, 8.0, 5.0], "yaw_deg": 0.0}`
+POST /uav/<id>/px4/hard_reset
+  - 硬重启 PX4 进程（停止并重新启动）
+  - 响应：{"status": "success", "uav_id": 0}
 
-# 提高 UDP buffer
+POST /uav/<id>/px4/relaunch
+  - 软重启 PX4 进程
+  - 响应：{"status": "success", "uav_id": 0}
+
+GET /uav/<id>/px4/ready
+  - 查询 PX4 是否就绪（Ready for takeoff）
+  - 响应：{"status": "success", "uav_id": 0, "ready": true/false}
+
+GET /record/start
+GET /record/stop
+GET /record/status
+  - 控制和查询录制状态
+
+==========================
+调用关系
+==========================
+                    launch_multi_rospy.py
+                           │
+                           ▼
+        ┌─────────────────────────────────────────┐
+        │         8_camera_vehicle.py              │
+        │  (Isaac Sim + PX4 SITL + HTTP Server)    │
+        │                                          │
+        │  HTTP :8081 ◄───────┐                    │
+        └─────────┬───────────┼────────────────────┘
+                  │           │
+                  │ MAVLink   │ HTTP
+                  ▼           │
+        ┌─────────────────────┴────────────────────┐
+        │         rospy_isaacsim.py                │
+        │   (ROS2 + MAVROS Controller :5009+id)    │
+        │                                          │
+        │  HTTP :5009+id ◄─────┐                   │
+        └─────────┬────────────┼───────────────────┘
+                  │            │
+                  │            │ HTTP
+                  ▼            │
+        ┌──────────────────────┴───────────────────┐
+        │         recording_server.py              │
+        │      (Gateway + Recording :5008)         │
+        └──────────────────────────────────────────┘
+
+==========================
+配置文件（multi_uav_config.json）
+==========================
+{
+  "vehicles": [
+    {
+      "vehicle_id": 0,                      // 载具 ID（唯一）
+      "mavros_namespace": "uav0",           // ROS2 命名空间
+      "ros2_namespace": "uav0",             // USD prim 路径前缀
+      "initial_position": [0.0, 0.0, 0.07], // 初始位置 [x, y, z]
+      "initial_orientation_euler_deg": [0, 0, 0], // 初始姿态 [roll, pitch, yaw]
+      "px4_autolaunch": true,               // 是否自动启动 PX4
+      "px4_dir": "/home/user/PX4-Autopilot", // PX4 源码目录
+      "sim_speed_factor": 5.0               // 仿真加速倍率
+    },
+    ...
+  ]
+}
+
+==========================
+关键参数说明
+==========================
+渲染与性能参数：
+  USE_RASTERIZATION = True    # True=栅格化（快），False=光追（慢但真实）
+  RENDER_THROTTLE = True      # 启用渲染节流
+  RENDER_MAX_FPS = 10.0       # 最大渲染帧率，影响相机输出频率
+  CAMERA_RESOLUTION = (640, 640)  # 相机分辨率
+
+录制参数：
+  RECORD_ENABLE = False       # 全局录制开关
+  RECORD_FPS = 10.0           # 录制帧率
+  RECORD_DIR = "./recordings" # 录制目录
+
+UAV 视觉参数：
+  UAV_TRANSPARENCY_ENABLE = True  # 启用 UAV 透明（多机避免遮挡）
+  UAV_TRANSPARENCY_ALPHA = 0.0    # 透明度（0=完全透明）
+  DISABLE_UAV_UAV_COLLISION = True # 禁用 UAV 之间碰撞
+
+ROS2 参数：
+  ROS2_ENABLE = False          # 启用 ROS2 后端（通常由控制器使用）
+  ROS2_CAMERA_ENABLE = False   # 启用 ROS2 相机话题发布
+  ROS2_SENSOR_ENABLE = False   # 启用 ROS2 传感器话题发布
+
+仿真加速（APP_CONFIG.extra_args）：
+  --/app/runLoops/main/rateLimitEnabled=false   # 禁用主循环速率限制
+  --/app/runLoops/rendering/rateLimitEnabled=false  # 禁用渲染速率限制
+  --/physics/updateToUsd=false  # 禁用物理到 USD 同步（提升性能）
+  --/app/asyncRendering=true    # 启用异步渲染
+
+==========================
+环境变量
+==========================
+PEGASUS_SESSION_TS    - 会话时间戳（用于日志分组）
+
+==========================
+接口调用示例（Python）
+==========================
+import requests
+import json
+
+base = "http://127.0.0.1:8081"
+
+# 获取 UAV0 的位姿
+resp = requests.get(f"{base}/uav/0/pose")
+print(resp.json())
+
+# 获取 UAV0 的图像（JSON 格式）
+resp = requests.get(f"{base}/uav/0/image")
+data = resp.json()
+print(f"Image size: {data['width']}x{data['height']}")
+
+# 获取 UAV0 的图像和位姿（同步快照）
+resp = requests.get(f"{base}/uav/0/all")
+all_data = resp.json()
+print(f"Position: {all_data['pose']['position']}")
+
+# 重置 UAV0 到指定位置
+resp = requests.post(f"{base}/uav/0/reset", json={
+    "position": [0.0, 0.0, 2.0],
+    "yaw_deg": 90.0
+})
+print(resp.json())
+
+# 查询 PX4 是否就绪
+resp = requests.get(f"{base}/uav/0/px4/ready")
+print(f"PX4 ready: {resp.json()['ready']}")
+
+==========================
+接口调用示例（curl）
+==========================
+# 获取位姿
+curl http://127.0.0.1:8081/uav/0/pose
+
+# 获取图像（PNG）
+curl -o image.png http://127.0.0.1:8081/uav/0/image.png
+
+# 获取综合信息
+curl http://127.0.0.1:8081/uav/0/all
+
+# 重置 UAV 位置
+curl -X POST http://127.0.0.1:8081/uav/0/reset \
+  -H "Content-Type: application/json" \
+  -d '{"position":[0,0,2],"yaw_deg":0}'
+
+# 查询 PX4 状态
+curl http://127.0.0.1:8081/uav/0/px4/ready
+
+# 控制录制
+curl http://127.0.0.1:8081/record/start
+curl http://127.0.0.1:8081/record/stop
+curl http://127.0.0.1:8081/record/status
+
+==========================
+系统调优建议
+==========================
+# 提高 UDP buffer（MAVLink 通信）
 sudo sysctl -w net.core.rmem_max=26214400
 sudo sysctl -w net.core.wmem_max=26214400
 sudo sysctl -w net.core.rmem_default=26214400
 sudo sysctl -w net.core.wmem_default=26214400
 
-# 减少 TIME_WAIT 连接等（主要偏 TCP，但某些 RMW 配置会用到）
+# 减少 TIME_WAIT 连接
 sudo sysctl -w net.ipv4.tcp_fin_timeout=15
 sudo sysctl -w net.ipv4.tcp_tw_reuse=1
 
@@ -71,19 +261,26 @@ from scipy.spatial.transform import Rotation
 
 LOG_ENABLE = True
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
-LOG_FILE_PATH = os.path.join(LOG_DIR, f"8_camera_vehicle_{int(time.time())}.log")
+
+# 支持 PEGASUS_SESSION_TS 环境变量进行日志分组
+_SESSION_TS = os.environ.get("PEGASUS_SESSION_TS", str(int(time.time())))
+LOG_SESSION_DIR = os.path.join(LOG_DIR, _SESSION_TS, "isaac")
+LOG_FILE_PATH = os.path.join(LOG_SESSION_DIR, f"8_camera_vehicle.log")
 
 
 def _setup_file_logger():
     if not LOG_ENABLE:
         return None
-    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(LOG_SESSION_DIR, exist_ok=True)
     logger = logging.getLogger("pegasus.sim")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
         fh = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
         logger.addHandler(fh)
         logger.propagate = False
     return logger
@@ -222,7 +419,7 @@ APP_CONFIG = {
     # "height": 600,
     "window_width": 1280,
     "window_height": 720,
-    "headless": True,
+    "headless": False,
     "max_bounces": 0 if USE_RASTERIZATION else 1,  # RT 模式里 bounces 越低越快
     "samples_per_pixel_per_frame": 1 if USE_RASTERIZATION else 16,  # 默认 64，很吃GPU，先降
     "anti_aliasing": 1,  # 0/1 更快（3=高质量）
@@ -241,6 +438,13 @@ APP_CONFIG = {
         # Enable MDL Disk Cache
         "--mdl-disk-cache=true",
         "--mdl-disk-cache-path=/home/user/.cache/omni/mdl_cache",
+        # ========== 仿真加速：禁用实时节流 ==========
+        # "--/app/runLoops/main/rateLimitEnabled=false",
+        # "--/app/runLoops/main/rateLimitFrequency=0",
+        # "--/app/runLoops/rendering/rateLimitEnabled=false",
+        # "--/physics/updateToUsd=false",  # 减少 USD 同步开销
+        # "--/app/asyncRendering=true",
+        # "--/app/asyncRenderingLowLatency=false",
     ],
 }
 simulation_app = SimulationApp(APP_CONFIG)
@@ -524,6 +728,22 @@ class PegasusApp:
         """
         Method that initializes the PegasusApp and is used to setup the simulation environment.
         """
+        # # ========== 仿真加速：运行时禁用节流设置 ==========
+        # try:
+        #     import carb.settings
+        #     settings = carb.settings.get_settings()
+        #     # 禁用主循环和渲染循环的速率限制
+        #     settings.set("/app/runLoops/main/rateLimitEnabled", False)
+        #     settings.set("/app/runLoops/main/rateLimitFrequency", 0)
+        #     settings.set("/app/runLoops/rendering/rateLimitEnabled", False)
+        #     # 禁用物理到 USD 的同步以减少开销
+        #     settings.set("/physics/updateToUsd", False)
+        #     # 异步渲染设置
+        #     settings.set("/app/asyncRendering", True)
+        #     settings.set("/app/asyncRenderingLowLatency", False)
+        #     carb.log_info("[PegasusApp] Simulation acceleration settings applied: rate limiting disabled")
+        # except Exception as e:
+        #     carb.log_warn(f"[PegasusApp] Failed to apply acceleration settings: {e}")
 
         # Acquire the timeline that will be used to start/stop the simulation
         self.timeline = omni.timeline.get_timeline_interface()
@@ -793,6 +1013,7 @@ class PegasusApp:
 
         @app.route('/uav/<int:uav_id>/px4/hard_reset', methods=['POST'])
         def px4_hard_reset_route(uav_id: int):
+            """硬重启 PX4（仅重启 PX4 进程，不涉及 MAVROS）"""
             try:
                 vehicle = self._get_vehicle(uav_id)
                 if vehicle is None:
@@ -816,6 +1037,7 @@ class PegasusApp:
 
         @app.route('/uav/<int:uav_id>/px4/relaunch', methods=['POST'])
         def px4_relaunch_route(uav_id: int):
+            """重新启动 PX4（软重启并重新启动）"""
             try:
                 vehicle = self._get_vehicle(uav_id)
                 if vehicle is None:
@@ -837,6 +1059,30 @@ class PegasusApp:
             except Exception as e:
                 carb.log_warn(f"HTTP px4 relaunch error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
                 return jsonify({"error": str(e), "endpoint": "px4/relaunch"}), 500
+
+        @app.route('/uav/<int:uav_id>/px4/ready', methods=['GET'])
+        def px4_ready_route(uav_id: int):
+            """查询 PX4 ready to takeoff 状态（从 PX4 日志检测）"""
+            try:
+                vehicle = self._get_vehicle(uav_id)
+                if vehicle is None:
+                    return jsonify({"status": "error", "message": f"Vehicle /World/uav{uav_id} not found", "ready": False}), 404
+                try:
+                    backend = None
+                    for b in getattr(vehicle, "_backends", []):
+                        if isinstance(b, PX4MavlinkBackend):
+                            backend = b
+                            break
+                    if backend is None:
+                        return jsonify({"status": "error", "message": "PX4 backend not found", "ready": False}), 404
+                    ready = backend.px4_ready_to_takeoff
+                    return jsonify({"status": "success", "uav_id": uav_id, "ready": ready})
+                except Exception as e:
+                    carb.log_warn(f"HTTP px4 ready exec_error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                    return jsonify({"status": "error", "message": f"px4 ready check failed: {e}", "ready": False}), 500
+            except Exception as e:
+                carb.log_warn(f"HTTP px4 ready error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                return jsonify({"error": str(e), "endpoint": "px4/ready", "ready": False}), 500
 
     def _png_bytes_and_b64(self, img):
         arr = np.array(img)

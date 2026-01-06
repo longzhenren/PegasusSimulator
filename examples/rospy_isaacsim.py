@@ -134,6 +134,9 @@ import time
 import math
 import os
 import sys
+import signal
+import subprocess as sp
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from tqdm import tqdm
 import base64
@@ -198,6 +201,173 @@ ARMING_TIMEOUT_S = float(os.environ.get("PEGASUS_ARMING_TIMEOUT_S", "10.0"))
 
 MAX_PITCH_DEG = 20.0
 MAX_ROLL_DEG = 20.0
+
+# MAVROS ROS2 launch command path (using Isaac Sim's Python environment)
+ISAACSIM_PYTHON = os.environ.get("ISAACSIM_PYTHON", "/home/user/isaacsim-5.1.0/python.sh")
+ISAACSIM_ROS2_CMD = os.environ.get("ISAACSIM_ROS2_CMD", "/home/user/IsaacSim-ros_workspaces/build_ws/humble/humble_ws/install/bin/ros2")
+
+
+class MavrosManager:
+    """
+    MAVROS 进程生命周期管理器。
+    负责启动、停止和重启 MAVROS 进程。
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+    _processes: Dict[int, sp.Popen] = {}  # vid -> Popen
+    _log_files: Dict[int, Any] = {}  # vid -> file handle
+
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = object.__new__(cls)
+            return cls._instance
+
+    @classmethod
+    def get_instance(cls) -> 'MavrosManager':
+        return cls()
+
+    @classmethod
+    def start_mavros(cls, vid: int, launch_file: Path, log_dir: Optional[Path] = None) -> bool:
+        """
+        启动单个 MAVROS 实例。
+
+        Args:
+            vid: Vehicle ID
+            launch_file: Path to the MAVROS launch file
+            log_dir: Optional directory for log files
+
+        Returns:
+            True if started successfully
+        """
+        with cls._lock:
+            if vid in cls._processes:
+                proc = cls._processes[vid]
+                if proc.poll() is None:
+                    print(f"[MavrosManager] MAVROS for vid={vid} already running (pid={proc.pid})")
+                    return True
+
+            if not launch_file.exists():
+                print(f"[MavrosManager] Launch file not found: {launch_file}")
+                return False
+
+            try:
+                cmd = [ISAACSIM_PYTHON, ISAACSIM_ROS2_CMD, "launch", str(launch_file)]
+                print(f"[MavrosManager] Starting MAVROS vid={vid}: {' '.join(cmd)}")
+
+                log_f = None
+                if log_dir:
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    log_path = log_dir / f"mavros_uav{vid}.log"
+                    log_f = log_path.open("w")
+                    cls._log_files[vid] = log_f
+                    proc = sp.Popen(cmd, stdout=log_f, stderr=sp.STDOUT, preexec_fn=os.setsid)
+                else:
+                    proc = sp.Popen(cmd, stdout=sp.DEVNULL, stderr=sp.DEVNULL, preexec_fn=os.setsid)
+
+                cls._processes[vid] = proc
+                print(f"[MavrosManager] MAVROS vid={vid} started (pid={proc.pid})")
+                return True
+            except Exception as e:
+                print(f"[MavrosManager] Failed to start MAVROS vid={vid}: {e}")
+                traceback.print_exc()
+                return False
+
+    @classmethod
+    def stop_mavros(cls, vid: int, timeout: float = 5.0) -> bool:
+        """
+        停止单个 MAVROS 实例。
+
+        Args:
+            vid: Vehicle ID
+            timeout: Timeout for graceful termination
+
+        Returns:
+            True if stopped successfully
+        """
+        with cls._lock:
+            if vid not in cls._processes:
+                print(f"[MavrosManager] No MAVROS process for vid={vid}")
+                return True
+
+            proc = cls._processes[vid]
+            if proc.poll() is not None:
+                print(f"[MavrosManager] MAVROS vid={vid} already terminated")
+                cls._cleanup_vid(vid)
+                return True
+
+            try:
+                # Try to kill the process group
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                print(f"[MavrosManager] Sent SIGTERM to MAVROS vid={vid} (pgid={pgid})")
+
+                # Wait for termination
+                start = time.time()
+                while time.time() - start < timeout:
+                    if proc.poll() is not None:
+                        print(f"[MavrosManager] MAVROS vid={vid} terminated gracefully")
+                        cls._cleanup_vid(vid)
+                        return True
+                    time.sleep(0.2)
+
+                # Force kill if still running
+                os.killpg(pgid, signal.SIGKILL)
+                print(f"[MavrosManager] Sent SIGKILL to MAVROS vid={vid}")
+                proc.wait(timeout=2.0)
+                cls._cleanup_vid(vid)
+                return True
+            except Exception as e:
+                print(f"[MavrosManager] Error stopping MAVROS vid={vid}: {e}")
+                traceback.print_exc()
+                cls._cleanup_vid(vid)
+                return False
+
+    @classmethod
+    def restart_mavros(cls, vid: int, launch_file: Path, log_dir: Optional[Path] = None) -> bool:
+        """
+        重启单个 MAVROS 实例。
+
+        Args:
+            vid: Vehicle ID
+            launch_file: Path to the MAVROS launch file
+            log_dir: Optional directory for log files
+
+        Returns:
+            True if restarted successfully
+        """
+        print(f"[MavrosManager] Restarting MAVROS vid={vid}")
+        cls.stop_mavros(vid)
+        time.sleep(1.0)  # Brief pause before restart
+        return cls.start_mavros(vid, launch_file, log_dir)
+
+    @classmethod
+    def stop_all(cls, timeout: float = 5.0):
+        """停止所有 MAVROS 实例。"""
+        vids = list(cls._processes.keys())
+        for vid in vids:
+            cls.stop_mavros(vid, timeout)
+        print(f"[MavrosManager] All MAVROS processes stopped")
+
+    @classmethod
+    def is_running(cls, vid: int) -> bool:
+        """检查指定 vid 的 MAVROS 是否正在运行。"""
+        with cls._lock:
+            if vid not in cls._processes:
+                return False
+            return cls._processes[vid].poll() is None
+
+    @classmethod
+    def _cleanup_vid(cls, vid: int):
+        """清理指定 vid 的资源。"""
+        cls._processes.pop(vid, None)
+        log_f = cls._log_files.pop(vid, None)
+        if log_f:
+            try:
+                log_f.close()
+            except Exception:
+                pass
 
 # ---------------- Helper: wait for a single message ----------------
 def wait_for_message(node: Node, topic: str, msg_type, timeout: float = None):
@@ -346,6 +516,21 @@ class IsaacSimEnv(Node):
         self._http_api = HttpApi(self)
         self._image_service = ImageService(self._image_from_ros, self._image_http_base, self._vid)
         self._reset_cancel_event = threading.Event()
+
+        # MAVROS launch file path (set externally or derived from config)
+        self._mavros_launch_file: Optional[Path] = None
+        self._mavros_log_dir: Optional[Path] = None
+
+        # Hover loop 暂停控制
+        self._hover_paused = False
+        self._hover_pause_lock = threading.Lock()
+        self._hover_pause_event = threading.Event()
+        self._hover_pause_event.set()  # 初始非暂停状态
+
+        # MAVROS state 监控
+        self._mavros_connected = False
+        self._mavros_connected_event = threading.Event()
+
         # --- helper: configure MAVROS time sync after launch (as a method) ---
         # Intention: reduce/disable TIMESYNC to avoid PX4 "RTT too high" warnings
         # Tries setting params on '/<ns>/mavros/time', then falls back to '/<ns>/mavros'
@@ -643,6 +828,12 @@ class IsaacSimEnv(Node):
         hz = CONTROL_LOOP_HZ
         while rclpy.ok() and not self._shutdown_requested:
             try:
+                # 检查是否暂停
+                if self._hover_paused:
+                    # 等待恢复信号，最多等待 0.1 秒后继续检查
+                    self._hover_pause_event.wait(timeout=0.1)
+                    continue
+
                 li = bool(getattr(self, "_landing_in_progress", False))
                 if not li and self.hover_target is not None:
                     x, y, z = self.hover_target
@@ -670,10 +861,59 @@ class IsaacSimEnv(Node):
                 self.get_logger().error(f"Hover loop outer traceback: {tb}")
             time.sleep(1.0 / hz)
 
+    def pause_hover_loop(self):
+        """暂停 hover loop 并等待当前发送完成。"""
+        with self._hover_pause_lock:
+            if self._hover_paused:
+                return
+            self._hover_paused = True
+            self._hover_pause_event.clear()
+            self.get_logger().info(f"[hover] UAV{self._vid} hover loop paused")
+            # 等待一个周期确保当前发送完成
+            time.sleep(1.0 / CONTROL_LOOP_HZ + 0.05)
+
+    def resume_hover_loop(self, new_target: Optional[Tuple[float, float, float]] = None):
+        """恢复 hover loop，可选更新目标位置。"""
+        with self._hover_pause_lock:
+            if new_target is not None:
+                self.hover_target = new_target
+                self.get_logger().info(f"[hover] UAV{self._vid} hover target updated to {new_target}")
+            self._hover_paused = False
+            self._hover_pause_event.set()
+            self.get_logger().info(f"[hover] UAV{self._vid} hover loop resumed")
+
+    def wait_for_mavros_connected(self, timeout: float = 60.0) -> bool:
+        """等待 MAVROS 连接成功。"""
+        self.get_logger().info(f"[mavros] UAV{self._vid} waiting for MAVROS connection (timeout={timeout}s)...")
+        start = time.time()
+        while time.time() - start < timeout:
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
+            if self._mavros_connected:
+                self.get_logger().info(f"[mavros] UAV{self._vid} MAVROS connected!")
+                return True
+            # spin 一下以接收消息
+            try:
+                rclpy.spin_once(self, timeout_sec=0.1)
+            except Exception:
+                pass
+            time.sleep(0.2)
+        self.get_logger().warn(f"[mavros] UAV{self._vid} MAVROS connection timeout!")
+        return False
+
     # ---------- Callbacks ----------
     def state_cb(self, msg: State):
         self.current_state = msg
         self._state_updates += 1
+        # 更新 MAVROS 连接状态
+        was_connected = self._mavros_connected
+        self._mavros_connected = bool(getattr(msg, "connected", False))
+        if self._mavros_connected and not was_connected:
+            self._mavros_connected_event.set()
+            self.get_logger().info(f"[state_cb] UAV{self._vid} MAVROS connected")
+        elif not self._mavros_connected and was_connected:
+            self._mavros_connected_event.clear()
+            self.get_logger().warn(f"[state_cb] UAV{self._vid} MAVROS disconnected")
 
     def pose_cb(self, msg: PoseStamped):
         self.current_pose = msg
@@ -855,11 +1095,12 @@ class IsaacSimEnv(Node):
         self._perform_takeoff(target_x, target_y, target_z, "[reset]")
 
     def _sim_move_uav(self, position: Optional[List[float]] = None, yaw_deg: Optional[float] = None) -> bool:
+        """通过仿真端 HTTP 接口重置 UAV 位置。"""
         vid = int(self._vid)
         if position is None or not isinstance(position, (list, tuple)) or len(position) < 3:
             return False
         try:
-            import urllib.request, json as _json, traceback as _tb
+            import urllib.request, json as _json
             if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
                 raise InterruptedError("reset cancelled")
             url = f"{self._image_http_base}/uav/{vid}/reset"
@@ -868,26 +1109,17 @@ class IsaacSimEnv(Node):
             req.add_header("Content-Type", "application/json")
             with urllib.request.urlopen(req, timeout=60) as resp:
                 _ = resp.read()
-                try:
-                    self.get_logger().info(f"[sim_move] UAV{vid} reset response from PGSIM: {_}")
-                except Exception:
-                    import traceback as _tb
-                    print(_tb.format_exc())
+                self.get_logger().info(f"[sim_move] UAV{vid} reset response from PGSIM: {_}")
                 return True
         except Exception as e:
-            try:
-                self.get_logger().warn(f"[sim_move] UAV{vid} reboot move Request failed: {e}")
-                import traceback as _tb
-                self.get_logger().warn(_tb.format_exc())
-            except Exception:
-                import traceback as _tb
-                print(_tb.format_exc())
+            self.get_logger().warn(f"[sim_move] UAV{vid} reboot move Request failed: {e}")
             return False
 
     def _sim_px4_hard_reset(self) -> bool:
+        """通过仿真端 HTTP 接口硬重启 PX4。"""
         vid = int(self._vid)
         try:
-            import urllib.request, traceback as _tb
+            import urllib.request
             if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
                 raise InterruptedError("reset cancelled")
             url = f"{self._image_http_base}/uav/{vid}/px4/hard_reset"
@@ -899,11 +1131,10 @@ class IsaacSimEnv(Node):
                 return True
         except Exception as e:
             self.get_logger().warn(f"[px4_hard_reset] UAV{vid} request failed: {e}")
-            import traceback as _tb
-            self.get_logger().warn(_tb.format_exc())
             return False
 
     def _sim_px4_relaunch(self) -> bool:
+        """通过仿真端 HTTP 接口重新启动 PX4。"""
         vid = int(self._vid)
         try:
             import urllib.request
@@ -918,80 +1149,249 @@ class IsaacSimEnv(Node):
                 return True
         except Exception as e:
             self.get_logger().warn(f"[px4_relaunch] UAV{vid} request failed: {e}")
-            import traceback as _tb
-            self.get_logger().warn(_tb.format_exc())
             return False
 
+    def set_mavros_launch_file(self, launch_file: Path, log_dir: Optional[Path] = None):
+        """设置 MAVROS launch 文件路径，供后续启动/重启使用。"""
+        self._mavros_launch_file = Path(launch_file) if launch_file else None
+        self._mavros_log_dir = Path(log_dir) if log_dir else None
+
+    def start_mavros(self) -> bool:
+        """启动当前 UAV 的 MAVROS 实例。"""
+        if self._mavros_launch_file is None:
+            self.get_logger().warn(f"[start_mavros] UAV{self._vid} no launch file configured")
+            return False
+        return MavrosManager.start_mavros(self._vid, self._mavros_launch_file, self._mavros_log_dir)
+
+    def stop_mavros(self) -> bool:
+        """停止当前 UAV 的 MAVROS 实例。"""
+        return MavrosManager.stop_mavros(self._vid)
+
+    def restart_mavros(self) -> bool:
+        """重启当前 UAV 的 MAVROS 实例。"""
+        if self._mavros_launch_file is None:
+            self.get_logger().warn(f"[restart_mavros] UAV{self._vid} no launch file configured")
+            return False
+        return MavrosManager.restart_mavros(self._vid, self._mavros_launch_file, self._mavros_log_dir)
+
     def reboot_px4_hard(self, position: Optional[List[float]] = None, yaw_deg: Optional[float] = None):
+        """
+        硬重启流程（统一入口）：
+        1. 暂停 hover loop
+        2. 停止 MAVROS
+        3. 通过仿真端硬重启 PX4
+        4. 移动 UAV 到目标位置
+        5. 通过仿真端重新启动 PX4
+        6. 重启 MAVROS
+        7. 等待 MAVROS 连接（通过 state topic 监控）
+        8. 等待 FCU 连接和姿态稳定
+        9. ARM 和 OFFBOARD
+        10. 起飞
+        11. 恢复 hover loop（更新目标位置）
+        """
         vid = int(self._vid)
         if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
             raise InterruptedError("reset cancelled")
-        ok_reset = self._sim_px4_hard_reset()
-        if not ok_reset:
-            self.get_logger().warn(f"[reboot_hard] UAV{vid} px4 hard reset failed")
-        if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
-            self.get_logger().info(f"[reboot_hard] UAV{vid} moving to position {position} yaw={yaw_deg}")
-            self._sim_move_uav([position[0], position[1], 0.07], yaw_deg)
-        ok_relaunch = self._sim_px4_relaunch()
-        if not ok_relaunch:
-            self.get_logger().warn(f"[reboot_hard] UAV{vid} px4 relaunch failed")
-        time.sleep(4.0)
-        self.wait_for_fcu_connection()
-        
-        ok_att = self.wait_until_attitude_stable(
-            timeout_s=POSITION_READY_TIMEOUT_S,
-            window_s=POSITION_READY_WINDOW_S,
-            eps=POSITION_READY_EPS,
-        )
-        self.get_logger().info(f"[reboot_hard] UAV{vid} attitude stable={ok_att}")
-        
-        # Wait for arming service to be available.
-        self.arming_client.wait_for_service(timeout_sec=20.0)
-        self.arm_cmd.value = True
-        arm_start = time.time()
-        while not self.current_state.armed and (time.time() - arm_start) < 60.0:
-            try:
-                if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
-                    raise InterruptedError("reset cancelled")
-                resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
-                if resp and getattr(resp, "success", False):
-                    self.get_logger().info(f"[reboot_hard] UAV{vid} ***** Vehicle armed *****")
-                    break
-            except Exception as e:
-                self.get_logger().warn(f"[reboot_hard] UAV{vid} arming failed. Exception: {e}")
-            spin_sleep(self, 2.0)
-            
-        # Send warmup position commands before sending OFFBOARD mode command, to avoid fallback into disarm mode.
-        warmup_count = 60
-        for _ in range(warmup_count):
-            self.pub_position(position[0], position[1], 0.07)
-            spin_sleep(self, 20.0)
-        
-        # Send OFFBOARD mode command.
-        self.set_mode_client.wait_for_service(timeout_sec=SETMODE_TIMEOUT_S)
-        self.offb_set_mode.custom_mode = "OFFBOARD"
-        off_start = time.time()
-        while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 60.0:
-            try:
-                if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
-                    raise InterruptedError("reset cancelled")
-                resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
-                if resp and getattr(resp, "mode_sent", False):
-                    self.get_logger().info("[reboot_hard] ***** OFFBOARD enabled *****")
-            except Exception as e:
-                self.get_logger().warn(f"[reboot_hard] UAV{vid} OFFBOARD enable failed. Exception: {e}")
-            spin_sleep(self, 2.0)
-        if self.current_state.mode != "OFFBOARD":
-            raise TimeoutError("OFFBOARD not enabled within 60s")
-        
-        target_x = float(position[0])
-        target_y = float(position[1])
-        # takeoff_z = float(self.current_pose.pose.position.z) + float(self.init_height)
-        target_z = float(position[2])
-        self._perform_takeoff(target_x, target_y, target_z, "[reboot_hard]")
-        # if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
-            # ok_mv = self.move_to_and_wait(target_x, target_y, target_z, threshold=MOVE_REACH_THRESHOLD, timeout_s=60.0)
-        self.get_logger().info(f"[reboot_hard] UAV{vid} moved to target={position}")
+
+        self.get_logger().info(f"[reboot_hard] UAV{vid} starting hard reboot...")
+
+        # 1. 暂停 hover loop
+        self.get_logger().info(f"[reboot_hard] UAV{vid} pausing hover loop...")
+        self.pause_hover_loop()
+
+        try:
+            # 2. 停止 MAVROS
+            self.get_logger().info(f"[reboot_hard] UAV{vid} stopping MAVROS...")
+            MavrosManager.stop_mavros(vid)
+            self._mavros_connected = False
+            self._mavros_connected_event.clear()
+
+            # 3. 通过仿真端硬重启 PX4
+            self.get_logger().info(f"[reboot_hard] UAV{vid} hard resetting PX4...")
+            ok_reset = self._sim_px4_hard_reset()
+            if not ok_reset:
+                self.get_logger().warn(f"[reboot_hard] UAV{vid} PX4 hard reset failed")
+
+            # 4. 移动 UAV 到目标位置
+            if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
+                self.get_logger().info(f"[reboot_hard] UAV{vid} moving to position {position} yaw={yaw_deg}")
+                self._sim_move_uav([position[0], position[1], 0.07], yaw_deg)
+
+            # 5. 通过仿真端重新启动 PX4
+            self.get_logger().info(f"[reboot_hard] UAV{vid} relaunching PX4...")
+            ok_relaunch = self._sim_px4_relaunch()
+            if not ok_relaunch:
+                self.get_logger().warn(f"[reboot_hard] UAV{vid} PX4 relaunch failed")
+
+            time.sleep(2.0)
+
+            # 6. 重启 MAVROS
+            self.get_logger().info(f"[reboot_hard] UAV{vid} restarting MAVROS...")
+            if self._mavros_launch_file:
+                ok = MavrosManager.start_mavros(vid, self._mavros_launch_file, self._mavros_log_dir)
+                if not ok:
+                    self.get_logger().warn(f"[reboot_hard] UAV{vid} MAVROS restart failed")
+            else:
+                self.get_logger().warn(f"[reboot_hard] UAV{vid} no MAVROS launch file configured, skipping MAVROS restart")
+
+            # 7. 等待 MAVROS 连接（通过 state topic 监控）
+            self.get_logger().info(f"[reboot_hard] UAV{vid} waiting for MAVROS connection...")
+            mavros_ok = self.wait_for_mavros_connected(timeout=60.0)
+            if not mavros_ok:
+                raise TimeoutError(f"MAVROS connection timeout for UAV{vid}")
+
+            # 8. 等待 FCU 连接和姿态稳定
+            self.wait_for_fcu_connection()
+
+            ok_att = self.wait_until_attitude_stable(
+                timeout_s=POSITION_READY_TIMEOUT_S,
+                window_s=POSITION_READY_WINDOW_S,
+                eps=POSITION_READY_EPS,
+            )
+            self.get_logger().info(f"[reboot_hard] UAV{vid} attitude stable={ok_att}")
+
+            # 9. ARM 和 OFFBOARD
+            self.arming_client.wait_for_service(timeout_sec=20.0)
+            self.arm_cmd.value = True
+            arm_start = time.time()
+            while not self.current_state.armed and (time.time() - arm_start) < 60.0:
+                try:
+                    if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                        raise InterruptedError("reset cancelled")
+                    resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
+                    if resp and getattr(resp, "success", False):
+                        self.get_logger().info(f"[reboot_hard] UAV{vid} ***** Vehicle armed *****")
+                        break
+                except Exception as e:
+                    self.get_logger().warn(f"[reboot_hard] UAV{vid} arming failed. Exception: {e}")
+                spin_sleep(self, 2.0)
+
+            # Send warmup position commands
+            target_x = float(position[0]) if position else 0.0
+            target_y = float(position[1]) if position else 0.0
+            target_z = float(position[2]) if position else self.init_height
+            warmup_count = 60
+            for _ in range(warmup_count):
+                self.pub_position(target_x, target_y, 0.07)
+                spin_sleep(self, 20.0)
+
+            # Send OFFBOARD mode command
+            self.set_mode_client.wait_for_service(timeout_sec=SETMODE_TIMEOUT_S)
+            self.offb_set_mode.custom_mode = "OFFBOARD"
+            off_start = time.time()
+            while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 60.0:
+                try:
+                    if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                        raise InterruptedError("reset cancelled")
+                    resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
+                    if resp and getattr(resp, "mode_sent", False):
+                        self.get_logger().info("[reboot_hard] ***** OFFBOARD enabled *****")
+                except Exception as e:
+                    self.get_logger().warn(f"[reboot_hard] UAV{vid} OFFBOARD enable failed. Exception: {e}")
+                spin_sleep(self, 2.0)
+            if self.current_state.mode != "OFFBOARD":
+                raise TimeoutError("OFFBOARD not enabled within 60s")
+
+            # 10. 起飞
+            self._perform_takeoff(target_x, target_y, target_z, "[reboot_hard]")
+            self.get_logger().info(f"[reboot_hard] UAV{vid} moved to target={position}")
+
+        finally:
+            # 11. 恢复 hover loop（更新目标位置）
+            final_target = None
+            if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
+                final_target = (float(position[0]), float(position[1]), float(position[2]))
+            self.resume_hover_loop(new_target=final_target)
+
+    def reboot_px4(self, position: Optional[List[float]] = None, yaw_deg: Optional[float] = None):
+        """
+        软重启流程（不重启 PX4 和 MAVROS，仅移动位置并重新起飞）：
+        1. 暂停 hover loop
+        2. 通过仿真端移动 UAV 到目标位置
+        3. 等待姿态稳定
+        4. 重新 ARM 和 OFFBOARD（如果需要）
+        5. 起飞
+        6. 恢复 hover loop（更新目标位置）
+        """
+        vid = int(self._vid)
+        if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+            raise InterruptedError("reset cancelled")
+
+        self.get_logger().info(f"[reboot_soft] UAV{vid} starting soft reboot...")
+
+        # 1. 暂停 hover loop
+        self.get_logger().info(f"[reboot_soft] UAV{vid} pausing hover loop...")
+        self.pause_hover_loop()
+
+        try:
+            # 2. 通过仿真端移动 UAV 到目标位置
+            if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
+                self.get_logger().info(f"[reboot_soft] UAV{vid} moving to position {position} yaw={yaw_deg}")
+                self._sim_move_uav([position[0], position[1], 0.07], yaw_deg)
+
+            time.sleep(1.0)
+
+            # 3. 等待姿态稳定
+            ok_att = self.wait_until_attitude_stable(
+                timeout_s=POSITION_READY_TIMEOUT_S,
+                window_s=POSITION_READY_WINDOW_S,
+                eps=POSITION_READY_EPS,
+            )
+            self.get_logger().info(f"[reboot_soft] UAV{vid} attitude stable={ok_att}")
+
+            # 4. 如果未 armed，重新 ARM
+            if not self.current_state.armed:
+                self.arming_client.wait_for_service(timeout_sec=10.0)
+                self.arm_cmd.value = True
+                arm_start = time.time()
+                while not self.current_state.armed and (time.time() - arm_start) < 30.0:
+                    try:
+                        if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                            raise InterruptedError("reset cancelled")
+                        resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
+                        if resp and getattr(resp, "success", False):
+                            self.get_logger().info(f"[reboot_soft] UAV{vid} ***** Vehicle armed *****")
+                            break
+                    except Exception as e:
+                        self.get_logger().warn(f"[reboot_soft] UAV{vid} arming failed. Exception: {e}")
+                    spin_sleep(self, 1.0)
+
+            # Send warmup position commands
+            target_x = float(position[0]) if position else 0.0
+            target_y = float(position[1]) if position else 0.0
+            target_z = float(position[2]) if position else self.init_height
+
+            # 如果不在 OFFBOARD 模式，切换到 OFFBOARD
+            if self.current_state.mode != "OFFBOARD":
+                warmup_count = 60
+                for _ in range(warmup_count):
+                    self.pub_position(target_x, target_y, 0.07)
+                    spin_sleep(self, 20.0)
+
+                self.set_mode_client.wait_for_service(timeout_sec=SETMODE_TIMEOUT_S)
+                self.offb_set_mode.custom_mode = "OFFBOARD"
+                off_start = time.time()
+                while self.current_state.mode != "OFFBOARD" and (time.time() - off_start) < 30.0:
+                    try:
+                        if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                            raise InterruptedError("reset cancelled")
+                        resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=SETMODE_TIMEOUT_S)
+                        if resp and getattr(resp, "mode_sent", False):
+                            self.get_logger().info("[reboot_soft] ***** OFFBOARD enabled *****")
+                    except Exception as e:
+                        self.get_logger().warn(f"[reboot_soft] UAV{vid} OFFBOARD enable failed. Exception: {e}")
+                    spin_sleep(self, 1.0)
+
+            # 5. 起飞
+            self._perform_takeoff(target_x, target_y, target_z, "[reboot_soft]")
+            self.get_logger().info(f"[reboot_soft] UAV{vid} moved to target={position}")
+
+        finally:
+            # 6. 恢复 hover loop（更新目标位置）
+            final_target = None
+            if position is not None and isinstance(position, (list, tuple)) and len(position) >= 3:
+                final_target = (float(position[0]), float(position[1]), float(position[2]))
+            self.resume_hover_loop(new_target=final_target)
 
     def wait_for_fcu_connection(self):
         """在 MAVROS 启动后阻塞等待 FCU 连接成功。"""
@@ -1383,6 +1783,16 @@ class IsaacSimEnv(Node):
                 resp.update({"position": self.get_position()})
             elif ctype == "get_status":
                 resp.update({"status": self.get_status()})
+            elif ctype == "set_px4_ready":
+                # 接收来自 trajectory_data_collector 的 PX4 ready 状态通知
+                ready = bool(cmd.get("ready", False))
+                self._px4_ready_from_collector = ready
+                self.get_logger().info(f"[set_px4_ready] UAV{self._vid} received px4_ready={ready}")
+                resp.update({"message": f"px4_ready set to {ready}"})
+            elif ctype == "get_px4_ready":
+                # 查询 PX4 ready 状态（从仿真端获取）
+                ready = self._get_sim_px4_ready()
+                resp.update({"px4_ready": ready})
             elif ctype == "shutdown":
                 self._shutdown_requested = True
                 resp.update({"message": "Shutdown requested"})
@@ -1395,6 +1805,21 @@ class IsaacSimEnv(Node):
             except Exception as le:
                 self.get_logger().warn(f"[ERROR] HTTP command error log failed: {le}")
         return resp
+
+    def _get_sim_px4_ready(self) -> bool:
+        """从仿真端查询 PX4 ready to takeoff 状态"""
+        vid = int(self._vid)
+        try:
+            import urllib.request, json as _json
+            url = f"{self._image_http_base}/uav/{vid}/px4/ready"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                raw = resp.read()
+                obj = _json.loads(raw.decode("utf-8"))
+                return bool(obj.get("ready", False))
+        except Exception as e:
+            self.get_logger().warn(f"[_get_sim_px4_ready] UAV{vid} request failed: {e}")
+            return False
 
 class TaskGuard:
     def __init__(self, lock: threading.Lock, force: bool, cancel_event: Optional[threading.Event] = None, timeout_s: float = 10.0):
@@ -1619,6 +2044,71 @@ class HttpApi:
 
 
 # =======================================================================
+#                           Logging Setup
+# =======================================================================
+import logging
+
+_LOG_DIR = Path(__file__).parent / "logs"
+_LOG_INITIALIZED = False
+_FILE_LOGGER: Optional[logging.Logger] = None
+
+
+def setup_file_logger(script_name: str, session_ts: Optional[str] = None) -> logging.Logger:
+    """
+    设置文件日志记录器。
+
+    Args:
+        script_name: 脚本名称（用于日志文件命名）
+        session_ts: 会话时间戳（可选，用于目录分组）
+
+    Returns:
+        配置好的 Logger 对象
+    """
+    global _LOG_INITIALIZED, _FILE_LOGGER
+
+    if _LOG_INITIALIZED and _FILE_LOGGER is not None:
+        return _FILE_LOGGER
+
+    # 创建日志目录
+    if session_ts:
+        log_dir = _LOG_DIR / str(session_ts)
+    else:
+        log_dir = _LOG_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # 创建日志文件路径
+    log_file = log_dir / f"{script_name}_{int(time.time())}.log"
+
+    # 创建 Logger
+    logger = logging.getLogger(f"pegasus.{script_name}")
+    logger.setLevel(logging.DEBUG)
+
+    # 文件 Handler
+    fh = logging.FileHandler(str(log_file), encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(fh)
+
+    # 控制台 Handler（仅 INFO 及以上）
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter(
+        "[%(levelname)s] %(message)s"
+    ))
+    logger.addHandler(ch)
+
+    logger.propagate = False
+    _LOG_INITIALIZED = True
+    _FILE_LOGGER = logger
+
+    logger.info(f"Log file: {log_file}")
+    return logger
+
+
+# =======================================================================
 #                                   main
 # =======================================================================
 def main():
@@ -1626,20 +2116,82 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Pegasus ROS2 IsaacSimEnv")
     parser.add_argument("--mavros-ns", dest="mavros_ns", type=str, default=None, help="ROS2 namespace for MAVROS (e.g., uav0)")
+    parser.add_argument("--launch-file", dest="launch_file", type=str, default=None, help="Path to MAVROS launch file")
+    parser.add_argument("--log-dir", dest="log_dir", type=str, default=None, help="Directory for log files")
     # 允许通过 --ros-args __ns:=uavX 的方式设置命名空间（由 launch_multi_rospy 传递）
     args = parser.parse_args()
-    
+
+    # 获取环境变量
+    env_mavros_ns = os.environ.get("MAVROS_NS")
+    mavros_ns = env_mavros_ns if env_mavros_ns else args.mavros_ns
+    session_ts = os.environ.get("PEGASUS_SESSION_TS")
+
+    # 设置日志
+    script_name = f"rospy_{mavros_ns or 'default'}"
+    logger = setup_file_logger(script_name, session_ts)
+    logger.info(f"Starting rospy_isaacsim.py with mavros_ns={mavros_ns}")
+
     rclpy.init()
     env = None
     try:
-        # Resolve MAVROS URL/NS and output directory (prefers env, falls back to CLI, then defaults)
-        env_mavros_ns = os.environ.get("MAVROS_NS")
-        mavros_ns = env_mavros_ns if env_mavros_ns else args.mavros_ns
-
         env = IsaacSimEnv(mavros_ns=mavros_ns)
         env.get_logger().info("IsaacSimEnv node started.")
 
+        # ============================================================
+        # 自动启动 MAVROS（关键修复）
+        # ============================================================
+        vid = env._vid
+
+        # 确定 MAVROS launch 文件路径
+        launch_file: Optional[Path] = None
+        if args.launch_file:
+            launch_file = Path(args.launch_file)
+        else:
+            # 默认路径：examples/launch/pegasus_uav_{vid}.launch
+            default_launch = Path(__file__).parent / "launch" / f"pegasus_uav_{vid}.launch"
+            if default_launch.exists():
+                launch_file = default_launch
+            else:
+                # 尝试生成 launch 文件
+                config_path = Path(__file__).parent / "multi_uav_config.json"
+                if config_path.exists():
+                    try:
+                        from pegasus.simulator.logic.vehicle_manager import VehicleManager
+                        VehicleManager.generate_mavros_launch_files(str(config_path))
+                        if default_launch.exists():
+                            launch_file = default_launch
+                    except Exception as e:
+                        logger.warning(f"Failed to generate MAVROS launch files: {e}")
+
+        # 确定日志目录
+        log_dir: Optional[Path] = None
+        if args.log_dir:
+            log_dir = Path(args.log_dir)
+        elif session_ts:
+            log_dir = _LOG_DIR / str(session_ts) / "mavros"
+        else:
+            log_dir = _LOG_DIR / "mavros"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        # 设置 MAVROS launch 文件并启动
+        if launch_file and launch_file.exists():
+            env.set_mavros_launch_file(launch_file, log_dir)
+            logger.info(f"Starting MAVROS for UAV{vid} with launch file: {launch_file}")
+
+            ok = env.start_mavros()
+            if ok:
+                logger.info(f"MAVROS started successfully for UAV{vid}")
+            else:
+                logger.error(f"Failed to start MAVROS for UAV{vid}")
+
+            # 等待 MAVROS 进程稳定
+            time.sleep(2.0)
+        else:
+            logger.warning(f"No MAVROS launch file found for UAV{vid}. FCU connection may fail.")
+            logger.warning(f"Expected launch file: examples/launch/pegasus_uav_{vid}.launch")
+
         # 在 MAVROS 启动后等待 FCU 连接
+        logger.info(f"Waiting for FCU connection...")
         env.wait_for_fcu_connection()
         # Configure MAVROS time sync parameters to avoid PX4 timesync RTT warnings
         # try:

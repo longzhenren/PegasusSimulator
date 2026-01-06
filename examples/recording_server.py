@@ -1,22 +1,227 @@
 #!/usr/bin/env python3
 """
-Gateway Server（统一 HTTP 网关 + 录制浏览）
+HTTP 网关与录制服务器（recording_server.py）
 
+==========================
 概述
-- 统一入口：将 `/{uav/<id>/reset|step|command}` 请求按命名空间映射转发到控制器实例（`rospy_isaacsim.py`）。
-- 录制浏览：列出 `recordings/` 目录并支持打包为 ZIP（由 `8_camera_vehicle.py` 生成PNG/CSV）。
+==========================
+本脚本提供两大核心功能：
+1. HTTP 网关：将 `/uav/<id>/...` 请求转发到对应的控制器实例
+2. 录制浏览：列出、打包和下载仿真录制数据（由 8_camera_vehicle.py 生成）
 
-端点
-- `GET /health`：健康检查与命名空间端口存活探测。
-- `POST/GET /uav/<id>/{reset|step|command}`：透明转发到对应的控制器 HTTP 服务。
-- `GET /sessions`、`GET /start_zip`、`GET /progress/<task_id>`、`GET /zip/<task_id>`、`GET /files/<session>/<filename>`：录制浏览与打包。
+==========================
+启动流程
+==========================
+1. 解析环境变量配置
+   - PEGASUS_NS_PORT_MAP: 命名空间到端口的映射
+   - PEGASUS_GATEWAY_PORT: 网关监听端口（默认 5008）
 
+2. 加载配置（若 NS_PORT_MAP 为空）
+   - 读取 multi_uav_config.json
+   - 自动生成端口映射（5009+vid）
+
+3. 初始化 Flask 应用并注册路由
+
+4. 启动 HTTP 服务器
+
+==========================
+HTTP 网关接口（端口 5008）
+==========================
+请求转发（透明代理）：
+  POST /uav/<id>/reset
+    - 转发到控制器 http://127.0.0.1:{5009+id}/reset
+    - 超时：300s（由 PEGASUS_GATEWAY_TIMEOUT_RESET 配置）
+
+  POST /uav/<id>/step
+    - 转发到控制器 http://127.0.0.1:{5009+id}/step
+    - 超时：120s（由 PEGASUS_GATEWAY_TIMEOUT_STEP 配置）
+
+  POST /uav/<id>/command
+    - 转发到控制器 http://127.0.0.1:{5009+id}/command
+    - 超时：60s（由 PEGASUS_GATEWAY_TIMEOUT_COMMAND 配置）
+
+健康检查：
+  GET /health
+    - 返回网关状态和各命名空间端口存活状态
+    - 响应：{"status": "ok", "namespaces": {"uav0": {"port": 5009, "alive": true}, ...}}
+
+==========================
+录制浏览接口
+==========================
+GET /
+  - 返回 HTML 页面，展示录制会话列表和打包功能
+
+GET /sessions
+  - 返回所有录制会话列表
+  - 响应：{"dir": "/path/to/recordings", "sessions": [{
+      "name": "session_1234567890",
+      "mtime": 1234567890.0,
+      "counts": {"files": 100, "png": 50, "csv": 50}
+    }, ...]}
+
+GET /start_zip?session=<name>&ext=<ext>&uav=<id>&since=<ts>&until=<ts>
+  - 启动异步 ZIP 打包任务
+  - 参数：
+    - session: 会话名称（必需）
+    - ext: 文件类型过滤（png/csv/all，可选）
+    - uav: 指定 UAV ID 过滤（可选）
+    - since/until: 时间戳范围过滤（可选，毫秒）
+  - 响应：{"task_id": "1"}
+
+GET /progress/<task_id>
+  - 查询 ZIP 打包进度
+  - 响应：{
+      "id": "1",
+      "state": "running",  // pending/running/done/error
+      "total": 100,
+      "processed": 50,
+      "filename": "session_xxx_12345.zip"
+    }
+
+GET /zip/<task_id>
+  - 下载已完成的 ZIP 文件
+  - 响应：application/zip 二进制流
+
+GET /files/<session>/<filename>
+  - 下载单个录制文件
+  - 响应：对应 MIME 类型的文件内容
+
+==========================
+调用关系
+==========================
+                           外部客户端 / trajectory_data_collector.py
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    recording_server.py                           │
+│                  (HTTP 网关 端口: 5008)                          │
+│                                                                  │
+│   /uav/<id>/reset ────┐                                         │
+│   /uav/<id>/step  ────┼──► 转发到 rospy_isaacsim.py (5009+id)   │
+│   /uav/<id>/command ──┘                                         │
+│                                                                  │
+│   /sessions, /zip, ... ──► 录制文件浏览/打包                     │
+└──────────────────────────────────────────────────────────────────┘
+
+==========================
 环境变量
-- `PEGASUS_NS_PORT_MAP`：JSON 字典，形如 `{"uav0":5009,"uav1":5010,...}`；若缺省则从 `multi_uav_config.json` 自动生成。
-- `PEGASUS_GATEWAY_PORT`：网关监听端口，默认 `5008`（由启动器设置）。
+==========================
+PEGASUS_NS_PORT_MAP          JSON 格式的命名空间端口映射
+                             示例：{"uav0":5009,"uav1":5010}
 
-与系统的关系
-- 由 `launch_multi_rospy.py` 启动，控制器端口默认 `5009 + vid` 与网关映射一致；仿真端图像服务默认在 `8081`。
+PEGASUS_GATEWAY_PORT         网关监听端口（默认：5008）
+
+PEGASUS_CONFIG_PATH          配置文件路径（默认：./multi_uav_config.json）
+
+PEGASUS_NS_BASE_PORT         控制器基础端口（默认：5009）
+
+PEGASUS_GATEWAY_TIMEOUT_RESET    reset 请求超时（默认：300s）
+PEGASUS_GATEWAY_TIMEOUT_STEP     step 请求超时（默认：120s）
+PEGASUS_GATEWAY_TIMEOUT_COMMAND  command 请求超时（默认：60s）
+
+==========================
+录制目录结构
+==========================
+recordings/
+  └── session_<timestamp>/
+      ├── uav0_<ts_ms>.png    # UAV0 相机图像
+      ├── uav0.csv            # UAV0 状态聚合 CSV
+      ├── uav1_<ts_ms>.png
+      ├── uav1.csv
+      └── ...
+
+CSV 文件字段：
+  timestamp_ms, timestamp_s, uav_id, image_filename,
+  image_width, image_height, image_channels,
+  pos_x, pos_y, pos_z,
+  att_w, att_x, att_y, att_z,
+  linvel_x, linvel_y, linvel_z,
+  angvel_x, angvel_y, angvel_z,
+  linacc_x, linacc_y, linacc_z
+
+==========================
+使用示例（Python）
+==========================
+import requests
+
+base = "http://127.0.0.1:5008"
+
+# 健康检查
+resp = requests.get(f"{base}/health")
+print(resp.json())
+
+# 通过网关发送 reset 命令到 UAV0
+resp = requests.post(f"{base}/uav/0/reset", json={
+    "vid": 0,
+    "position": [0, 0, 2],
+    "yaw_deg": 0,
+    "hard": True,
+    "force": True
+}, timeout=300)
+print(resp.json())
+
+# 通过网关发送 command 到 UAV0
+resp = requests.post(f"{base}/uav/0/command", json={
+    "cmd": "move_to",
+    "x": 1.0, "y": 0.5, "z": 2.0,
+    "force": True
+}, timeout=60)
+print(resp.json())
+
+# 获取录制会话列表
+resp = requests.get(f"{base}/sessions")
+sessions = resp.json()["sessions"]
+print(f"Found {len(sessions)} sessions")
+
+# 启动 ZIP 打包（仅 PNG 文件）
+resp = requests.get(f"{base}/start_zip", params={
+    "session": sessions[0]["name"],
+    "ext": "png"
+})
+task_id = resp.json()["task_id"]
+
+# 查询打包进度
+import time
+while True:
+    resp = requests.get(f"{base}/progress/{task_id}")
+    progress = resp.json()
+    print(f"Progress: {progress['processed']}/{progress['total']}")
+    if progress["state"] == "done":
+        break
+    time.sleep(1)
+
+# 下载 ZIP 文件
+resp = requests.get(f"{base}/zip/{task_id}")
+with open("recordings.zip", "wb") as f:
+    f.write(resp.content)
+
+==========================
+使用示例（curl）
+==========================
+# 健康检查
+curl http://127.0.0.1:5008/health
+
+# 通过网关发送命令
+curl -X POST http://127.0.0.1:5008/uav/0/reset \
+  -H "Content-Type: application/json" \
+  -d '{"vid":0,"position":[0,0,2],"hard":true,"force":true}'
+
+curl -X POST http://127.0.0.1:5008/uav/0/command \
+  -H "Content-Type: application/json" \
+  -d '{"cmd":"get_position"}'
+
+# 获取会话列表
+curl http://127.0.0.1:5008/sessions
+
+# 启动打包
+curl "http://127.0.0.1:5008/start_zip?session=session_xxx&ext=png"
+
+# 查询进度
+curl http://127.0.0.1:5008/progress/1
+
+# 下载 ZIP
+curl -o recordings.zip http://127.0.0.1:5008/zip/1
+
 """
 import os
 import io

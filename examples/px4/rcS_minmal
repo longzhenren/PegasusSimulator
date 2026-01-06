@@ -192,9 +192,6 @@ param set-default MAV_PROTO_VER 2
 # 仅在需要时才启用 MC AT 控制（保持默认）
 param set-default -s MC_AT_EN 1
 
-# 日志相关默认值你在 airframe 里已经调成 “不记录”：
-# SDLOG_MODE=0, SDLOG_PROFILE=0, SDLOG_DIRS_MAX=1
-
 # 失联时间随仿真时间缩放（保留，代价很小）
 if [ -n "$PX4_SIM_SPEED_FACTOR" ]; then
     COM_DL_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 10" | bc)
@@ -287,8 +284,17 @@ then
     echo "pwm_out_sim start failed"
 fi
 
-# 车辆类型相关配置（multicopter / VTOL / plane 等）
-. ${R}etc/init.d/rc.vehicle_setup
+rc_setup="${R}etc/init.d/rc.vehicle_setup"
+if [ ! -e "$rc_setup" ]
+then
+    rc_setup="${R}etc/init.d-posix/rc.vehicle_setup"
+fi
+if [ -e "$rc_setup" ]
+then
+    . "$rc_setup"
+else
+    echo "WARN [init] rc.vehicle_setup not found ($rc_setup)"
+fi
 
 navigator start
 
@@ -329,18 +335,22 @@ fi
 # ----------------------------------------------------------------------------
 
 # 用户自定义 mavlink stream 设置
-. px4-rc.mavlink
+. /home/user/PegasusSimulator-5.1/examples/px4/px4-rc_minmal.mavlink
 
 # autostart 后置脚本（若存在）
 [ -e "$autostart_file".post ] && . "$autostart_file".post
 
 # ----------------------------------------------------------------------------
-# 12. 不启 logger / replay / load_mon 等，以达到“极简 + 高并发”目的
+# 12. 不启 replay / load_mon 等，以达到“极简 + 高并发”目的
 # ----------------------------------------------------------------------------
 
-# 不再调用 rc.logging（避免启动 logger 线程）
 # 不再调用 load_mon start
 # 不再调用 battery_simulator start
+# Run script to start logging
+# set LOGGER_ARGS "-e -p vehicle_attitude -p vehicle_local_position actuator_outputs sensor_combined"
+set LOGGER_ARGS "-e -r 20 vehicle_attitude vehicle_local_position actuator_outputs sensor_combined"
+. ${R}etc/init.d/rc.logging
+
 tone_alarm start
 replay trystart
 

@@ -46,3 +46,5 @@ export4/
 sensor_data/
 backup/
 recordings/
+px4_logs/
+examples/launch/pegasus_uav_*.launch

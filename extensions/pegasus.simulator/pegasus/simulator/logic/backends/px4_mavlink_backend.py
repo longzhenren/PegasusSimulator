@@ -1,4 +1,219 @@
 """
+PX4 MAVLink 后端（px4_mavlink_backend.py）
+
+==========================
+概述
+==========================
+本模块实现 Isaac Sim 与 PX4 飞控之间的 MAVLink 通信后端，负责：
+- 发送仿真传感器数据（IMU、GPS、气压计、磁力计）到 PX4
+- 接收 PX4 的执行器控制命令（电机推力）
+- 管理 PX4 SITL 进程的自动启动和重启
+- 支持 lockstep 同步模式（仿真与 PX4 时钟同步）
+
+==========================
+类结构
+==========================
+SensorSource
+  - 传感器类型的 MAVLink 位掩码常量
+
+SensorMsg
+  - 传感器数据缓冲区（IMU、GPS、气压计、磁力计、视觉等）
+
+ThrusterControl
+  - 执行器控制数据处理（MAVLink → 角速度）
+
+PX4MavlinkBackendConfig
+  - 后端配置类（连接参数、PX4 启动参数、执行器参数等）
+
+PX4MavlinkBackend
+  - 主后端类，继承自 Backend 基类
+  - 实现传感器数据发送、控制命令接收、PX4 进程管理
+
+==========================
+MAVLink 消息类型
+==========================
+发送（Isaac Sim → PX4）：
+  - HEARTBEAT           - 心跳消息（1Hz）
+  - HIL_SENSOR          - 传感器数据（加速度、陀螺仪、磁力计、气压计）
+  - HIL_GPS             - GPS 数据
+  - HIL_STATE_QUATERNION - 真值状态（可选）
+  - VISION_POSITION_ESTIMATE - 视觉定位（可选）
+
+接收（PX4 → Isaac Sim）：
+  - HEARTBEAT           - PX4 心跳
+  - HIL_ACTUATOR_CONTROLS - 执行器控制命令
+
+==========================
+配置参数说明
+==========================
+PX4MavlinkBackendConfig 参数：
+  vehicle_id          - 载具 ID（0, 1, 2, ...）
+  connection_type     - 连接类型（tcpin/udpin/tcpout/udpout）
+  connection_ip       - 连接 IP（默认 localhost）
+  connection_baseport - 基础端口（默认 4560）
+  px4_autolaunch      - 是否自动启动 PX4（默认 True）
+  px4_dir             - PX4-Autopilot 目录路径
+  px4_vehicle_model   - PX4 载具模型（默认 gazebo-classic_iris）
+  enable_lockstep     - 启用 lockstep 同步（默认 True）
+  num_rotors          - 电机数量（默认 4）
+  input_offset        - 电机输入偏移
+  input_scaling       - 电机输入缩放
+  zero_position_armed - 解锁时零位
+  update_rate         - 更新频率（默认 120Hz）
+  sim_speed_factor    - 仿真加速倍率（默认 1.0）
+
+==========================
+端口规划
+==========================
+4560 + vehicle_id    - MAVLink TCP lockstep 端口（Isaac Sim 监听）
+8888 + vehicle_id    - ROS2 UXRCE-DDS 端口（PX4 使用）
+
+==========================
+Lockstep 同步模式
+==========================
+当 enable_lockstep=True 时：
+1. Isaac Sim 发送传感器数据后等待 PX4 返回控制命令
+2. PX4 收到传感器数据后计算控制输出并发送
+3. Isaac Sim 收到控制命令后才推进下一个物理步
+4. 确保仿真时钟与 PX4 时钟严格同步
+
+==========================
+主要方法
+==========================
+start()
+  - 启动 MAVLink 后端
+  - 初始化连接
+  - 自动启动 PX4（如果配置）
+
+stop()
+  - 停止 MAVLink 后端
+  - 关闭连接
+  - 停止 PX4 进程
+
+update(dt)
+  - 每物理步调用
+  - 发送心跳、传感器数据
+  - 接收控制命令
+  - 检查 PX4 进程状态
+
+update_sensor(sensor_type, data)
+  - 接收仿真传感器数据回调
+  - 支持：IMU、GPS、Barometer、Magnetometer
+
+update_state(state)
+  - 接收载具状态回调
+  - 用于发送真值数据
+
+input_reference()
+  - 返回电机角速度参考值列表
+
+hard_reboot_px4()
+  - 硬重启 PX4 进程（立即终止）
+
+soft_relaunch_px4()
+  - 软重启 PX4 进程（清理后重启）
+
+px4_ready_to_takeoff (property)
+  - 返回 PX4 是否处于 "Ready for takeoff" 状态
+
+==========================
+调用关系
+==========================
+┌─────────────────────────────────────────────────────────────┐
+│                   Isaac Sim 仿真端                          │
+│                                                             │
+│  Multirotor ──► PX4MavlinkBackend                          │
+│      │              │                                       │
+│      │ 传感器数据    │ 控制命令                              │
+│      ▼              ▼                                       │
+│  [IMU,GPS,...]   [电机角速度]                               │
+└─────────┬───────────┬───────────────────────────────────────┘
+          │           ▲
+          │ MAVLink   │ MAVLink
+          ▼           │
+┌─────────────────────┴───────────────────────────────────────┐
+│                    PX4 SITL                                  │
+│              (由 PX4LaunchTool 管理)                         │
+│                                                              │
+│  TCP 端口: 4560 + vehicle_id                                │
+└──────────────────────────────────────────────────────────────┘
+
+==========================
+传感器数据流
+==========================
+物理仿真
+    │
+    ▼
+IMU/GPS/Baro/Mag 传感器
+    │
+    │ update_sensor()
+    ▼
+SensorMsg 缓冲区
+    │
+    │ send_sensor_msgs() / send_gps_msgs()
+    ▼
+MAVLink HIL_SENSOR / HIL_GPS
+    │
+    ▼
+PX4 飞控
+
+==========================
+控制数据流
+==========================
+PX4 飞控
+    │
+    │ HIL_ACTUATOR_CONTROLS
+    ▼
+poll_mavlink_messages()
+    │
+    │ handle_control()
+    ▼
+ThrusterControl
+    │
+    │ input_reference()
+    ▼
+Multirotor 电机
+
+==========================
+使用示例
+==========================
+from px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
+
+# 创建配置
+config = PX4MavlinkBackendConfig({
+    "vehicle_id": 0,
+    "px4_autolaunch": True,
+    "px4_dir": "/home/user/PX4-Autopilot",
+    "sim_speed_factor": 2.0,
+    "enable_lockstep": True,
+})
+
+# 创建后端
+backend = PX4MavlinkBackend(config)
+
+# 添加到 Multirotor
+multirotor_config.backends = [backend]
+
+# 后端会在仿真开始时自动启动
+
+==========================
+错误恢复
+==========================
+1. PX4 进程崩溃
+   - update() 中周期性检查 PX4 进程状态
+   - 如果进程不存在，自动调用 hard_reboot_px4() 重启
+
+2. MAVLink 连接断开
+   - re_initialize_interface() 重新初始化连接
+   - 重置心跳等待状态
+
+3. 心跳超时
+   - wait_for_first_hearbeat() 等待 PX4 心跳
+   - 节流日志输出避免刷屏
+
+==========================
+原始文件信息
+==========================
 | File: px4_mavlink_backend.py
 | Author: Marcelo Jacinto (marcelo.jacinto@tecnico.ulisboa.pt)
 | Description: File that implements the Mavlink Backend for communication/control with/of the vehicle simulation
@@ -16,6 +231,37 @@ from pegasus.simulator.logic.state import State
 from pegasus.simulator.logic.backends.backend import Backend, BackendConfig
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 from pegasus.simulator.logic.backends.tools.px4_launch_tool import PX4LaunchTool
+
+
+def _is_port_in_use(port: int) -> bool:
+    """检查端口是否被占用"""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(('127.0.0.1', port))
+            return False
+        except OSError:
+            return True
+
+
+def _wait_for_port_release(port: int, timeout: float = 30.0, interval: float = 0.5) -> bool:
+    """
+    等待端口释放
+
+    Args:
+        port: 端口号
+        timeout: 超时时间（秒）
+        interval: 检测间隔（秒）
+
+    Returns:
+        True 如果端口已释放，False 如果超时
+    """
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if not _is_port_in_use(port):
+            return True
+        time.sleep(interval)
+    return False
 
 
 class SensorSource:
@@ -286,6 +532,9 @@ class PX4MavlinkBackend(Backend):
 
         # They are configured and launched by the external control script.
 
+        # Get PX4 log directory from environment or use default
+        self._px4_log_dir = self._get_px4_log_dir()
+
         # Set the update rate used for sending the messages (TODO - remove this hardcoded value from here)
         self._update_rate: float = self.config.update_rate
         self._time_step: float = 1.0 / self._update_rate  # s
@@ -330,6 +579,21 @@ class PX4MavlinkBackend(Backend):
 
         # Log 前缀（不依赖 MAVROS 命名空间）
         self._log_prefix = f"[uav{self._vehicle_id}]"
+
+    def _get_px4_log_dir(self):
+        """获取 PX4 日志目录"""
+        import os
+        session_ts = os.environ.get("PEGASUS_SESSION_TS")
+        if session_ts:
+            cwd = os.getcwd()
+            log_dir = os.path.join(cwd, "logs", session_ts, "px4")
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+                return log_dir
+            except Exception:
+                pass
+        # 回退到 None,让 PX4LaunchTool 使用默认路径
+        return None
 
     def update_sensor(self, sensor_type: str, data):
         """Method that is used as callback for the vehicle for every iteration that a sensor produces new data. 
@@ -532,7 +796,7 @@ class PX4MavlinkBackend(Backend):
         # Launch the PX4 in the background if needed
         if self.px4_tool is None:
             carb.log_info(f"{self._log_prefix} Attempting to launch PX4 in background process")
-            self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model, self.config.sim_speed_factor)
+            self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model, self.config.sim_speed_factor, log_dir=self._px4_log_dir)
             if self.px4_autolaunch:
                 # If a pid file exists, verify the process is alive; otherwise relaunch
                 try:
@@ -620,8 +884,18 @@ class PX4MavlinkBackend(Backend):
             carb.log_warn(traceback.format_exc())
         self._connection = None
         self._is_running = False
-        # Reset protocol state so update() restarts heartbeat wait cleanly
-        self._received_first_hearbeat = False
+
+        # 等待端口释放
+        mavlink_port = self.config.connection_baseport + self._vehicle_id
+        carb.log_info(f"{self._log_prefix} Waiting for MAVLink port {mavlink_port} to be released...")
+        if _wait_for_port_release(mavlink_port, timeout=30.0, interval=0.5):
+            carb.log_info(f"{self._log_prefix} MAVLink port {mavlink_port} released")
+        else:
+            carb.log_warn(f"{self._log_prefix} MAVLink port {mavlink_port} release timeout, continuing anyway")
+
+        # 注意: 不要重置 _received_first_hearbeat,避免死锁
+        # 后续 soft_relaunch_px4() 会重新建立连接并继续发送数据
+        # 只重置 actuator 相关状态
         self._received_first_actuator = False
         self._received_actuator = False
         self._last_heartbeat_sent_time = 0
@@ -631,6 +905,25 @@ class PX4MavlinkBackend(Backend):
         """Relaunch PX4 using current config without stopping simulator."""
         try:
             carb.log_info(f"{self._log_prefix} Relaunching PX4")
+
+            # 先关闭旧的 MAVLink 连接
+            try:
+                if self._connection is not None:
+                    self._connection.close()
+                    carb.log_info(f"{self._log_prefix} Closed existing MAVLink connection")
+            except Exception as e:
+                carb.log_warn(f"{self._log_prefix} Close MAVLink connection failed: {e}")
+            self._connection = None
+            self._is_running = False
+
+            # 等待端口释放
+            mavlink_port = self.config.connection_baseport + self._vehicle_id
+            carb.log_info(f"{self._log_prefix} Waiting for MAVLink port {mavlink_port} to be released...")
+            if _wait_for_port_release(mavlink_port, timeout=30.0, interval=0.5):
+                carb.log_info(f"{self._log_prefix} MAVLink port {mavlink_port} released")
+            else:
+                carb.log_warn(f"{self._log_prefix} MAVLink port {mavlink_port} release timeout, continuing anyway")
+
             # Ensure previous pid file is cleared to avoid px4 thinking 'server not running'
             try:
                 import os
@@ -639,8 +932,25 @@ class PX4MavlinkBackend(Backend):
             except Exception as e:
                 carb.log_warn(f"{self._log_prefix} Remove stale PID before relaunch failed: {e}")
                 carb.log_warn(traceback.format_exc())
-            self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model, self.config.sim_speed_factor)
+
+            # 重新初始化 MAVLink 接口（先于 PX4 启动）
+            carb.log_info(f"{self._log_prefix} Re-initializing MAVLink interface...")
+            self.re_initialize_interface()
+            self._is_running = True
+
+            # 创建新的 PX4 工具并启动
+            self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model, self.config.sim_speed_factor, log_dir=self._px4_log_dir)
             self.px4_tool.launch_px4()
+
+            # 注意: 不要重置 _received_first_hearbeat,让 update() 继续发送传感器数据
+            # 这样 PX4 可以收到数据并发送心跳回来
+            # 重置 actuator 相关状态
+            self._received_first_actuator = False
+            self._received_actuator = False
+            self._last_heartbeat_sent_time = 0
+
+            carb.log_info(f"{self._log_prefix} PX4 relaunched, MAVLink interface ready")
+
         except Exception as e:
             carb.log_warn(f"{self._log_prefix} Relaunch PX4 failed: {e}")
             carb.log_warn(traceback.format_exc())
@@ -650,6 +960,17 @@ class PX4MavlinkBackend(Backend):
         """
         return
 
+    @property
+    def px4_ready_to_takeoff(self) -> bool:
+        """获取 PX4 ready to takeoff 状态（从 PX4 日志检测）"""
+        if self.px4_tool is not None:
+            return self.px4_tool.ready_to_takeoff
+        return False
+
+    def get_px4_log_file_path(self) -> str:
+        """获取 PX4 日志文件路径"""
+        return PX4LaunchTool.log_file_path(self._vehicle_id)
+
     def re_initialize_interface(self):
         """Auxiliar method used to get the MavlinkInterface to reset the MavlinkInterface to its initial state
         """
@@ -658,6 +979,15 @@ class PX4MavlinkBackend(Backend):
 
         # Restart the sensor data
         self._sensor_data = SensorMsg()
+
+        # 检查并等待端口释放
+        mavlink_port = self.config.connection_baseport + self._vehicle_id
+        if _is_port_in_use(mavlink_port):
+            carb.log_info(f"{self._log_prefix} MAVLink port {mavlink_port} is in use, waiting for release...")
+            if _wait_for_port_release(mavlink_port, timeout=30.0, interval=0.5):
+                carb.log_info(f"{self._log_prefix} MAVLink port {mavlink_port} released")
+            else:
+                carb.log_warn(f"{self._log_prefix} MAVLink port {mavlink_port} release timeout, attempting connection anyway")
 
         # Restart the connection
         carb.log_info(f"{self._log_prefix} Connection to backend at {self._connection_port}")
@@ -740,7 +1070,17 @@ class PX4MavlinkBackend(Backend):
         self.send_gps_msgs(self._current_utime)
 
     def _is_px4_alive(self) -> bool:
+        """检查 PX4 进程是否存活。优先检查 px4_tool.px4_process，其次检查 PID 文件。"""
         try:
+            # 优先检查 px4_tool 管理的进程
+            if self.px4_tool is not None and self.px4_tool.px4_process is not None:
+                # poll() 返回 None 表示进程还在运行
+                if self.px4_tool.px4_process.poll() is None:
+                    return True
+                else:
+                    return False
+
+            # 回退到 PID 文件检查（用于外部启动的 PX4）
             import os, signal
             if not os.path.exists(self._px4_pid_path):
                 return False
@@ -767,7 +1107,14 @@ class PX4MavlinkBackend(Backend):
         now = time.time()
         if not hasattr(self, "_last_px4_check_time"):
             self._last_px4_check_time = 0.0
-            self._px4_check_interval = 1.0
+            self._px4_check_interval = 5.0  # 检查间隔增加到 5 秒
+            self._px4_startup_grace_period = 30.0  # 启动后 30 秒内不检查
+            self._px4_start_time = now  # 记录启动时间
+
+        # 启动保护期：刚启动后一段时间内不检查
+        if (now - self._px4_start_time) < self._px4_startup_grace_period:
+            return
+
         if (now - self._last_px4_check_time) < self._px4_check_interval:
             return
         self._last_px4_check_time = now
@@ -779,6 +1126,7 @@ class PX4MavlinkBackend(Backend):
         try:
             carb.log_warn(f"{self._log_prefix} PX4 not alive; attempting relaunch")
             self.hard_reboot_px4()
+            self._px4_start_time = time.time()  # 重置启动时间
         except Exception as e:
             carb.log_warn(f"{self._log_prefix} Periodic relaunch failed: {e}")
             carb.log_warn(traceback.format_exc())
