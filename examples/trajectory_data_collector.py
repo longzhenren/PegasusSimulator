@@ -586,6 +586,34 @@ def _transform_points(
     return out
 
 
+# 最小航点距离，略大于 MOVE_REACH_THRESHOLD (0.3m)
+MIN_WAYPOINT_DIST = float(os.environ.get("PEGASUS_MIN_WAYPOINT_DIST", "0.35"))
+
+
+def _filter_close_points(pts: List[TrajPoint], min_dist: float = MIN_WAYPOINT_DIST) -> List[TrajPoint]:
+    """过滤掉距离过近的航点，保留第一个点和最后一个点"""
+    if len(pts) <= 2:
+        return pts
+
+    filtered: List[TrajPoint] = [pts[0]]  # 始终保留第一个点
+
+    for i in range(1, len(pts) - 1):
+        last = filtered[-1]
+        curr = pts[i]
+        dx = curr.x - last.x
+        dy = curr.y - last.y
+        dz = curr.z - last.z
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dist >= min_dist:
+            filtered.append(curr)
+
+    # 始终保留最后一个点
+    if len(pts) > 1:
+        filtered.append(pts[-1])
+
+    return filtered
+
+
 def _fetch_all_info(image_base: str, uav_id: int, timeout: float, retries: int) -> Dict[str, Any]:
     url = f"{image_base}/uav/{uav_id}/all"
     last: Optional[Dict[str, Any]] = None
@@ -900,15 +928,26 @@ class MavrosCommander:
         ts_log(f"[MavrosCommander UAV{self.uav_id}]", f"wait_ready_to_takeoff timeout, status={status}", "WARN")
         return False
 
-    def _call_service(self, client, req, timeout_s: float, max_retries: int = 3):
+    def _call_service(self, client, req, timeout_s: float, max_retries: int = 10):
+        """调用ROS2服务，支持重试机制
+
+        关键修复：增加重试次数和等待时间，处理MAVROS重启后服务不可用的情况
+        """
         last_err: Optional[Exception] = None
         for attempt in range(max(1, max_retries)):
-            # 等待服务可用
-            wait_timeout = min(10.0, float(timeout_s))
+            # 等待服务可用，每次重试增加等待时间
+            base_wait = min(10.0, float(timeout_s))
+            # 前几次快速重试，后面增加等待时间
+            wait_timeout = base_wait if attempt < 3 else base_wait + (attempt - 2) * 2.0
+
             if not client.wait_for_service(timeout_sec=wait_timeout):
-                last_err = TimeoutError(f"service not available after {wait_timeout}s (attempt {attempt + 1}/{max_retries})")
+                last_err = TimeoutError(f"service not available after {wait_timeout:.1f}s (attempt {attempt + 1}/{max_retries})")
                 if attempt < max_retries - 1:
-                    time.sleep(1.0)
+                    # 等待时间递增：1s, 2s, 3s, ...
+                    retry_delay = min(1.0 + attempt * 0.5, 5.0)
+                    ts_log(f"[MavrosCommander UAV{self.uav_id}]",
+                           f"service not available, retrying in {retry_delay:.1f}s...", "WARN")
+                    time.sleep(retry_delay)
                 continue
 
             try:
@@ -921,11 +960,60 @@ class MavrosCommander:
                 last_err = TimeoutError(f"service call timeout (attempt {attempt + 1}/{max_retries})")
             except Exception as e:
                 last_err = e
+                ts_log(f"[MavrosCommander UAV{self.uav_id}]",
+                       f"service call exception: {e}, retrying...", "WARN")
 
             if attempt < max_retries - 1:
-                time.sleep(1.0)
+                retry_delay = min(1.0 + attempt * 0.5, 5.0)
+                time.sleep(retry_delay)
 
         raise last_err if last_err else TimeoutError("service not available")
+
+    def wait_mission_services_ready(self, timeout_s: float = 60.0) -> bool:
+        """等待MAVROS mission服务就绪
+
+        关键修复：在reset后需要等待MAVROS服务完全初始化，否则mission服务不可用
+        """
+        deadline = time.time() + float(timeout_s)
+        services_to_check = [
+            (self.mission_clear_client, "waypoint/clear"),
+            (self.mission_push_client, "waypoint/push"),
+            (self.set_mode_client, "set_mode"),
+            (self.arming_client, "cmd/arming"),
+        ]
+
+        ts_log(f"[MavrosCommander UAV{self.uav_id}]", "Waiting for MAVROS services to be ready...")
+
+        all_ready = False
+        last_log_time = 0.0
+        log_interval = 5.0
+
+        while time.time() < deadline:
+            ready_count = 0
+            not_ready = []
+
+            for client, name in services_to_check:
+                if client.wait_for_service(timeout_sec=1.0):
+                    ready_count += 1
+                else:
+                    not_ready.append(name)
+
+            if ready_count == len(services_to_check):
+                all_ready = True
+                ts_log(f"[MavrosCommander UAV{self.uav_id}]",
+                       f"All MAVROS services ready ({ready_count}/{len(services_to_check)})")
+                break
+
+            now = time.time()
+            if now - last_log_time >= log_interval:
+                ts_log(f"[MavrosCommander UAV{self.uav_id}]",
+                       f"Waiting for services: {ready_count}/{len(services_to_check)} ready, "
+                       f"not ready: {not_ready}", "WARN")
+                last_log_time = now
+
+            time.sleep(1.0)
+
+        return all_ready
 
     def set_mode(self, mode: str, timeout_s: float = 10.0) -> None:
         req = SetMode.Request()
@@ -1313,8 +1401,15 @@ class Worker:
 
         raw_pts = _load_preprocessed_xyz(json_path)
         init_pos = _load_init_point_xyz(json_path)
-        
+
         pts = _transform_points(raw_pts, self.scale, init_pos.x, init_pos.y, init_pos.z, self.z_down)
+
+        # 过滤距离过近的航点，避免在航点处打转
+        pts_before = len(pts)
+        pts = _filter_close_points(pts, MIN_WAYPOINT_DIST)
+        if len(pts) < pts_before:
+            self._log(f"[UAV{self.uav_id}] filtered {pts_before - len(pts)} close waypoints (min_dist={MIN_WAYPOINT_DIST:.2f}m), {len(pts)} remaining")
+
         if int(self.max_points) > 0:
             raw_pts = raw_pts[: int(self.max_points)]
             pts = pts[: int(self.max_points)]
@@ -1323,11 +1418,17 @@ class Worker:
 
         self._log(f"[UAV{self.uav_id}] reset(hard=True) before traj={traj_name}")
 
-        # 先确保 mavros 已连接
-        if self.commander is None:
-            raise RuntimeError("missing mavros commander")
-        if not self.commander.wait_connected(timeout_s=60.0):
-            raise TimeoutError("mavros not connected")
+        # MAVROS 连接检查（可选，HTTP命令不依赖MAVROS）
+        mavros_ok = False
+        if self.commander is not None:
+            try:
+                mavros_ok = self.commander.wait_connected(timeout_s=30.0)
+                if mavros_ok:
+                    self._log(f"[UAV{self.uav_id}] MAVROS connected")
+                else:
+                    self._log(f"[UAV{self.uav_id}] MAVROS not connected, proceeding with HTTP commands", "WARN")
+            except Exception as e:
+                self._log(f"[UAV{self.uav_id}] MAVROS check failed: {e}, proceeding with HTTP commands", "WARN")
 
         # 执行 reset 并同时等待 OFFBOARD + PX4 ready
         self._reset_and_wait_ready(
@@ -1335,6 +1436,10 @@ class Worker:
             yaw_deg=None,
             timeout=self.reset_timeout,
         )
+
+        # 使用HTTP命令，不再需要等待MAVROS mission服务
+        # MAVROS服务仅用于状态监控（可选）
+        self._log(f"[UAV{self.uav_id}] using HTTP commands, skipping MAVROS service check")
 
         traj_start_ts = time.time()
         self._log(f"[UAV{self.uav_id}] start traj={traj_name} points={len(pts)}")
@@ -1346,114 +1451,22 @@ class Worker:
         all_pose_rows: List[Dict[str, Any]] = []
 
         try:
-            mission_wps: List[Waypoint] = []
-            for i, p_cmd in enumerate(pts):
-                wp = Waypoint()
-                wp.frame = int(getattr(Waypoint, "FRAME_LOCAL_NED", 1))
-                wp.command = int(getattr(Waypoint, "NAV_TAKEOFF", 22) if i == 0 else getattr(Waypoint, "NAV_WAYPOINT", 16))
-                wp.is_current = bool(i == 0)
-                wp.autocontinue = True
-                wp.param1 = float(0.0)
-                wp.param2 = float(0.5)
-                wp.param3 = float(0.0)
-                wp.param4 = float(p_cmd.yaw_deg) if p_cmd.yaw_deg == p_cmd.yaw_deg else float("nan")
-                wp.x_lat = float(p_cmd.x)
-                wp.y_long = float(p_cmd.y)
-                wp.z_alt = float(p_cmd.z)
-                mission_wps.append(wp)
-
-            land_wp = Waypoint()
-            land_wp.frame = int(getattr(Waypoint, "FRAME_LOCAL_NED", 1))
-            land_wp.command = int(getattr(Waypoint, "NAV_LAND", 21))
-            land_wp.is_current = False
-            land_wp.autocontinue = True
-            land_wp.param1 = float(0.0)
-            land_wp.param2 = float(0.5)
-            land_wp.param3 = float(0.0)
-            land_wp.param4 = float("nan")
-            land_wp.x_lat = float(pts[-1].x)
-            land_wp.y_long = float(pts[-1].y)
-            land_wp.z_alt = float(0.0)
-            mission_wps.append(land_wp)
-
-            self.commander.reached_seq = -1
-            self.commander.clear_mission(timeout_s=10.0)
-            self.commander.push_mission(mission_wps, timeout_s=30.0)
-
-            # 执行解锁并起飞，带有arm状态检查
-            max_arm_retries = 5
-            arm_success = False
-            for arm_attempt in range(max_arm_retries):
-                try:
-                    self.commander.set_mode("AUTO.MISSION", timeout_s=10.0)
-                except Exception as e:
-                    _log_exc(f"set_mode AUTO.MISSION failed uav_id={self.uav_id} attempt={arm_attempt+1}", e)
-                try:
-                    self.commander.arm(True, timeout_s=10.0)
-                except Exception as e:
-                    _log_exc(f"arm failed uav_id={self.uav_id} attempt={arm_attempt+1}", e)
-
-                # 检查arm状态
-                time.sleep(0.5)
-                st = self.commander.state
-                armed = bool(getattr(st, "armed", False)) if st is not None else False
-                if armed:
-                    arm_success = True
-                    self._log(f"[UAV{self.uav_id}] armed successfully on attempt {arm_attempt+1}")
-                    break
-                else:
-                    self._log(f"[UAV{self.uav_id}] arm state is False, retrying... attempt={arm_attempt+1}/{max_arm_retries}")
-                    time.sleep(1.0)
-
-            if not arm_success:
-                raise RuntimeError(f"failed to arm UAV{self.uav_id} after {max_arm_retries} attempts")
+            # 使用OFFBOARD模式的move_to命令代替mission waypoints
+            # （PX4 mission模式不支持本地NED坐标，只支持GPS坐标）
+            self._log(f"[UAV{self.uav_id}] starting OFFBOARD waypoint navigation ({len(pts)} points)")
 
             for i, (p_in, p_cmd) in enumerate(zip(raw_pts, pts)):
-                # 在等待航点到达时检查arm状态
-                wp_deadline = time.time() + float(self.cmd_timeout)
-                wp_reached = False
-                rearm_count = 0
-                max_rearm_during_flight = 3
+                # 发送move_to命令到控制器
+                self._log(f"[UAV{self.uav_id}] moving to waypoint {i}/{len(pts)-1}: ({p_cmd.x:.2f}, {p_cmd.y:.2f}, {p_cmd.z:.2f})")
 
-                while time.time() < wp_deadline:
-                    # 检查是否到达航点
-                    if int(self.commander.reached_seq) >= i:
-                        wp_reached = True
-                        break
-
-                    # 检查arm状态
-                    st = self.commander.state
-                    armed = bool(getattr(st, "armed", False)) if st is not None else True
-
-                    if not armed:
-                        self._log(f"[UAV{self.uav_id}] arm state became False during flight at wp={i}, attempting rearm...")
-                        rearm_count += 1
-                        if rearm_count > max_rearm_during_flight:
-                            raise RuntimeError(f"UAV{self.uav_id} disarmed too many times during flight (>{max_rearm_during_flight})")
-
-                        # 重新解锁并设置模式
-                        try:
-                            self.commander.set_mode("AUTO.MISSION", timeout_s=10.0)
-                        except Exception as e:
-                            _log_exc(f"rearm set_mode failed uav_id={self.uav_id}", e)
-                        try:
-                            self.commander.arm(True, timeout_s=10.0)
-                        except Exception as e:
-                            _log_exc(f"rearm arm failed uav_id={self.uav_id}", e)
-
-                        time.sleep(0.5)
-                        # 再次检查arm状态
-                        st = self.commander.state
-                        armed = bool(getattr(st, "armed", False)) if st is not None else False
-                        if armed:
-                            self._log(f"[UAV{self.uav_id}] rearmed successfully")
-                        else:
-                            self._log(f"[UAV{self.uav_id}] rearm failed, will retry...")
-
-                    time.sleep(0.1)
-
-                if not wp_reached:
-                    raise TimeoutError(f"mission waypoint not reached seq={i}")
+                try:
+                    cmd = {"cmd": "move_to", "x": float(p_cmd.x), "y": float(p_cmd.y), "z": float(p_cmd.z), "force": True}
+                    resp = _controller_command(self.control_base, self.uav_id, cmd, timeout=self.cmd_timeout)
+                    if not isinstance(resp, dict) or resp.get("ok") is False:
+                        raise RuntimeError(f"move_to failed: {resp}")
+                except Exception as e:
+                    self._log(f"[UAV{self.uav_id}] waypoint {i} move_to failed: {e}", "WARN")
+                    raise
 
                 info = _fetch_all_info(
                     self.image_base,
@@ -1545,13 +1558,15 @@ class Worker:
                     }
                 )
 
-            self._log(f"[UAV{self.uav_id}] wait landed after mission traj={traj_name}")
-            landed = self.commander.wait_landed(timeout_s=max(60.0, self.cmd_timeout))
-            if not landed:
-                self._log(f"[UAV{self.uav_id}] mission land wait timeout, fallback AUTO.LAND traj={traj_name}")
-                landed = self.commander.land_and_wait(timeout_s=max(60.0, self.cmd_timeout))
-            if not landed:
-                self._log(f"[UAV{self.uav_id}] land wait timeout traj={traj_name}")
+            # 使用HTTP命令执行降落（不依赖MAVROS）
+            self._log(f"[UAV{self.uav_id}] executing HTTP land command for traj={traj_name}")
+            try:
+                land_cmd = {"cmd": "land", "force": True}
+                land_resp = _controller_command(self.control_base, self.uav_id, land_cmd, timeout=max(60.0, self.cmd_timeout))
+                if not isinstance(land_resp, dict) or land_resp.get("ok") is False:
+                    self._log(f"[UAV{self.uav_id}] HTTP land command failed: {land_resp}", "WARN")
+            except Exception as e:
+                self._log(f"[UAV{self.uav_id}] HTTP land exception: {e}", "WARN")
             time.sleep(2.0)
 
             self._log(f"[UAV{self.uav_id}] reset(hard=True) after land traj={traj_name}")
@@ -1716,9 +1731,12 @@ def main() -> None:
             try:
                 ts_log("[ROS2]", "Starting ROS2 spin...")
                 rclpy.spin(ros_node)
-                ts_log("[ROS2]", "ROS2 spin finished")
+                ts_log("[ROS2]", "ROS2 spin finished normally")
             except Exception as e:
+                import traceback as _tb
+                tb = _tb.format_exc()
                 ts_log("[ROS2]", f"ROS2 spin error: {e}", "ERROR")
+                ts_log("[ROS2]", f"ROS2 spin traceback:\n{tb}", "ERROR")
         spin_thread = threading.Thread(target=_spin, name="ros_spin", daemon=True)
         spin_thread.start()
 

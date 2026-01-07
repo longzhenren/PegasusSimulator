@@ -1,44 +1,185 @@
 {
-  "environment": "/home/user/Downloads/Demos/AEC/BrownstoneDemo/World_BrownstoneDemopack_Morning(20Gb).usd",
+  "world_settings": {
+    "latitude": 47.397742,
+    "longitude": 8.545594,
+    "altitude": 488.0
+  },
   "vehicles": [
     {
       "vehicle_id": 0,
-      "initial_position": [
+      "vehicle_name": "iris_0",
+      "vehicle_model": "iris",
+      "init_pos": [
         0.0,
         0.0,
         0.07
       ],
-      "initial_orientation_euler_deg": [
-        0.0,
-        0.0,
-        0.0
-      ],
-      "px4_autolaunch": true,
-      "px4_dir": "/home/user/PX4-Autopilot",
-      "mavros_namespace": "uav0",
-      "ros2_namespace": "uav0",
-      "publish_graphical_sensors": true,
-      "sim_speed_factor": 5.0,
-      "px4_vehicle_model": "gazebo-classic_iris_pg" 
-    },{
+      "init_yaw": 0.0
+    },
+    {
       "vehicle_id": 1,
-      "initial_position": [
+      "vehicle_name": "iris_1",
+      "vehicle_model": "iris",
+      "init_pos": [
         0.0,
         0.0,
         0.07
       ],
-      "initial_orientation_euler_deg": [
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 2,
+      "vehicle_name": "iris_2",
+      "vehicle_model": "iris",
+      "init_pos": [
         0.0,
         0.0,
-        0.0
+        0.07
       ],
-      "px4_autolaunch": true,
-      "px4_dir": "/home/user/PX4-Autopilot",
-      "mavros_namespace": "uav1",
-      "ros2_namespace": "uav1",
-      "publish_graphical_sensors": true,
-      "sim_speed_factor": 5.0,
-      "px4_vehicle_model": "gazebo-classic_iris_pg"
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 3,
+      "vehicle_name": "iris_3",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 4,
+      "vehicle_name": "iris_4",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 5,
+      "vehicle_name": "iris_5",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 6,
+      "vehicle_name": "iris_6",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 7,
+      "vehicle_name": "iris_7",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 8,
+      "vehicle_name": "iris_8",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 9,
+      "vehicle_name": "iris_9",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 10,
+      "vehicle_name": "iris_10",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 11,
+      "vehicle_name": "iris_11",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 12,
+      "vehicle_name": "iris_12",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 13,
+      "vehicle_name": "iris_13",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 14,
+      "vehicle_name": "iris_14",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
+    },
+    {
+      "vehicle_id": 15,
+      "vehicle_name": "iris_15",
+      "vehicle_model": "iris",
+      "init_pos": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "init_yaw": 0.0
     }
   ]
 }
