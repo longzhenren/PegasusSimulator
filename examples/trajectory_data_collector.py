@@ -61,7 +61,7 @@
 ==========================
 --input-dir PATH        轨迹 JSON 文件目录（必需）
 --pattern GLOB          JSON 文件匹配模式（默认：*.json）
---out-dir PATH          输出目录（默认：./trajectory_recordings）
+--out-dir PATH          输出目录（默认：./recordings）
 --config PATH           UAV 配置文件路径（默认：./multi_uav_config.json）
 --uav-ids IDS           指定 UAV ID 列表，逗号分隔（默认：从配置文件读取）
 --control-base URL      控制器基础 URL（默认：http://127.0.0.1:5009）
@@ -761,19 +761,6 @@ def _flush_ulg_copies() -> None:
 
 
 atexit.register(_flush_ulg_copies)
-
-
-# def _schedule_ulg_copy(src: Path, dst: Path) -> bool:
-#     try:
-#         if src is None or dst is None:
-#             return False
-#         if not src.exists():
-#             return False
-#         with _ULG_COPY_LOCK:
-#             _ULG_COPY_JOBS.append((src, dst))
-#         return True
-#     except Exception:
-#         return False
 
 
 def _copy_ulg_now(src: Path, dst: Path) -> bool:
@@ -1658,7 +1645,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--input-dir", type=str, required=True)
     p.add_argument("--pattern", type=str, default="*.json")
-    p.add_argument("--out-dir", type=str, default=str(Path(__file__).resolve().parent / "trajectory_recordings"))
+    p.add_argument("--out-dir", type=str, default=str(Path(__file__).resolve().parent / "recordings"))
     p.add_argument("--config", type=str, default=str(Path(__file__).resolve().parent / "multi_uav_config.json"))
     p.add_argument("--uav-ids", type=str, default="")
     p.add_argument("--control-base", type=str, default="http://127.0.0.1:5009")
