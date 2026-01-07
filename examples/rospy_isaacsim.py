@@ -45,7 +45,10 @@ HTTP 接口与示例
   - 响应：`{"status":"success","message":"reset ok","vid":0,"position":[x,y,z]}` 或 `409 busy`
 - `POST /command`
   - `{"cmd":"move_to","x":X,"y":Y,"z":Z}` → 移动并返回当前位姿
-  - `{"cmd":"move_to_many","points":[[x,y,z],...]}` → 批量移动
+  - `{"cmd":"move_to_many","points":[[x,y,z],...]}` → 批量移动（OFFBOARD逐点）
+  - `{"cmd":"execute_mission","points":[[x,y,z],...]}` → 使用MAVROS MISSION模式执行航点任务
+    - `use_mission_mode`: true=AUTO.MISSION模式，false=OFFBOARD逐点模式（默认true）
+    - `timeout`: 任务超时秒数（默认300）
   - `{"cmd":"land"}` → 执行降落并解除
   - `{"cmd":"get_position"}` → 返回当前位姿 `{x,y,z}`
   - `{"cmd":"get_status"}` → 返回连接、解锁、模式
@@ -188,6 +191,13 @@ from geometry_msgs.msg import PoseStamped
 from mavros_msgs.msg import State, RCIn, PositionTarget, ExtendedState
 from sensor_msgs.msg import Image
 from mavros_msgs.srv import CommandBool, SetMode, CommandLong
+# Mission waypoint services
+try:
+    from mavros_msgs.srv import WaypointPush, WaypointClear
+    from mavros_msgs.msg import Waypoint
+    _MISSION_AVAILABLE = True
+except Exception:
+    _MISSION_AVAILABLE = False
 try:
     from mavros_msgs.srv import ParamSet
     from mavros_msgs.msg import ParamValue as MavrosParamValue
@@ -492,6 +502,14 @@ class IsaacSimEnv(Node):
         self.arming_client    = self.create_client(CommandBool, self._mavros_prefix + "/mavros/cmd/arming")
         self.set_mode_client  = self.create_client(SetMode,    self._mavros_prefix + "/mavros/set_mode")
         self.cmdlong_client   = self.create_client(CommandLong,self._mavros_prefix + "/mavros/cmd/command")
+
+        # --- mission services ---
+        if _MISSION_AVAILABLE:
+            self.mission_push_client = self.create_client(WaypointPush, self._mavros_prefix + "/mavros/mission/push")
+            self.mission_clear_client = self.create_client(WaypointClear, self._mavros_prefix + "/mavros/mission/clear")
+        else:
+            self.mission_push_client = None
+            self.mission_clear_client = None
 
         # FCU 连接等待改为外部方法，在启动 MAVROS 之后调用
         self.get_logger().info(f"UAV{self._vid} Waiting for FCU connection...")
@@ -1075,6 +1093,216 @@ class IsaacSimEnv(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
             time.sleep(0.05)
         return False
+
+    # ========== MAVROS Mission Mode Methods ==========
+
+    def clear_mission(self, timeout_s: float = 10.0) -> bool:
+        """清除所有 mission 航点"""
+        if not _MISSION_AVAILABLE or self.mission_clear_client is None:
+            self.get_logger().warn("[mission] WaypointClear service not available")
+            return False
+
+        if not self.mission_clear_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("[mission] WaypointClear service not ready")
+            return False
+
+        req = WaypointClear.Request()
+        try:
+            future = self.mission_clear_client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
+            if future.result() is not None:
+                result = future.result()
+                if result.success:
+                    self.get_logger().info("[mission] Waypoints cleared successfully")
+                    return True
+                else:
+                    self.get_logger().warn("[mission] Failed to clear waypoints")
+                    return False
+            else:
+                self.get_logger().warn("[mission] Clear waypoints timed out")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"[mission] Clear waypoints exception: {e}")
+            return False
+
+    def push_mission(self, waypoints: list, start_index: int = 0, timeout_s: float = 30.0) -> bool:
+        """
+        推送 mission 航点到 FCU
+
+        Args:
+            waypoints: 航点列表，每个航点为 (x, y, z) 元组（本地 NED 坐标）
+            start_index: 起始航点索引
+            timeout_s: 超时时间
+
+        Returns:
+            是否成功
+
+        注意：PX4 SITL 的 mission 模式通常需要 GPS 坐标 (MAV_FRAME_GLOBAL_RELATIVE_ALT)，
+        但也支持本地坐标 (MAV_FRAME_LOCAL_NED)。这里使用本地坐标。
+        """
+        if not _MISSION_AVAILABLE or self.mission_push_client is None:
+            self.get_logger().warn("[mission] WaypointPush service not available")
+            return False
+
+        if not self.mission_push_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("[mission] WaypointPush service not ready")
+            return False
+
+        if not waypoints:
+            self.get_logger().warn("[mission] No waypoints to push")
+            return False
+
+        # 构建航点列表
+        wp_list = []
+        for i, (x, y, z) in enumerate(waypoints):
+            wp = Waypoint()
+            wp.frame = 1  # MAV_FRAME_LOCAL_NED
+            wp.command = 16  # MAV_CMD_NAV_WAYPOINT
+            wp.is_current = (i == start_index)
+            wp.autocontinue = True
+            wp.param1 = 0.0  # Hold time (s)
+            wp.param2 = MOVE_REACH_THRESHOLD  # Acceptance radius (m)
+            wp.param3 = 0.0  # Pass through (0=no)
+            wp.param4 = float('nan')  # Desired yaw (NaN=unchanged)
+            wp.x_lat = float(x)
+            wp.y_long = float(y)
+            wp.z_alt = float(z)
+            wp_list.append(wp)
+
+        self.get_logger().info(f"[mission] Pushing {len(wp_list)} waypoints to FCU")
+
+        req = WaypointPush.Request()
+        req.start_index = start_index
+        req.waypoints = wp_list
+
+        try:
+            future = self.mission_push_client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
+            if future.result() is not None:
+                result = future.result()
+                if result.success:
+                    self.get_logger().info(f"[mission] Pushed {result.wp_transfered} waypoints successfully")
+                    return True
+                else:
+                    self.get_logger().warn(f"[mission] Failed to push waypoints, transferred={result.wp_transfered}")
+                    return False
+            else:
+                self.get_logger().warn("[mission] Push waypoints timed out")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"[mission] Push waypoints exception: {e}")
+            return False
+
+    def start_mission(self, timeout_s: float = 10.0) -> bool:
+        """切换到 AUTO.MISSION 模式开始执行任务"""
+        mode_req = SetMode.Request()
+        mode_req.custom_mode = "AUTO.MISSION"
+
+        try:
+            resp = call_service_sync(self, self.set_mode_client, mode_req, timeout_sec=timeout_s)
+            if resp and getattr(resp, "mode_sent", False):
+                self.get_logger().info("[mission] Switched to AUTO.MISSION mode")
+                return True
+            else:
+                self.get_logger().warn("[mission] Failed to switch to AUTO.MISSION mode")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"[mission] Set mode exception: {e}")
+            return False
+
+    def execute_mission(
+        self,
+        waypoints: list,
+        timeout_s: float = 300.0,
+        completion_threshold: float = MOVE_REACH_THRESHOLD,
+    ) -> bool:
+        """
+        执行完整的 mission 飞行任务
+
+        Args:
+            waypoints: 航点列表，每个为 (x, y, z) 元组
+            timeout_s: 整体超时时间
+            completion_threshold: 到达最后一个航点的判定阈值
+
+        Returns:
+            是否成功完成任务
+        """
+        if not waypoints:
+            self.get_logger().warn("[mission] No waypoints provided")
+            return False
+
+        self.get_logger().info(f"[mission] Starting mission with {len(waypoints)} waypoints")
+
+        # Step 1: 清除旧航点
+        if not self.clear_mission():
+            self.get_logger().warn("[mission] Failed to clear old waypoints, continuing anyway")
+
+        # Step 2: 推送新航点
+        if not self.push_mission(waypoints):
+            self.get_logger().error("[mission] Failed to push waypoints")
+            return False
+
+        # Step 3: 确保已解锁
+        if not self.current_state.armed:
+            self.get_logger().info("[mission] Arming vehicle...")
+            self.arm_cmd.value = True
+            resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=ARMING_TIMEOUT_S)
+            if not (resp and getattr(resp, "success", False)):
+                self.get_logger().error("[mission] Failed to arm")
+                return False
+
+        # Step 4: 切换到 AUTO.MISSION 模式
+        if not self.start_mission():
+            self.get_logger().error("[mission] Failed to start mission mode")
+            return False
+
+        # Step 5: 等待任务完成（监控到达最后一个航点）
+        last_wp = waypoints[-1]
+        start_time = time.time()
+
+        self.get_logger().info(f"[mission] Waiting for mission completion, last wp=({last_wp[0]:.2f}, {last_wp[1]:.2f}, {last_wp[2]:.2f})")
+
+        while rclpy.ok() and (time.time() - start_time) < timeout_s:
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
+
+            # 检查是否到达最后一个航点
+            dx = self.current_pose.pose.position.x - last_wp[0]
+            dy = self.current_pose.pose.position.y - last_wp[1]
+            dz = self.current_pose.pose.position.z - last_wp[2]
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+            if dist < completion_threshold:
+                self.get_logger().info(f"[mission] Reached last waypoint (dist={dist:.3f}m)")
+                return True
+
+            # 检查是否还在 MISSION 模式
+            if self.current_state.mode != "AUTO.MISSION":
+                self.get_logger().warn(f"[mission] Mode changed to {self.current_state.mode}, mission may have ended")
+                # 可能是任务完成后自动切换了模式
+                if dist < completion_threshold * 2:
+                    return True
+
+            rclpy.spin_once(self, timeout_sec=0.1)
+            time.sleep(0.1)
+
+        self.get_logger().warn(f"[mission] Mission timeout after {timeout_s}s")
+        return False
+
+    def switch_to_offboard(self, timeout_s: float = 10.0) -> bool:
+        """切换回 OFFBOARD 模式"""
+        self.offb_set_mode.custom_mode = "OFFBOARD"
+        try:
+            resp = call_service_sync(self, self.set_mode_client, self.offb_set_mode, timeout_sec=timeout_s)
+            if resp and getattr(resp, "mode_sent", False):
+                self.get_logger().info("[mission] Switched back to OFFBOARD mode")
+                return True
+            else:
+                self.get_logger().warn("[mission] Failed to switch to OFFBOARD mode")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"[mission] Switch to OFFBOARD exception: {e}")
+            return False
 
     # ---------- Core API ----------
     def reset(self, target_z: float = None):
@@ -1900,6 +2128,41 @@ class IsaacSimEnv(Node):
                         x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
                         self.move_to_and_wait(x, y, z)
                 resp.update({"position": self.get_position()})
+            elif ctype == "execute_mission":
+                # 使用 MAVROS mission 模式执行航点任务
+                pts = cmd.get("points") or cmd.get("waypoints") or []
+                timeout = float(cmd.get("timeout", 300.0))
+                use_mission_mode = bool(cmd.get("use_mission_mode", True))
+
+                if not pts:
+                    resp = {"ok": False, "error": "No waypoints provided"}
+                else:
+                    waypoints = []
+                    for pt in pts:
+                        if isinstance(pt, (list, tuple)) and len(pt) >= 3:
+                            waypoints.append((float(pt[0]), float(pt[1]), float(pt[2])))
+
+                    if use_mission_mode and _MISSION_AVAILABLE:
+                        # 使用 AUTO.MISSION 模式
+                        self.get_logger().info(f"[execute_mission] Using MISSION mode with {len(waypoints)} waypoints")
+                        success = self.execute_mission(waypoints, timeout_s=timeout)
+                        # 任务完成后切换回 OFFBOARD 模式以便后续控制
+                        self.switch_to_offboard()
+                    else:
+                        # 回退到 OFFBOARD 逐点移动模式
+                        self.get_logger().info(f"[execute_mission] Using OFFBOARD mode with {len(waypoints)} waypoints")
+                        success = True
+                        for wp in waypoints:
+                            if not self.move_to_and_wait(wp[0], wp[1], wp[2], timeout_s=timeout / len(waypoints)):
+                                success = False
+                                break
+
+                    resp.update({
+                        "success": success,
+                        "mode": "MISSION" if (use_mission_mode and _MISSION_AVAILABLE) else "OFFBOARD",
+                        "waypoints_count": len(waypoints),
+                        "position": self.get_position()
+                    })
             elif ctype == "land":
                 self.land()
                 resp.update({"status": self.get_status()})
