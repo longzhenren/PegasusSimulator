@@ -1,0 +1,15 @@
+{
+  "uav_ids": [
+    0
+  ],
+  "image_base": "http://localhost:8081",
+  "control_base_template": "http://localhost:{port}",
+  "control_ports": {
+    "0": 5009
+  },
+  "input_dir": "test_collection_input",
+  "output_dir": "test_altitude_fix",
+  "file_pattern": "small_test_trajectory.json",
+  "scale": 1.0,
+  "reset_timeout": 45.0
+}

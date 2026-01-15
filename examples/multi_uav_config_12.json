@@ -12,6 +12,10 @@
     {"vehicle_id": 4, "vehicle_name": "iris_4", "vehicle_model": "iris", "init_pos": [0.0, 0.0, 0.07], "init_yaw": 0.0},
     {"vehicle_id": 5, "vehicle_name": "iris_5", "vehicle_model": "iris", "init_pos": [0.0, 0.0, 0.07], "init_yaw": 0.0},
     {"vehicle_id": 6, "vehicle_name": "iris_6", "vehicle_model": "iris", "init_pos": [0.0, 0.0, 0.07], "init_yaw": 0.0},
-    {"vehicle_id": 7, "vehicle_name": "iris_7", "vehicle_model": "iris", "init_pos": [0.0, 0.0, 0.07], "init_yaw": 0.0}
+    {"vehicle_id": 7, "vehicle_name": "iris_7", "vehicle_model": "iris", "init_pos": [0.0, 0.0, 0.07], "init_yaw": 0.0},
+    {"vehicle_id": 8, "vehicle_name": "iris_8", "vehicle_model": "iris", "init_pos": [0.0, 0.0, 0.07], "init_yaw": 0.0},
+    {"vehicle_id": 9, "vehicle_name": "iris_9", "vehicle_model": "iris", "init_pos": [0.0, 0.0, 0.07], "init_yaw": 0.0},
+    {"vehicle_id": 10, "vehicle_name": "iris_10", "vehicle_model": "iris", "init_pos": [0.0, 0.0, 0.07], "init_yaw": 0.0},
+    {"vehicle_id": 11, "vehicle_name": "iris_11", "vehicle_model": "iris", "init_pos": [0.0, 0.0, 0.07], "init_yaw": 0.0}
   ]
 }

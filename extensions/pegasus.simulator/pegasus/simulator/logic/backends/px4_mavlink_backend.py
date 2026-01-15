@@ -861,21 +861,39 @@ class PX4MavlinkBackend(Backend):
         # Set the flag so that we are no longer running the mavlink interface
         self._is_running = False
 
-        # Close the mavlink connection
-        self._connection.close()
-        self._connection = None
+        # ============================================================================
+        # 【关键】关闭顺序不能修改！必须先杀 PX4，再关闭 MAVLink 连接
+        # ============================================================================
+        # 原因：
+        # 1. Isaac Sim 端是 TCP 服务器（tcpin），PX4 端是 TCP 客户端
+        # 2. 如果先关闭服务端连接，PX4 客户端仍在运行，会导致：
+        #    - PX4 端 TCP 连接进入 CLOSE_WAIT 状态
+        #    - Isaac Sim 端 accepted socket 进入 TIME_WAIT 状态（约 60 秒）
+        #    - 新的 bind() 调用失败，报 "Address already in use"
+        # 3. 正确顺序：先让 PX4 关闭其 TCP 客户端，再关闭服务端
+        # ============================================================================
 
-        # Close the PX4 if it was running and was autolaunched by this backend
+        # Step 1: 先杀死 PX4 进程，让其 simulator_mavlink 模块关闭 TCP 客户端连接
         if self.px4_tool is not None:
-            carb.log_info(f"{self._log_prefix} Attempting to kill PX4 background process")
+            carb.log_info(f"{self._log_prefix} Attempting to gracefully stop PX4 background process")
             if self.px4_autolaunch:
                 try:
-                    self.px4_tool.kill_px4()
+                    self.px4_tool.kill_px4_save()  # 使用优雅关闭以保存 ULG 日志
                 except Exception as e:
-                    ts_log(self._log_prefix, f"PX4 kill failed: {e}", "WARN")
+                    ts_log(self._log_prefix, f"PX4 graceful stop failed: {e}", "WARN")
                     ts_log(self._log_prefix, traceback.format_exc(), "WARN")
-            # Internal MAVROS termination disabled
             self.px4_tool = None
+
+        # Step 2: 等待 PX4 的 TCP 连接完全关闭
+        time.sleep(0.5)
+
+        # Step 3: 关闭 Isaac Sim 端的 MAVLink TCP 服务
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            except Exception as e:
+                ts_log(self._log_prefix, f"MAVLink connection close failed: {e}", "WARN")
+            self._connection = None
 
     def recover_px4(self):
         """
@@ -978,9 +996,23 @@ class PX4MavlinkBackend(Backend):
             time.sleep(1.0)
 
             # Step 4: 创建新 MAVLink 连接（先于 PX4 启动，避免连接竞争）
+            # 使用重试机制处理 "Address already in use" 错误（端口可能在 TIME_WAIT 状态）
             ts_log(self._log_prefix, f"Step 4: Creating MAVLink connection: {self._connection_port}")
-            self._connection = mavutil.mavlink_connection(self._connection_port)
-            ts_log(self._log_prefix, "MAVLink connection created")
+            max_retries = 10
+            retry_delay = 1.0  # 初始重试延迟（秒）
+
+            for attempt in range(max_retries):
+                try:
+                    self._connection = mavutil.mavlink_connection(self._connection_port)
+                    ts_log(self._log_prefix, f"MAVLink connection created (attempt {attempt + 1})")
+                    break
+                except OSError as e:
+                    if e.errno == 98 and attempt < max_retries - 1:  # Address already in use
+                        ts_log(self._log_prefix, f"Port still busy, retrying in {retry_delay:.1f}s... (attempt {attempt + 1}/{max_retries})", "WARN")
+                        time.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 1.5, 5.0)  # 指数退避，最大5秒
+                    else:
+                        raise
 
             # 重置必要的状态
             # 关键修复：必须重置 _received_first_hearbeat，否则 update() 中不会调用
@@ -1072,6 +1104,15 @@ class PX4MavlinkBackend(Backend):
 
         self._is_running = False
 
+        # 关键修复：先关闭旧连接，释放端口
+        if self._connection is not None:
+            try:
+                ts_log(self._log_prefix, "Closing old MAVLink connection...")
+                self._connection.close()
+            except Exception as e:
+                ts_log(self._log_prefix, f"Failed to close old connection: {e}", "WARN")
+            self._connection = None
+
         # Restart the sensor data
         self._sensor_data = SensorMsg()
 
@@ -1084,9 +1125,24 @@ class PX4MavlinkBackend(Backend):
             else:
                 ts_log(self._log_prefix, f"MAVLink port {mavlink_port} release timeout, attempting connection anyway", "WARN")
 
-        # Restart the connection
+        # Restart the connection (with retry logic for TIME_WAIT state)
         ts_log(self._log_prefix, f"Creating MAVLink connection to {self._connection_port}")
-        self._connection = mavutil.mavlink_connection(self._connection_port)
+        max_retries = 15
+        retry_delay = 1.0
+
+        for attempt in range(max_retries):
+            try:
+                self._connection = mavutil.mavlink_connection(self._connection_port)
+                if attempt > 0:
+                    ts_log(self._log_prefix, f"MAVLink connection created (attempt {attempt + 1})")
+                break
+            except OSError as e:
+                if e.errno == 98 and attempt < max_retries - 1:  # Address already in use
+                    ts_log(self._log_prefix, f"Port busy (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay:.1f}s...", "WARN")
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 1.5, 5.0)  # 指数退避，最大5秒
+                else:
+                    raise
 
         # Auxiliar variables to handle the lockstep between receiving sensor data and actuator control
         self._received_first_actuator: bool = False
@@ -1140,10 +1196,10 @@ class PX4MavlinkBackend(Backend):
         if not hasattr(self, '_update_call_count'):
             self._update_call_count = 0
         self._update_call_count += 1
-        if self._update_call_count % 120 == 1:  # 约每秒一次
-            carb.log_warn(f"{self._log_prefix} update() entry #{self._update_call_count}: "
-                         f"_is_running={self._is_running}, "
-                         f"_connection={'OK' if self._connection else 'None'}")
+        # if self._update_call_count % 120 == 1:  # 约每秒一次
+        #     carb.log_warn(f"{self._log_prefix} update() entry #{self._update_call_count}: "
+        #                  f"_is_running={self._is_running}, "
+        #                  f"_connection={'OK' if self._connection else 'None'}")
 
         # Ensure PX4 process is running (auto-recover if killed externally)
         self._ensure_px4_running_periodic()
@@ -1160,15 +1216,15 @@ class PX4MavlinkBackend(Backend):
             # 不要 return，继续发送传感器数据以打破死锁
 
         # 调试：定期打印连接状态
-        if not hasattr(self, '_debug_log_count'):
-            self._debug_log_count = 0
-        self._debug_log_count += 1
-        if self._debug_log_count % 500 == 1:  # 每500帧打印一次
-            carb.log_warn(f"{self._log_prefix} update() called: heartbeat={self._received_first_hearbeat}, "
-                         f"first_imu={self._sensor_data.received_first_imu}, "
-                         f"new_imu={self._sensor_data.new_imu_data}, "
-                         f"imu_data=({self._sensor_data.xacc:.2f},{self._sensor_data.yacc:.2f},{self._sensor_data.zacc:.2f}), "
-                         f"is_running={self._is_running}")
+        # if not hasattr(self, '_debug_log_count'):
+        #     self._debug_log_count = 0
+        # self._debug_log_count += 1
+        # if self._debug_log_count % 500 == 1:  # 每500帧打印一次
+        #     carb.log_warn(f"{self._log_prefix} update() called: heartbeat={self._received_first_hearbeat}, "
+        #                  f"first_imu={self._sensor_data.received_first_imu}, "
+        #                  f"new_imu={self._sensor_data.new_imu_data}, "
+        #                  f"imu_data=({self._sensor_data.xacc:.2f},{self._sensor_data.yacc:.2f},{self._sensor_data.zacc:.2f}), "
+        #                  f"is_running={self._is_running}")
 
         # Check if we have already received IMU data. If not, start the lockstep and wait for more data
         # 关键修复：添加超时机制防止无限等待
@@ -1420,7 +1476,14 @@ class PX4MavlinkBackend(Backend):
         Args:
             time_usec (int): The total time elapsed since the simulation started
         """
-        carb.log_info("Sending GPS msgs")
+        # # 调试：跟踪GPS发送调用（使用warn级别确保可见）
+        # if not hasattr(self, '_gps_send_count'):
+        #     self._gps_send_count = 0
+        # self._gps_send_count += 1
+        # if self._gps_send_count % 500 == 1:  # 每500次调用打印一次
+        #     carb.log_warn(f"{self._log_prefix} send_gps_msgs called #{self._gps_send_count}, "
+        #                  f"new_gps_data={self._sensor_data.new_gps_data}, "
+        #                  f"lat={self._sensor_data.latitude_deg}, lon={self._sensor_data.longitude_deg}")
 
         # Guard: mavlink connection may be None during hard reset/relaunch
         if self._connection is None:

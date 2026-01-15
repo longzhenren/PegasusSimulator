@@ -324,6 +324,166 @@ class TrajPoint:
     pitch_deg: float
 
 
+# ============================================================================
+# TrajectorySmoother: 三次样条插值平滑器
+# ============================================================================
+
+try:
+    import numpy as np
+    from scipy.interpolate import CubicSpline
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+    np = None
+    CubicSpline = None
+
+
+class TrajectorySmoother:
+    """
+    轨迹平滑器：使用三次样条插值对轨迹进行平滑处理
+
+    特性：
+    1. 对位置(x,y,z)和姿态(roll,pitch,yaw)进行三次样条插值
+    2. 自动处理角度的unwrap（防止±180°跳变）
+    3. 提供位置和速度的导数计算（用于前馈控制）
+
+    用法：
+        smoother = TrajectorySmoother(points, dt=0.2)
+        state = smoother.get_full_state(t)
+        # state包含: x,y,z, vx,vy,vz, roll,pitch,yaw, yaw_rate
+    """
+
+    def __init__(self, points: List[TrajPoint], dt: float = 0.2):
+        """
+        初始化平滑器
+
+        Args:
+            points: 轨迹点列表
+            dt: 原始数据时间间隔（默认0.2s = 5Hz）
+        """
+        if not HAS_SCIPY:
+            raise RuntimeError("TrajectorySmoother requires numpy and scipy. "
+                               "Install with: pip install numpy scipy")
+
+        if len(points) < 2:
+            raise ValueError("Need at least 2 points for interpolation")
+
+        self.dt = dt
+        self.n_points = len(points)
+        self.duration = (self.n_points - 1) * dt
+
+        # 提取各维度数据
+        self.t_orig = np.array([i * dt for i in range(self.n_points)])
+
+        x_arr = np.array([p.x for p in points])
+        y_arr = np.array([p.y for p in points])
+        z_arr = np.array([p.z for p in points])
+
+        # 角度转弧度并unwrap
+        roll_arr = np.unwrap(np.deg2rad([p.roll_deg for p in points]))
+        pitch_arr = np.unwrap(np.deg2rad([p.pitch_deg for p in points]))
+        yaw_arr = np.unwrap(np.deg2rad([p.yaw_deg for p in points]))
+
+        # 创建三次样条插值器
+        # bc_type='natural' 表示端点处二阶导数为0
+        self._spline_x = CubicSpline(self.t_orig, x_arr, bc_type='natural')
+        self._spline_y = CubicSpline(self.t_orig, y_arr, bc_type='natural')
+        self._spline_z = CubicSpline(self.t_orig, z_arr, bc_type='natural')
+        self._spline_roll = CubicSpline(self.t_orig, roll_arr, bc_type='natural')
+        self._spline_pitch = CubicSpline(self.t_orig, pitch_arr, bc_type='natural')
+        self._spline_yaw = CubicSpline(self.t_orig, yaw_arr, bc_type='natural')
+
+    def get_full_state(self, t: float, for_control: bool = True) -> Dict[str, float]:
+        """
+        获取时刻t的完整状态（位置、速度、姿态、角速度）
+
+        Args:
+            t: 时间（秒），范围[0, duration]
+            for_control: 是否用于控制（True=用于发送setpoint，需要平滑速度；
+                        False=用于数据记录，只有最终航点速度为0）
+
+        Returns:
+            字典包含:
+            - x, y, z: 位置 (m)
+            - vx, vy, vz: 速度 (m/s)
+            - roll, pitch, yaw: 姿态 (rad)
+            - roll_rate, pitch_rate, yaw_rate: 角速度 (rad/s)
+        """
+        # 限制时间在有效范围内
+        t = max(0.0, min(t, self.duration))
+
+        # 位置
+        x = float(self._spline_x(t))
+        y = float(self._spline_y(t))
+        z = float(self._spline_z(t))
+
+        # 姿态
+        roll = float(self._spline_roll(t))
+        pitch = float(self._spline_pitch(t))
+        yaw = float(self._spline_yaw(t))
+
+        if for_control:
+            # 控制模式：使用平滑速度进行前馈控制
+            vx = float(self._spline_x(t, 1))
+            vy = float(self._spline_y(t, 1))
+            vz = float(self._spline_z(t, 1))
+            roll_rate = float(self._spline_roll(t, 1))
+            pitch_rate = float(self._spline_pitch(t, 1))
+            yaw_rate = float(self._spline_yaw(t, 1))
+        else:
+            # 数据记录模式：只有最终航点速度为0，中间航点使用实际插值速度
+            final_waypoint_threshold = 0.01  # 10ms阈值
+            is_at_final_waypoint = (self.duration - t) < final_waypoint_threshold
+
+            if is_at_final_waypoint:
+                # 在最终航点，速度为0（悬停目标）
+                vx, vy, vz = 0.0, 0.0, 0.0
+                roll_rate, pitch_rate, yaw_rate = 0.0, 0.0, 0.0
+            else:
+                # 中间航点：使用实际插值速度
+                vx = float(self._spline_x(t, 1))
+                vy = float(self._spline_y(t, 1))
+                vz = float(self._spline_z(t, 1))
+                roll_rate = float(self._spline_roll(t, 1))
+                pitch_rate = float(self._spline_pitch(t, 1))
+                yaw_rate = float(self._spline_yaw(t, 1))
+
+        return {
+            'x': x, 'y': y, 'z': z,
+            'vx': vx, 'vy': vy, 'vz': vz,
+            'roll': roll, 'pitch': pitch, 'yaw': yaw,
+            'roll_rate': roll_rate, 'pitch_rate': pitch_rate, 'yaw_rate': yaw_rate,
+        }
+
+    def get_position(self, t: float) -> Tuple[float, float, float]:
+        """获取时刻t的位置"""
+        t = max(0.0, min(t, self.duration))
+        return (
+            float(self._spline_x(t)),
+            float(self._spline_y(t)),
+            float(self._spline_z(t))
+        )
+
+    def get_velocity(self, t: float) -> Tuple[float, float, float]:
+        """获取时刻t的速度"""
+        t = max(0.0, min(t, self.duration))
+        return (
+            float(self._spline_x(t, 1)),
+            float(self._spline_y(t, 1)),
+            float(self._spline_z(t, 1))
+        )
+
+    def get_yaw_and_rate(self, t: float) -> Tuple[float, float]:
+        """获取时刻t的航向角和角速度"""
+        t = max(0.0, min(t, self.duration))
+        return (
+            float(self._spline_yaw(t)),
+            float(self._spline_yaw(t, 1))
+        )
+
+# ============================================================================
+
+
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -626,6 +786,27 @@ def _fetch_all_info(image_base: str, uav_id: int, timeout: float, retries: int) 
         last = obj if isinstance(obj, dict) else {"error": "invalid response"}
         time.sleep(0.2)
     raise RuntimeError(f"fetch /all failed uav={uav_id} resp={last}")
+
+
+def _fetch_depth(image_base: str, uav_id: int, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    """Fetch depth image from simulation.
+
+    Args:
+        image_base: Base URL for image service (e.g., http://127.0.0.1:8081)
+        uav_id: UAV ID
+        timeout: Request timeout in seconds
+
+    Returns:
+        Dict with depth data (data, raw_float32_base64, timestamp, etc.) or None if failed
+    """
+    url = f"{image_base}/uav/{uav_id}/depth"
+    try:
+        code, obj = _http_json("GET", url, payload=None, timeout=timeout)
+        if 200 <= code < 300 and isinstance(obj, dict) and obj.get("data"):
+            return obj
+    except Exception:
+        pass
+    return None
 
 
 def _ensure_control_healthy(control_base: str, uav_ids: List[int], timeout_s: float = 60.0) -> None:
@@ -1222,6 +1403,8 @@ class Worker:
         monitor: Optional[MavrosMonitor],
         commander: Optional[MavrosCommander],
         status_log_path: Path,
+        use_mission_mode: bool = False,
+        use_velocity_offboard: bool = False,
     ):
         self.uav_id = int(uav_id)
         self.control_base = _build_controller_base(control_base, self.uav_id).rstrip("/")
@@ -1240,10 +1423,606 @@ class Worker:
         self.monitor = monitor
         self.commander = commander
         self.status_log_path = status_log_path
+        self.use_mission_mode = bool(use_mission_mode)
+        self.use_velocity_offboard = bool(use_velocity_offboard)
+
+        # 坐标对齐相关
+        self._origin_offset: Optional[Tuple[float, float, float]] = None
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         with self.print_lock:
             ts_log(f"[Worker UAV{self.uav_id}]", msg, level)
+
+    def _calculate_origin_offset(self, cmd_pos: Tuple[float, float, float], obs_pos: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        """
+        计算命令坐标系和观测坐标系之间的原点偏移量
+
+        offset = obs - cmd，应用时 aligned_obs = obs - offset
+        """
+        return (
+            obs_pos[0] - cmd_pos[0],
+            obs_pos[1] - cmd_pos[1],
+            obs_pos[2] - cmd_pos[2],
+        )
+
+    def _apply_alignment(self, obs_pos: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        """
+        将观测坐标对齐到命令坐标系
+        """
+        if self._origin_offset is None:
+            return obs_pos
+        return (
+            obs_pos[0] - self._origin_offset[0],
+            obs_pos[1] - self._origin_offset[1],
+            obs_pos[2] - self._origin_offset[2],
+        )
+
+    def _execute_mission_mode(self, pts: List[TrajPoint], traj_name: str) -> bool:
+        """
+        使用Mission模式执行轨迹
+
+        通过控制器HTTP接口发送execute_mission命令，上传所有航点后等待执行完成
+
+        Returns:
+            True if mission completed successfully, False otherwise
+        """
+        self._log(f"[UAV{self.uav_id}] executing mission mode with {len(pts)} waypoints")
+
+        # 构建航点列表
+        waypoints = []
+        for i, p in enumerate(pts):
+            waypoints.append({
+                "x": float(p.x),
+                "y": float(p.y),
+                "z": float(p.z),
+                "yaw_deg": float(p.yaw_deg) if p.yaw_deg is not None else 0.0,
+            })
+
+        try:
+            # 发送execute_mission命令到控制器
+            cmd = {
+                "cmd": "execute_mission",
+                "waypoints": waypoints,
+                "acceptance_radius": 0.5,  # 航点接受半径
+                "cruise_speed": 2.0,  # 巡航速度
+            }
+            resp = _controller_command(self.control_base, self.uav_id, cmd, timeout=self.cmd_timeout)
+
+            if not isinstance(resp, dict) or resp.get("ok") is False:
+                self._log(f"[UAV{self.uav_id}] execute_mission failed: {resp}", "WARN")
+                return False
+
+            self._log(f"[UAV{self.uav_id}] mission started, waiting for completion...")
+            return True
+
+        except Exception as e:
+            self._log(f"[UAV{self.uav_id}] execute_mission exception: {e}", "WARN")
+            return False
+
+    def _wait_mission_waypoint(self, waypoint_idx: int, timeout: float = 60.0) -> bool:
+        """
+        等待到达指定航点
+
+        通过控制器HTTP接口查询当前mission状态
+        """
+        deadline = time.time() + float(timeout)
+        last_log_time = 0.0
+        log_interval = 5.0
+
+        while time.time() < deadline:
+            try:
+                cmd = {"cmd": "get_mission_status"}
+                resp = _controller_command(self.control_base, self.uav_id, cmd, timeout=5.0)
+
+                if isinstance(resp, dict):
+                    current_wp = resp.get("current_waypoint", -1)
+                    mission_state = resp.get("mission_state", "unknown")
+
+                    # 如果已经过了这个航点
+                    if current_wp > waypoint_idx:
+                        return True
+
+                    # 如果任务完成
+                    if mission_state in ("completed", "finished"):
+                        return True
+
+                    now = time.time()
+                    if now - last_log_time >= log_interval:
+                        self._log(f"[UAV{self.uav_id}] waiting for waypoint {waypoint_idx}, current={current_wp}, state={mission_state}")
+                        last_log_time = now
+
+            except Exception as e:
+                self._log(f"[UAV{self.uav_id}] get_mission_status failed: {e}", "WARN")
+
+            time.sleep(0.5)
+
+        return False
+
+    def _process_velocity_offboard_mode(
+        self,
+        json_path: Path,
+        transformed_pts: List[TrajPoint],
+        traj_dir: Path,
+        rows: List[Dict],
+        all_pose_rows: List[Dict],
+    ) -> None:
+        """
+        速度前馈OFFBOARD模式：基于时间的平滑跟踪控制
+
+        架构：
+        [5Hz人工数据] -> [Cubic Spline插值] -> [50Hz位置+速度前馈控制] -> [20Hz数据采样]
+
+        与mavlink_trajectory_collector.py的_process_offboard_mode保持一致
+        """
+        if not HAS_SCIPY:
+            raise RuntimeError("TrajectorySmoother requires scipy. Install with: pip install numpy scipy")
+
+        if len(transformed_pts) < 2:
+            self._log(f"[UAV{self.uav_id}] trajectory too short (<2 points)", "WARN")
+            return
+
+        self._log(f"[UAV{self.uav_id}] starting SMOOTH velocity tracking control ({len(transformed_pts)} points, {(len(transformed_pts)-1)*0.2:.1f}s)")
+
+        # 创建平滑器（使用变换后的轨迹点）
+        smoother = TrajectorySmoother(transformed_pts, dt=0.2)
+        total_duration = smoother.duration
+
+        # 获取初始位姿
+        try:
+            info = _fetch_all_info(self.image_base, self.uav_id, timeout=self.image_timeout, retries=5)
+            init_pose = info.get("pose", {})
+            uav_init_pos = init_pose.get("position", [0, 0, 0])
+            sim_start_ts = float(init_pose.get("timestamp", time.time()))
+        except Exception:
+            uav_init_pos = [0, 0, 0]
+            sim_start_ts = time.time()
+
+        self._log(f"[UAV{self.uav_id}] initial sim timestamp: {sim_start_ts:.3f}")
+
+        # 计算轨迹偏移（仅对齐XY，Z使用绝对轨迹高度）
+        traj_start = smoother.get_position(0.0)
+        self._origin_offset = (
+            uav_init_pos[0] - traj_start[0],
+            uav_init_pos[1] - traj_start[1],
+            0.0  # Z不偏移：使用轨迹的绝对高度
+        )
+        self._log(f"[UAV{self.uav_id}] trajectory offset: ({self._origin_offset[0]:.4f}, {self._origin_offset[1]:.4f}, {self._origin_offset[2]:.4f})m")
+
+        # 辅助函数：应用偏移到位置
+        def apply_offset(x, y, z):
+            return (
+                x + self._origin_offset[0],
+                y + self._origin_offset[1],
+                z  # Z使用原始轨迹高度
+            )
+
+        aligned_start = apply_offset(traj_start[0], traj_start[1], traj_start[2])
+
+        # === 检查当前高度并起飞 ===
+        TARGET_ALT = traj_start[2]
+        ALT_TOLERANCE = 0.3
+
+        try:
+            info = _fetch_all_info(self.image_base, self.uav_id, timeout=self.image_timeout, retries=3)
+            current_pos = info.get("pose", {}).get("position", [0, 0, 0])
+            current_alt = current_pos[2]
+            self._log(f"[UAV{self.uav_id}] current altitude: {current_alt:.2f}m, target: {TARGET_ALT:.2f}m")
+        except Exception as e:
+            self._log(f"[UAV{self.uav_id}] failed to check altitude: {e}", "WARN")
+            current_alt = 0.0
+
+        # 如果高度不足，执行起飞
+        if current_alt < TARGET_ALT - ALT_TOLERANCE:
+            self._log(f"[UAV{self.uav_id}] altitude too low, starting takeoff to {TARGET_ALT:.1f}m...")
+
+            # 发送setpoints准备OFFBOARD
+            for _ in range(50):
+                cmd = {
+                    "cmd": "setpoint",
+                    "x": aligned_start[0], "y": aligned_start[1], "z": TARGET_ALT,
+                    "vx": 0.0, "vy": 0.0, "vz": 0.5,
+                    "yaw": 0.0, "yaw_rate": 0.0
+                }
+                try:
+                    _http_json("POST", f"{self.control_base}/command", payload=cmd, timeout=0.5)
+                except Exception:
+                    pass
+                time.sleep(0.02)
+
+            # ARM
+            for attempt in range(5):
+                try:
+                    code, resp = _http_json("POST", f"{self.control_base}/command",
+                                            payload={"cmd": "arm"}, timeout=10.0)
+                    if 200 <= code < 300 and resp.get("ok"):
+                        self._log(f"[UAV{self.uav_id}] armed successfully")
+                        break
+                except Exception as e:
+                    self._log(f"[UAV{self.uav_id}] ARM attempt {attempt+1} failed: {e}", "WARN")
+                time.sleep(0.3)
+
+            # OFFBOARD模式
+            for attempt in range(3):
+                try:
+                    code, resp = _http_json("POST", f"{self.control_base}/command",
+                                            payload={"cmd": "set_mode", "mode": "OFFBOARD"}, timeout=5.0)
+                    if 200 <= code < 300 and resp.get("ok"):
+                        self._log(f"[UAV{self.uav_id}] OFFBOARD mode set")
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.3)
+
+            # 爬升
+            self._log(f"[UAV{self.uav_id}] climbing to {TARGET_ALT:.1f}m...")
+            takeoff_start = time.time()
+            takeoff_timeout = 15.0
+
+            while time.time() - takeoff_start < takeoff_timeout:
+                cmd = {
+                    "cmd": "setpoint",
+                    "x": aligned_start[0], "y": aligned_start[1], "z": TARGET_ALT,
+                    "vx": 0.0, "vy": 0.0, "vz": 0.3,
+                    "yaw": smoother.get_yaw_and_rate(0.0)[0],
+                    "yaw_rate": 0.0
+                }
+                try:
+                    _http_json("POST", f"{self.control_base}/command", payload=cmd, timeout=0.5)
+                except Exception:
+                    pass
+
+                if int((time.time() - takeoff_start) / 0.5) > int((time.time() - takeoff_start - 0.02) / 0.5):
+                    try:
+                        info = _fetch_all_info(self.image_base, self.uav_id, timeout=self.image_timeout, retries=2)
+                        current_alt = info.get("pose", {}).get("position", [0, 0, 0])[2]
+                        if current_alt >= TARGET_ALT - ALT_TOLERANCE:
+                            self._log(f"[UAV{self.uav_id}] reached target altitude!")
+                            break
+                    except Exception:
+                        pass
+                time.sleep(0.02)
+
+            # 稳定
+            for _ in range(50):
+                cmd = {
+                    "cmd": "setpoint",
+                    "x": aligned_start[0], "y": aligned_start[1], "z": TARGET_ALT,
+                    "vx": 0.0, "vy": 0.0, "vz": 0.0,
+                    "yaw": smoother.get_yaw_and_rate(0.0)[0],
+                    "yaw_rate": 0.0
+                }
+                try:
+                    _http_json("POST", f"{self.control_base}/command", payload=cmd, timeout=0.5)
+                except Exception:
+                    pass
+                time.sleep(0.02)
+
+        # 重新获取位置并更新偏移
+        try:
+            info = _fetch_all_info(self.image_base, self.uav_id, timeout=self.image_timeout, retries=3)
+            current_pose = info.get("pose", {})
+            current_pos = current_pose.get("position", [0, 0, 0])
+            sim_start_ts = float(current_pose.get("timestamp", time.time()))
+
+            old_offset = self._origin_offset
+            self._origin_offset = (
+                current_pos[0] - traj_start[0],
+                current_pos[1] - traj_start[1],
+                0.0
+            )
+            self._log(f"[UAV{self.uav_id}] updated trajectory offset: ({self._origin_offset[0]:.4f}, {self._origin_offset[1]:.4f})m")
+            aligned_start = apply_offset(traj_start[0], traj_start[1], traj_start[2])
+        except Exception:
+            sim_start_ts = time.time()
+
+        # 控制循环50Hz，数据采集20Hz
+        CONTROL_HZ = 50.0
+        SAMPLE_HZ = 20.0
+        control_dt = 1.0 / CONTROL_HZ
+        sample_dt = 1.0 / SAMPLE_HZ
+
+        sample_idx = 0
+        max_samples = int(total_duration / sample_dt) + 1
+        next_sample_time = 0.0
+
+        # 时间追踪
+        last_sim_ts = sim_start_ts
+        last_wall_time = time.time()
+        sim_speed_factor = 1.0
+
+        # 终点判定
+        FINAL_DIST_THRESHOLD = 0.3
+        FINAL_VEL_THRESHOLD = 0.1
+        in_final_mode = False
+        final_mode_start = None
+
+        # 当前观测状态
+        current_obs_pos = list(aligned_start)
+        current_obs_vel = [0, 0, 0]
+
+        # 误差统计
+        error_sum = 0.0
+        error_count = 0
+
+        obs_fetch_interval = 2
+        loop_counter = 0
+
+        self._log(f"[UAV{self.uav_id}] starting 50Hz control+sampling loop (duration={total_duration:.1f}s)")
+
+        while True:
+            loop_start = time.time()
+            loop_counter += 1
+
+            # 获取仿真时间戳
+            if loop_counter % obs_fetch_interval == 0:
+                try:
+                    info = _fetch_all_info(self.image_base, self.uav_id, timeout=0.1, retries=1)
+                    pose = info.get("pose", {})
+                    new_sim_ts = float(pose.get("timestamp", 0))
+                    new_pos = pose.get("position", None)
+                    new_vel = pose.get("linear_velocity", None)
+
+                    if new_sim_ts > 0:
+                        last_sim_ts = new_sim_ts
+                        last_wall_time = time.time()
+                    if new_pos is not None and len(new_pos) >= 3:
+                        current_obs_pos = new_pos
+                    if new_vel is not None and len(new_vel) >= 3:
+                        current_obs_vel = new_vel
+                except Exception:
+                    pass
+
+            wall_elapsed = time.time() - last_wall_time
+            current_sim_ts = last_sim_ts + wall_elapsed * sim_speed_factor
+            elapsed = current_sim_ts - sim_start_ts
+
+            # 终点状态
+            end_state = smoother.get_full_state(total_duration)
+            final_pos = apply_offset(end_state['x'], end_state['y'], end_state['z'])
+
+            # 终点判定
+            if elapsed > total_duration:
+                if not in_final_mode:
+                    in_final_mode = True
+                    final_mode_start = time.time()
+                    self._log(f"[UAV{self.uav_id}] entering FINAL mode")
+
+                dist_to_final = math.sqrt(
+                    (current_obs_pos[0] - final_pos[0])**2 +
+                    (current_obs_pos[1] - final_pos[1])**2 +
+                    (current_obs_pos[2] - final_pos[2])**2
+                )
+                current_speed = math.sqrt(
+                    current_obs_vel[0]**2 + current_obs_vel[1]**2 + current_obs_vel[2]**2
+                )
+
+                cmd = {
+                    "cmd": "setpoint",
+                    "x": final_pos[0], "y": final_pos[1], "z": final_pos[2],
+                    "vx": 0.0, "vy": 0.0, "vz": 0.0,
+                    "yaw": end_state['yaw'],
+                    "yaw_rate": 0.0
+                }
+                try:
+                    _http_json("POST", f"{self.control_base}/command", payload=cmd, timeout=0.5)
+                except Exception:
+                    pass
+
+                if dist_to_final < FINAL_DIST_THRESHOLD and current_speed < FINAL_VEL_THRESHOLD:
+                    self._log(f"[UAV{self.uav_id}] FINAL reached: dist={dist_to_final:.3f}m")
+                    break
+
+                if time.time() - final_mode_start > 10.0:
+                    self._log(f"[UAV{self.uav_id}] FINAL timeout", "WARN")
+                    break
+
+                time.sleep(control_dt)
+                continue
+
+            # 正常轨迹跟踪
+            t = min(elapsed, total_duration)
+            state = smoother.get_full_state(t)
+            aligned_pos = apply_offset(state['x'], state['y'], state['z'])
+
+            cmd = {
+                "cmd": "setpoint",
+                "x": aligned_pos[0], "y": aligned_pos[1], "z": aligned_pos[2],
+                "vx": state['vx'], "vy": state['vy'], "vz": state['vz'],
+                "yaw": state['yaw'],
+                "yaw_rate": state['yaw_rate']
+            }
+            try:
+                _http_json("POST", f"{self.control_base}/command", payload=cmd, timeout=0.5)
+            except Exception:
+                pass
+
+            # 计算跟踪误差
+            tracking_error = math.sqrt(
+                (current_obs_pos[0] - aligned_pos[0])**2 +
+                (current_obs_pos[1] - aligned_pos[1])**2 +
+                (current_obs_pos[2] - aligned_pos[2])**2
+            )
+            error_sum += tracking_error
+            error_count += 1
+
+            if sample_idx % 25 == 0:
+                self._log(f"[UAV{self.uav_id}] t={t:.2f}s Error={tracking_error:.3f}m")
+
+            # 数据采样
+            if elapsed >= next_sample_time and sample_idx < max_samples:
+                sample_t = sample_idx * sample_dt
+                sample_state = smoother.get_full_state(sample_t, for_control=False)
+                sample_pos = apply_offset(sample_state['x'], sample_state['y'], sample_state['z'])
+
+                p_in = TrajPoint(sample_state['x'], sample_state['y'], sample_state['z'],
+                                 math.degrees(sample_state['roll']),
+                                 math.degrees(sample_state['yaw']),
+                                 math.degrees(sample_state['pitch']))
+                p_cmd = TrajPoint(sample_pos[0], sample_pos[1], sample_pos[2],
+                                  math.degrees(sample_state['roll']),
+                                  math.degrees(sample_state['yaw']),
+                                  math.degrees(sample_state['pitch']))
+                cmd_velocity = {
+                    'vx': sample_state['vx'],
+                    'vy': sample_state['vy'],
+                    'vz': sample_state['vz'],
+                    'yaw': sample_state['yaw'],
+                    'yaw_rate': sample_state['yaw_rate']
+                }
+
+                try:
+                    self._collect_data_point(sample_idx, p_in, p_cmd, json_path, traj_dir, rows, all_pose_rows, cmd_velocity)
+                except Exception as e:
+                    self._log(f"[UAV{self.uav_id}] sample {sample_idx} error: {e}", "WARN")
+
+                sample_idx += 1
+                next_sample_time = sample_idx * sample_dt
+
+            # 控制循环节拍
+            loop_elapsed = time.time() - loop_start
+            sleep_time = control_dt - loop_elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        avg_error = error_sum / max(error_count, 1)
+        self._log(f"[UAV{self.uav_id}] tracking complete: {sample_idx} samples, avg_error={avg_error:.3f}m")
+
+    def _collect_data_point(
+        self,
+        i: int,
+        p_in: TrajPoint,
+        p_cmd: TrajPoint,
+        json_path: Path,
+        traj_dir: Path,
+        rows: List[Dict],
+        all_pose_rows: List[Dict],
+        cmd_velocity: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """采集单个数据点（与mavlink_trajectory_collector.py兼容）"""
+        traj_name = _safe_name(json_path)
+
+        info = _fetch_all_info(
+            self.image_base,
+            self.uav_id,
+            timeout=self.image_timeout,
+            retries=self.image_retries,
+        )
+        ts_img = float((info.get("image") or {}).get("timestamp") or 0.0)
+        img_b64 = (info.get("image") or {}).get("data") or ""
+        ts_ms = int(ts_img * 1000.0) if ts_img > 0 else int(time.time() * 1000.0)
+        img_name = f"img_{i:06d}_{ts_ms}.png"
+        img_path = traj_dir / "images" / img_name
+        if isinstance(img_b64, str) and img_b64:
+            _decode_png_b64_to_file(img_b64, img_path)
+
+        # Fetch and save depth image
+        depth_name = f"depth_{i:06d}_{ts_ms}.png"
+        depth_path = traj_dir / "depths" / depth_name
+        try:
+            depth_info = _fetch_depth(self.image_base, self.uav_id, timeout=self.image_timeout)
+            if depth_info and depth_info.get("data"):
+                _decode_png_b64_to_file(depth_info["data"], depth_path)
+        except Exception:
+            pass  # Depth capture is optional, don't fail on errors
+
+        pose = info.get("pose") or {}
+        pos = (pose.get("position") or [None, None, None])[:3]
+        att = (pose.get("attitude") or [None, None, None, None])[:4]
+        lv = (pose.get("linear_velocity") or [None, None, None])[:3]
+        av = (pose.get("angular_velocity") or [None, None, None])[:3]
+        la = (pose.get("linear_acceleration") or [None, None, None])[:3]
+
+        obs_pos = (
+            float(pos[0]) if pos[0] is not None else 0.0,
+            float(pos[1]) if pos[1] is not None else 0.0,
+            float(pos[2]) if pos[2] is not None else 0.0,
+        )
+        cmd_pos = (float(p_cmd.x), float(p_cmd.y), float(p_cmd.z))
+
+        if i == 0 and self._origin_offset is None:
+            self._origin_offset = self._calculate_origin_offset(cmd_pos, obs_pos)
+
+        aligned_obs = self._apply_alignment(obs_pos)
+
+        rows.append({
+            "traj_json": _norm_abs_path(json_path),
+            "traj_name": traj_name,
+            "uav_id": self.uav_id,
+            "step_idx": i,
+            "cmd_in_x": p_in.x,
+            "cmd_in_y": p_in.y,
+            "cmd_in_z": p_in.z,
+            "cmd_in_roll_deg": p_in.roll_deg,
+            "cmd_in_yaw_deg": p_in.yaw_deg,
+            "cmd_in_pitch_deg": p_in.pitch_deg,
+            "cmd_x": p_cmd.x,
+            "cmd_y": p_cmd.y,
+            "cmd_z": p_cmd.z,
+            "cmd_roll_deg": p_cmd.roll_deg,
+            "cmd_yaw_deg": p_cmd.yaw_deg,
+            "cmd_pitch_deg": p_cmd.pitch_deg,
+            "image_timestamp_s": ts_img,
+            "image_path": _norm_abs_path(img_path) if img_path.exists() else "",
+            "obs_pos_x": pos[0],
+            "obs_pos_y": pos[1],
+            "obs_pos_z": pos[2],
+            "obs_aligned_x": aligned_obs[0],
+            "obs_aligned_y": aligned_obs[1],
+            "obs_aligned_z": aligned_obs[2],
+            "origin_offset_x": self._origin_offset[0] if self._origin_offset else 0.0,
+            "origin_offset_y": self._origin_offset[1] if self._origin_offset else 0.0,
+            "origin_offset_z": self._origin_offset[2] if self._origin_offset else 0.0,
+            "obs_att_w": att[3] if len(att) >= 4 else None,
+            "obs_att_x": att[0] if len(att) >= 4 else None,
+            "obs_att_y": att[1] if len(att) >= 4 else None,
+            "obs_att_z": att[2] if len(att) >= 4 else None,
+            "obs_linvel_x": lv[0],
+            "obs_linvel_y": lv[1],
+            "obs_linvel_z": lv[2],
+            "obs_angvel_x": av[0],
+            "obs_angvel_y": av[1],
+            "obs_angvel_z": av[2],
+            "obs_linacc_x": la[0],
+            "obs_linacc_y": la[1],
+            "obs_linacc_z": la[2],
+            # 速度前馈控制输入
+            "cmd_vx": cmd_velocity.get('vx', 0.0) if cmd_velocity else 0.0,
+            "cmd_vy": cmd_velocity.get('vy', 0.0) if cmd_velocity else 0.0,
+            "cmd_vz": cmd_velocity.get('vz', 0.0) if cmd_velocity else 0.0,
+            "cmd_yaw_rad": cmd_velocity.get('yaw', 0.0) if cmd_velocity else 0.0,
+            "cmd_yaw_rate": cmd_velocity.get('yaw_rate', 0.0) if cmd_velocity else 0.0,
+            "ulg_path": "",
+        })
+
+        all_pose_rows.append({
+            "traj_json": _norm_abs_path(json_path),
+            "traj_name": traj_name,
+            "uav_id": self.uav_id,
+            "step_idx": i,
+            "image_timestamp_s": ts_img,
+            "pos_x": pos[0],
+            "pos_y": pos[1],
+            "pos_z": pos[2],
+            "aligned_pos_x": aligned_obs[0],
+            "aligned_pos_y": aligned_obs[1],
+            "aligned_pos_z": aligned_obs[2],
+            "cmd_roll_deg": p_cmd.roll_deg,
+            "cmd_yaw_deg": p_cmd.yaw_deg,
+            "cmd_pitch_deg": p_cmd.pitch_deg,
+            "att_w": att[3] if len(att) >= 4 else None,
+            "att_x": att[0] if len(att) >= 4 else None,
+            "att_y": att[1] if len(att) >= 4 else None,
+            "att_z": att[2] if len(att) >= 4 else None,
+            "linvel_x": lv[0],
+            "linvel_y": lv[1],
+            "linvel_z": lv[2],
+            "angvel_x": av[0],
+            "angvel_y": av[1],
+            "angvel_z": av[2],
+            "linacc_x": la[0],
+            "linacc_y": la[1],
+            "linacc_z": la[2],
+        })
 
     def _notify_controller_ready(self, ready: bool) -> bool:
         """通知控制器 PX4 ready 状态"""
@@ -1439,113 +2218,182 @@ class Worker:
         rows: List[Dict[str, Any]] = []
         all_pose_rows: List[Dict[str, Any]] = []
 
+        # 重置坐标对齐偏移量
+        self._origin_offset = None
+
         try:
-            # 使用OFFBOARD模式的move_to命令代替mission waypoints
-            # （PX4 mission模式不支持本地NED坐标，只支持GPS坐标）
-            self._log(f"[UAV{self.uav_id}] starting OFFBOARD waypoint navigation ({len(pts)} points)")
+            # 根据模式选择执行方式
+            if self.use_velocity_offboard:
+                # 速度前馈OFFBOARD模式：使用平滑轨迹跟踪控制
+                self._log(f"[UAV{self.uav_id}] starting VELOCITY OFFBOARD mode ({len(pts)} points)")
+                self._process_velocity_offboard_mode(json_path, pts, traj_dir, rows, all_pose_rows)
 
-            for i, (p_in, p_cmd) in enumerate(zip(raw_pts, pts)):
-                # 发送move_to命令到控制器
-                self._log(f"[UAV{self.uav_id}] moving to waypoint {i}/{len(pts)-1}: ({p_cmd.x:.2f}, {p_cmd.y:.2f}, {p_cmd.z:.2f})")
+            elif self.use_mission_mode:
+                # Mission模式：一次性上传所有航点，PX4自动执行
+                self._log(f"[UAV{self.uav_id}] starting MISSION mode waypoint navigation ({len(pts)} points)")
+                mission_started = self._execute_mission_mode(pts, traj_name)
+                if not mission_started:
+                    self._log(f"[UAV{self.uav_id}] mission mode failed, falling back to OFFBOARD mode", "WARN")
+                    # 回退到OFFBOARD模式
+                    self.use_mission_mode = False
 
-                try:
-                    cmd = {"cmd": "move_to", "x": float(p_cmd.x), "y": float(p_cmd.y), "z": float(p_cmd.z), "force": True}
-                    resp = _controller_command(self.control_base, self.uav_id, cmd, timeout=self.cmd_timeout)
-                    if not isinstance(resp, dict) or resp.get("ok") is False:
-                        raise RuntimeError(f"move_to failed: {resp}")
-                except Exception as e:
-                    self._log(f"[UAV{self.uav_id}] waypoint {i} move_to failed: {e}", "WARN")
-                    raise
+            # 仅当不使用速度前馈模式时执行标准航点循环
+            if not self.use_velocity_offboard:
+                if not self.use_mission_mode:
+                    # OFFBOARD模式：逐个航点发送move_to命令
+                    self._log(f"[UAV{self.uav_id}] starting OFFBOARD waypoint navigation ({len(pts)} points)")
 
-                info = _fetch_all_info(
-                    self.image_base,
-                    self.uav_id,
-                    timeout=self.image_timeout,
-                    retries=self.image_retries,
-                )
-                ts_img = float((info.get("image") or {}).get("timestamp") or 0.0)
-                img_b64 = (info.get("image") or {}).get("data") or ""
-                ts_ms = int(ts_img * 1000.0) if ts_img > 0 else int(time.time() * 1000.0)
-                img_name = f"img_{i:06d}_{ts_ms}.png"
-                img_path = traj_dir / "images" / img_name
-                if isinstance(img_b64, str) and img_b64:
-                    _decode_png_b64_to_file(img_b64, img_path)
+                for i, (p_in, p_cmd) in enumerate(zip(raw_pts, pts)):
+                    if self.use_mission_mode:
+                        # Mission模式：等待到达当前航点
+                        self._log(f"[UAV{self.uav_id}] waiting for mission waypoint {i}/{len(pts)-1}")
+                        if not self._wait_mission_waypoint(i, timeout=self.cmd_timeout):
+                            self._log(f"[UAV{self.uav_id}] waypoint {i} timeout, continuing...", "WARN")
+                    else:
+                        # OFFBOARD模式：发送move_to命令到控制器
+                        self._log(f"[UAV{self.uav_id}] moving to waypoint {i}/{len(pts)-1}: ({p_cmd.x:.2f}, {p_cmd.y:.2f}, {p_cmd.z:.2f})")
 
-                pose = info.get("pose") or {}
-                pos = (pose.get("position") or [None, None, None])[:3]
-                att = (pose.get("attitude") or [None, None, None, None])[:4]
-                lv = (pose.get("linear_velocity") or [None, None, None])[:3]
-                av = (pose.get("angular_velocity") or [None, None, None])[:3]
-                la = (pose.get("linear_acceleration") or [None, None, None])[:3]
+                        try:
+                            cmd = {"cmd": "move_to", "x": float(p_cmd.x), "y": float(p_cmd.y), "z": float(p_cmd.z), "force": True}
+                            resp = _controller_command(self.control_base, self.uav_id, cmd, timeout=self.cmd_timeout)
+                            if not isinstance(resp, dict) or resp.get("ok") is False:
+                                raise RuntimeError(f"move_to failed: {resp}")
+                        except Exception as e:
+                            self._log(f"[UAV{self.uav_id}] waypoint {i} move_to failed: {e}", "WARN")
+                            raise
 
-                rows.append(
-                    {
-                        "traj_json": _norm_abs_path(json_path),
-                        "traj_name": traj_name,
-                        "uav_id": self.uav_id,
-                        "step_idx": i,
-                        "cmd_in_x": p_in.x,
-                        "cmd_in_y": p_in.y,
-                        "cmd_in_z": p_in.z,
-                        "cmd_in_roll_deg": p_in.roll_deg,
-                        "cmd_in_yaw_deg": p_in.yaw_deg,
-                        "cmd_in_pitch_deg": p_in.pitch_deg,
-                        "cmd_x": p_cmd.x,
-                        "cmd_y": p_cmd.y,
-                        "cmd_z": p_cmd.z,
-                        "cmd_roll_deg": p_cmd.roll_deg,
-                        "cmd_yaw_deg": p_cmd.yaw_deg,
-                        "cmd_pitch_deg": p_cmd.pitch_deg,
-                        "image_timestamp_s": ts_img,
-                        "image_path": _norm_abs_path(img_path) if img_path.exists() else "",
-                        "obs_pos_x": pos[0],
-                        "obs_pos_y": pos[1],
-                        "obs_pos_z": pos[2],
-                        "obs_att_w": att[3] if len(att) >= 4 else None,
-                        "obs_att_x": att[0] if len(att) >= 4 else None,
-                        "obs_att_y": att[1] if len(att) >= 4 else None,
-                        "obs_att_z": att[2] if len(att) >= 4 else None,
-                        "obs_linvel_x": lv[0],
-                        "obs_linvel_y": lv[1],
-                        "obs_linvel_z": lv[2],
-                        "obs_angvel_x": av[0],
-                        "obs_angvel_y": av[1],
-                        "obs_angvel_z": av[2],
-                        "obs_linacc_x": la[0],
-                        "obs_linacc_y": la[1],
-                        "obs_linacc_z": la[2],
-                        "ulg_path": "",
-                    }
-                )
+                    info = _fetch_all_info(
+                        self.image_base,
+                        self.uav_id,
+                        timeout=self.image_timeout,
+                        retries=self.image_retries,
+                    )
+                    ts_img = float((info.get("image") or {}).get("timestamp") or 0.0)
+                    img_b64 = (info.get("image") or {}).get("data") or ""
+                    ts_ms = int(ts_img * 1000.0) if ts_img > 0 else int(time.time() * 1000.0)
+                    img_name = f"img_{i:06d}_{ts_ms}.png"
+                    img_path = traj_dir / "images" / img_name
+                    if isinstance(img_b64, str) and img_b64:
+                        _decode_png_b64_to_file(img_b64, img_path)
 
-                all_pose_rows.append(
-                    {
-                        "traj_json": _norm_abs_path(json_path),
-                        "traj_name": traj_name,
-                        "uav_id": self.uav_id,
-                        "step_idx": i,
-                        "image_timestamp_s": ts_img,
-                        "pos_x": pos[0],
-                        "pos_y": pos[1],
-                        "pos_z": pos[2],
-                        "cmd_roll_deg": p_cmd.roll_deg,
-                        "cmd_yaw_deg": p_cmd.yaw_deg,
-                        "cmd_pitch_deg": p_cmd.pitch_deg,
-                        "att_w": att[3] if len(att) >= 4 else None,
-                        "att_x": att[0] if len(att) >= 4 else None,
-                        "att_y": att[1] if len(att) >= 4 else None,
-                        "att_z": att[2] if len(att) >= 4 else None,
-                        "linvel_x": lv[0],
-                        "linvel_y": lv[1],
-                        "linvel_z": lv[2],
-                        "angvel_x": av[0],
-                        "angvel_y": av[1],
-                        "angvel_z": av[2],
-                        "linacc_x": la[0],
-                        "linacc_y": la[1],
-                        "linacc_z": la[2],
-                    }
-                )
+                    # Fetch and save depth image
+                    depth_name = f"depth_{i:06d}_{ts_ms}.png"
+                    depth_path = traj_dir / "depths" / depth_name
+                    try:
+                        depth_info = _fetch_depth(self.image_base, self.uav_id, timeout=self.image_timeout)
+                        if depth_info and depth_info.get("data"):
+                            _decode_png_b64_to_file(depth_info["data"], depth_path)
+                    except Exception:
+                        pass  # Depth capture is optional
+
+                    pose = info.get("pose") or {}
+                    pos = (pose.get("position") or [None, None, None])[:3]
+                    att = (pose.get("attitude") or [None, None, None, None])[:4]
+                    lv = (pose.get("linear_velocity") or [None, None, None])[:3]
+                    av = (pose.get("angular_velocity") or [None, None, None])[:3]
+                    la = (pose.get("linear_acceleration") or [None, None, None])[:3]
+
+                    # 坐标对齐：在第一个航点时计算偏移量
+                    obs_pos = (
+                        float(pos[0]) if pos[0] is not None else 0.0,
+                        float(pos[1]) if pos[1] is not None else 0.0,
+                        float(pos[2]) if pos[2] is not None else 0.0,
+                    )
+                    cmd_pos = (float(p_cmd.x), float(p_cmd.y), float(p_cmd.z))
+
+                    if i == 0 and self._origin_offset is None:
+                        # 计算原点偏移量
+                        self._origin_offset = self._calculate_origin_offset(cmd_pos, obs_pos)
+                        self._log(
+                            f"[UAV{self.uav_id}] origin offset calculated: "
+                            f"({self._origin_offset[0]:.4f}, {self._origin_offset[1]:.4f}, {self._origin_offset[2]:.4f})m"
+                        )
+
+                    # 应用坐标对齐
+                    aligned_obs = self._apply_alignment(obs_pos)
+
+                    rows.append(
+                        {
+                            "traj_json": _norm_abs_path(json_path),
+                            "traj_name": traj_name,
+                            "uav_id": self.uav_id,
+                            "step_idx": i,
+                            "cmd_in_x": p_in.x,
+                            "cmd_in_y": p_in.y,
+                            "cmd_in_z": p_in.z,
+                            "cmd_in_roll_deg": p_in.roll_deg,
+                            "cmd_in_yaw_deg": p_in.yaw_deg,
+                            "cmd_in_pitch_deg": p_in.pitch_deg,
+                            "cmd_x": p_cmd.x,
+                            "cmd_y": p_cmd.y,
+                            "cmd_z": p_cmd.z,
+                            "cmd_roll_deg": p_cmd.roll_deg,
+                            "cmd_yaw_deg": p_cmd.yaw_deg,
+                            "cmd_pitch_deg": p_cmd.pitch_deg,
+                            "image_timestamp_s": ts_img,
+                            "image_path": _norm_abs_path(img_path) if img_path.exists() else "",
+                            # 原始观测坐标
+                            "obs_pos_x": pos[0],
+                            "obs_pos_y": pos[1],
+                            "obs_pos_z": pos[2],
+                            # 对齐后的观测坐标（与命令坐标系对齐）
+                            "obs_aligned_x": aligned_obs[0],
+                            "obs_aligned_y": aligned_obs[1],
+                            "obs_aligned_z": aligned_obs[2],
+                            # 坐标系原点偏移量
+                            "origin_offset_x": self._origin_offset[0] if self._origin_offset else 0.0,
+                            "origin_offset_y": self._origin_offset[1] if self._origin_offset else 0.0,
+                            "origin_offset_z": self._origin_offset[2] if self._origin_offset else 0.0,
+                            "obs_att_w": att[3] if len(att) >= 4 else None,
+                            "obs_att_x": att[0] if len(att) >= 4 else None,
+                            "obs_att_y": att[1] if len(att) >= 4 else None,
+                            "obs_att_z": att[2] if len(att) >= 4 else None,
+                            "obs_linvel_x": lv[0],
+                            "obs_linvel_y": lv[1],
+                            "obs_linvel_z": lv[2],
+                            "obs_angvel_x": av[0],
+                            "obs_angvel_y": av[1],
+                            "obs_angvel_z": av[2],
+                            "obs_linacc_x": la[0],
+                            "obs_linacc_y": la[1],
+                            "obs_linacc_z": la[2],
+                            "ulg_path": "",
+                        }
+                    )
+
+                    all_pose_rows.append(
+                        {
+                            "traj_json": _norm_abs_path(json_path),
+                            "traj_name": traj_name,
+                            "uav_id": self.uav_id,
+                            "step_idx": i,
+                            "image_timestamp_s": ts_img,
+                            # 原始坐标
+                            "pos_x": pos[0],
+                            "pos_y": pos[1],
+                            "pos_z": pos[2],
+                            # 对齐后坐标
+                            "aligned_pos_x": aligned_obs[0],
+                            "aligned_pos_y": aligned_obs[1],
+                            "aligned_pos_z": aligned_obs[2],
+                            "cmd_roll_deg": p_cmd.roll_deg,
+                            "cmd_yaw_deg": p_cmd.yaw_deg,
+                            "cmd_pitch_deg": p_cmd.pitch_deg,
+                            "att_w": att[3] if len(att) >= 4 else None,
+                            "att_x": att[0] if len(att) >= 4 else None,
+                            "att_y": att[1] if len(att) >= 4 else None,
+                            "att_z": att[2] if len(att) >= 4 else None,
+                            "linvel_x": lv[0],
+                            "linvel_y": lv[1],
+                            "linvel_z": lv[2],
+                            "angvel_x": av[0],
+                            "angvel_y": av[1],
+                            "angvel_z": av[2],
+                            "linacc_x": la[0],
+                            "linacc_y": la[1],
+                            "linacc_z": la[2],
+                        }
+                    )
 
             # 使用HTTP命令执行降落（不依赖MAVROS）
             self._log(f"[UAV{self.uav_id}] executing HTTP land command for traj={traj_name}")
@@ -1665,6 +2513,12 @@ def main() -> None:
     sg.add_argument("--skip-existing", action="store_true", default=None)
     sg.add_argument("--no-skip-existing", action="store_true", default=None)
     p.add_argument("--dry-run", action="store_true", default=False)
+    # Mission模式：使用MAVROS航点任务而不是HTTP move_to命令
+    p.add_argument("--mission-mode", action="store_true", default=False,
+                   help="Use MAVROS mission mode instead of HTTP move_to commands")
+    # 速度前馈OFFBOARD模式：使用平滑轨迹跟踪控制
+    p.add_argument("--velocity-offboard", action="store_true", default=False,
+                   help="Use velocity-based OFFBOARD control with trajectory smoothing")
     args = p.parse_args()
 
     input_dir = Path(args.input_dir).resolve()
@@ -1776,6 +2630,8 @@ def main() -> None:
             monitor=monitor,
             commander=commander,
             status_log_path=status_log_path,
+            use_mission_mode=args.mission_mode,
+            use_velocity_offboard=args.velocity_offboard,
         )
         t = threading.Thread(target=w.run, name=f"uav{vid}", daemon=True)
         threads.append(t)

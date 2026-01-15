@@ -1,0 +1,135 @@
+    pkill -9 -f "px4_sitl_default/bin/px4"; python mavlink_sim_vehicle.py \
+      --config multi_uav_config_1.json --headless --no-images --sim-port 8081 --ctrl-base-port 5009
+
+      pkill -9 -f "px4_sitl_default/bin/px4"; python mavlink_sim_vehicle.py \
+      --config multi_uav_config_4.json \
+    --usd /home/user/Downloads/export/flattened.usd \
+      --sim-port 8081 \
+      --ctrl-base-port 5009
+
+      sleep 180 && python mavlink_trajectory_collector.py \
+      --input-dir ~/uav-data/drone/uav-flow-sim/train_data/extracted_json_files/ \
+      --out-dir ~/uav-data/recordings-01151005 \
+      --config multi_uav_config_1.json \
+      --uav-ids "0" \
+      --time-scale 2.5 \
+      --no-skip --no-images \
+      --scale 0.01
+
+sudo sysctl -w net.core.rmem_max=26214400
+sudo sysctl -w net.core.wmem_max=26214400 
+sudo sysctl -w net.core.rmem_default=2621440
+sudo sysctl -w net.core.wmem_default=26214400
+
+# 减少 TIME_WAIT 连接
+sudo sysctl -w net.ipv4.tcp_fin_timeout=15
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+
+import omni.usd
+from pxr import Usd, UsdShade, Sdf
+import os
+
+# --- 配置 ---
+# 你的资源实际所在的根目录 (不要带最后的斜杠)
+REAL_ASSET_ROOT = "/home/user/export"
+
+# 尝试匹配的关键词 (UE 导出通常包含这些文件夹名)
+# 脚本会尝试截取这些词之后的部分来拼接路径
+KEYWORDS = ["Assets", "Game", "Materials", "Textures", "export"]
+
+def find_file_in_dir(target_name, search_root):
+    """在指定目录下递归搜索文件 (模糊匹配备用方案)"""
+    for root, dirs, files in os.walk(search_root):
+        if target_name in files:
+            return os.path.join(root, target_name)
+    return None
+
+def resolve_new_path(old_path_str, usd_dir):
+    """计算新的相对路径"""
+    # 1. 统一分隔符，去掉 USD 的 @ 包裹
+    clean_old = old_path_str.replace("\\", "/").strip("@")
+    
+    # 2. 策略 A: 结构化匹配 (保留目录结构，最准确)
+    # 尝试找到关键词，截取后缀，拼接到 REAL_ASSET_ROOT
+    for kw in KEYWORDS:
+        token = f"/{kw}/"
+        if token in clean_old:
+            # 提取 /Assets/ 之后的部分
+            suffix = clean_old.split(token, 1)[1] 
+            # 拼凑成: /home/user/export/Assets/...
+            candidate = os.path.join(REAL_ASSET_ROOT, kw, suffix)
+            
+            if os.path.exists(candidate):
+                # 找到了！计算相对于当前 USD 的路径
+                try:
+                    rel_path = os.path.relpath(candidate, usd_dir)
+                    return "./" + rel_path
+                except ValueError:
+                    # 如果跨盘符或无法计算相对路径，返回绝对路径
+                    return candidate
+
+    # 3. 策略 B: 文件名暴力搜索 (如果目录结构变了)
+    filename = os.path.basename(clean_old)
+    found_abs_path = find_file_in_dir(filename, REAL_ASSET_ROOT)
+    
+    if found_abs_path:
+        try:
+            rel_path = os.path.relpath(found_abs_path, usd_dir)
+            return "./" + rel_path
+        except ValueError:
+            return found_abs_path
+            
+    return None
+
+def fix_paths_linux():
+    ctx = omni.usd.get_context()
+    stage = ctx.get_stage()
+    if not stage:
+        print("错误: 未打开场景")
+        return
+
+    # 获取当前 USD 文件的目录 (用于计算相对路径)
+    root_layer = stage.GetRootLayer()
+    # 注意：在某些环境下 realPath 可能为空，使用 identifier
+    usd_path = root_layer.realPath if root_layer.realPath else root_layer.identifier
+    usd_dir = os.path.dirname(usd_path)
+    
+    print(f"当前 USD 目录: {usd_dir}")
+    print(f"资源搜索根目录: {REAL_ASSET_ROOT}")
+    print("开始扫描并修复路径...")
+    
+    count = 0
+    
+    # 遍历所有 Shader 节点
+    for prim in stage.Traverse():
+        if prim.IsA(UsdShade.Shader):
+            shader = UsdShade.Shader(prim)
+            for input in shader.GetInputs():
+                if input.GetTypeName() == Sdf.ValueTypeNames.Asset:
+                    val = input.Get()
+                    if val:
+                        path_str = str(val)
+                        
+                        # 只处理看起来像 Windows 绝对路径或未找到的路径
+                        # 特征: 包含冒号(C:) 或 包含 Assets 但不在 ./ 下
+                        if ":" in path_str or (not path_str.startswith("./") and not os.path.exists(path_str.strip("@"))):
+                            
+                            new_path = resolve_new_path(path_str, usd_dir)
+                            
+                            if new_path:
+                                # 更新路径
+                                input.Set(new_path)
+                                # 打印简略日志
+                                fname = os.path.basename(path_str)
+                                print(f"[修复] {fname} -> {new_path}")
+                                count += 1
+                            else:
+                                # 只有当找不到时才打印警告，避免刷屏
+                                pass 
+                                # print(f"[警告] 未找到文件: {os.path.basename(path_str)}")
+
+    print("-" * 30)
+    print(f"修复完成！共重新链接了 {count} 个文件。")
+    print("请检查材质是否恢复，然后保存 (Ctrl+S)。")
+
+fix_paths_linux()

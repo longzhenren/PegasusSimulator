@@ -7,8 +7,9 @@
       - 'command'
       - 'state'
       - 'local_position'
-      # - 'global_position'  # 如果你不需要 GPS，可以先注释掉这一行
+      - 'global_position'  # Mission模式需要GPS坐标，必须启用
       # - 'imu'
       # - 'setpoint_position'
       # - 'setpoint_velocity'
       - 'setpoint_raw'   # 如果你使用 raw setpoint 再打开
+      - 'waypoint'       # 用于mission/waypoint服务（trajectory_data_collector需要）

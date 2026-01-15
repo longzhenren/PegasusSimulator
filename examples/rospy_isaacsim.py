@@ -219,7 +219,9 @@ IMAGE_HTTP_URL = os.environ.get("PEGASUS_IMAGE_HTTP_URL", "http://127.0.0.1:8081
 STEP_RETURN_EACH = os.environ.get("PEGASUS_STEP_RETURN_EACH", "0") in ("1", "true", "True")
 INIT_HEIGHT = float(os.environ.get("PEGASUS_INIT_HEIGHT", "2.0"))
 TAKEOFF_REACH_THRESHOLD = float(os.environ.get("PEGASUS_TAKEOFF_REACH_THRESHOLD", "0.1"))
-MOVE_REACH_THRESHOLD = float(os.environ.get("PEGASUS_MOVE_REACH_THRESHOLD", "0.3"))
+MOVE_REACH_THRESHOLD = float(os.environ.get("PEGASUS_MOVE_REACH_THRESHOLD", "0.2"))  # 减小阈值以提高精度
+MOVE_STABLE_WINDOW_S = float(os.environ.get("PEGASUS_MOVE_STABLE_WINDOW_S", "0.3"))  # 到达后等待稳定的时间窗口
+MOVE_STABLE_VEL_EPS = float(os.environ.get("PEGASUS_MOVE_STABLE_VEL_EPS", "0.15"))   # 速度阈值(m/s)，低于此值认为稳定
 CONTROL_LOOP_HZ = float(os.environ.get("PEGASUS_HOVER_HZ", "30.0"))
 LAND_TIMEOUT_S = float(os.environ.get("PEGASUS_LAND_TIMEOUT_S", "45.0"))
 DISARM_TIMEOUT_S = float(os.environ.get("PEGASUS_DISARM_TIMEOUT_S", "15.0"))
@@ -487,6 +489,10 @@ class IsaacSimEnv(Node):
             depth=10
         )
 
+        # MAVROS state 监控 - 必须在创建 state 订阅之前初始化，否则 state_cb 回调可能在属性创建前被触发
+        self._mavros_connected = False
+        self._mavros_connected_event = threading.Event()
+
         # --- subscribers ---
         self.create_subscription(State, self._mavros_prefix + "/mavros/state", self.state_cb, best_effort_qos)
         self.create_subscription(PoseStamped, self._mavros_prefix + "/mavros/local_position/pose", self.pose_cb, best_effort_qos)
@@ -568,10 +574,6 @@ class IsaacSimEnv(Node):
         self._hover_pause_lock = threading.Lock()
         self._hover_pause_event = threading.Event()
         self._hover_pause_event.set()  # 初始非暂停状态
-
-        # MAVROS state 监控
-        self._mavros_connected = False
-        self._mavros_connected_event = threading.Event()
 
         # --- helper: configure MAVROS time sync after launch (as a method) ---
         # Intention: reduce/disable TIMESYNC to avoid PX4 "RTT too high" warnings
@@ -1079,17 +1081,45 @@ class IsaacSimEnv(Node):
         return False
 
     def move_to_and_wait(self, x: float, y: float, z: float, threshold: float = MOVE_REACH_THRESHOLD, timeout_s: float = 60.0) -> bool:
+        """
+        移动到指定位置并等待到达且稳定。
+
+        Args:
+            x, y, z: 目标位置
+            threshold: 位置误差阈值（米）
+            timeout_s: 超时时间（秒）
+
+        Returns:
+            True 如果成功到达并稳定，False 如果超时
+        """
         start = time.time()
+        stable_since = None
+
         while rclpy.ok() and (time.time() - start) < float(timeout_s):
             if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
                 raise InterruptedError("reset cancelled")
+
             self.pub_position(x, y, z)
             self.hover_target = (x, y, z)
+
+            # 计算位置误差
             dx = self.current_pose.pose.position.x - x
             dy = self.current_pose.pose.position.y - y
             dz = self.current_pose.pose.position.z - z
-            if math.sqrt(dx * dx + dy * dy + dz * dz) < float(threshold):
-                return True
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+            if dist < float(threshold):
+                # 位置接近目标，开始检查稳定性
+                if stable_since is None:
+                    stable_since = time.time()
+
+                # 等待稳定时间窗口
+                if (time.time() - stable_since) >= MOVE_STABLE_WINDOW_S:
+                    return True
+            else:
+                # 位置不够接近，重置稳定计时器
+                stable_since = None
+
             rclpy.spin_once(self, timeout_sec=0.05)
             time.sleep(0.05)
         return False
@@ -1108,19 +1138,16 @@ class IsaacSimEnv(Node):
 
         req = WaypointClear.Request()
         try:
-            future = self.mission_clear_client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
-            if future.result() is not None:
-                result = future.result()
-                if result.success:
-                    self.get_logger().info("[mission] Waypoints cleared successfully")
-                    return True
-                else:
-                    self.get_logger().warn("[mission] Failed to clear waypoints")
-                    return False
+            result = call_service_sync(self, self.mission_clear_client, req, timeout_sec=timeout_s)
+            if result is not None and getattr(result, 'success', False):
+                self.get_logger().info("[mission] Waypoints cleared successfully")
+                return True
             else:
-                self.get_logger().warn("[mission] Clear waypoints timed out")
+                self.get_logger().warn("[mission] Failed to clear waypoints")
                 return False
+        except TimeoutError:
+            self.get_logger().warn("[mission] Clear waypoints timed out")
+            return False
         except Exception as e:
             self.get_logger().error(f"[mission] Clear waypoints exception: {e}")
             return False
@@ -1130,15 +1157,17 @@ class IsaacSimEnv(Node):
         推送 mission 航点到 FCU
 
         Args:
-            waypoints: 航点列表，每个航点为 (x, y, z) 元组（本地 NED 坐标）
+            waypoints: 航点列表，每个航点为 (x, y, z) 元组（本地坐标，单位：米）
+                       x=North, y=East, z=Altitude (正值向上)
+                       注意：z 是高度而非 NED 的 Down
             start_index: 起始航点索引
             timeout_s: 超时时间
 
         Returns:
             是否成功
 
-        注意：PX4 SITL 的 mission 模式通常需要 GPS 坐标 (MAV_FRAME_GLOBAL_RELATIVE_ALT)，
-        但也支持本地坐标 (MAV_FRAME_LOCAL_NED)。这里使用本地坐标。
+        注意：PX4 SITL 的 mission 模式需要 GPS 坐标 (MAV_FRAME_GLOBAL_RELATIVE_ALT=3)。
+        本函数会将本地坐标转换为 GPS 坐标。
         """
         if not _MISSION_AVAILABLE or self.mission_push_client is None:
             self.get_logger().warn("[mission] WaypointPush service not available")
@@ -1152,22 +1181,68 @@ class IsaacSimEnv(Node):
             self.get_logger().warn("[mission] No waypoints to push")
             return False
 
+        # GPS 参考点（与 Pegasus configs.yaml 保持一致）
+        from pyproj import Transformer, CRS
+
+        REF_LAT = 47.397742  # 参考纬度 (PX4 SITL 默认)
+        REF_LON = 8.545594   # 参考经度 (PX4 SITL 默认)
+        REF_ALT = 488.0      # 参考高度 (PX4 SITL 默认)
+
+        # 创建本地 ENU 坐标系到 WGS84 的转换器
+        # 使用 EPSG:4326 (WGS84) 和以参考点为中心的本地切平面坐标系
+        local_crs = CRS.from_proj4(
+            f"+proj=tmerc +lat_0={REF_LAT} +lon_0={REF_LON} +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs"
+        )
+        wgs84_crs = CRS.from_epsg(4326)
+        transformer = Transformer.from_crs(local_crs, wgs84_crs, always_xy=True)
+
+        def local_to_gps(north, east, altitude):
+            """将本地坐标转换为 GPS 坐标（使用 pyproj 精确计算）
+
+            Args:
+                north: North方向 (米) - 对应 Transverse Mercator 的 Y
+                east: East方向 (米) - 对应 Transverse Mercator 的 X
+                altitude: 高度 (米，正值向上，相对高度)
+
+            Returns:
+                (latitude, longitude, altitude) - GPS坐标和相对高度
+            """
+            # pyproj transformer expects (x, y) = (east, north) for tmerc
+            lon, lat = transformer.transform(east, north)
+            return lat, lon, altitude
+
         # 构建航点列表
         wp_list = []
+
+        # 注意：不显式添加 HOME 航点，让 PX4 使用当前位置作为 HOME
+        # PX4 mission 模式会自动将第一个 TAKEOFF 航点作为起点
+
         for i, (x, y, z) in enumerate(waypoints):
             wp = Waypoint()
-            wp.frame = 1  # MAV_FRAME_LOCAL_NED
-            wp.command = 16  # MAV_CMD_NAV_WAYPOINT
+            wp.frame = 3  # MAV_FRAME_GLOBAL_RELATIVE_ALT
+
+            if i == 0:
+                # 第一个航点使用 TAKEOFF 命令
+                wp.command = 22  # MAV_CMD_NAV_TAKEOFF
+            else:
+                # 后续航点使用 WAYPOINT 命令
+                wp.command = 16  # MAV_CMD_NAV_WAYPOINT
+
             wp.is_current = (i == start_index)
             wp.autocontinue = True
-            wp.param1 = 0.0  # Hold time (s)
+            wp.param1 = 0.0  # Hold time (s) / Pitch for takeoff
             wp.param2 = MOVE_REACH_THRESHOLD  # Acceptance radius (m)
             wp.param3 = 0.0  # Pass through (0=no)
             wp.param4 = float('nan')  # Desired yaw (NaN=unchanged)
-            wp.x_lat = float(x)
-            wp.y_long = float(y)
-            wp.z_alt = float(z)
+
+            # 转换为 GPS 坐标 (输入: x=North, y=East, z=Altitude 正值向上)
+            lat, lon, alt = local_to_gps(x, y, z)
+            wp.x_lat = lat
+            wp.y_long = lon
+            wp.z_alt = alt
+
             wp_list.append(wp)
+            self.get_logger().info(f"[mission] WP{i}: NED=({x:.2f}, {y:.2f}, {z:.2f}) -> GPS=({lat:.6f}, {lon:.6f}, {alt:.1f}m) cmd={wp.command}")
 
         self.get_logger().info(f"[mission] Pushing {len(wp_list)} waypoints to FCU")
 
@@ -1176,19 +1251,20 @@ class IsaacSimEnv(Node):
         req.waypoints = wp_list
 
         try:
-            future = self.mission_push_client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
-            if future.result() is not None:
-                result = future.result()
-                if result.success:
-                    self.get_logger().info(f"[mission] Pushed {result.wp_transfered} waypoints successfully")
+            result = call_service_sync(self, self.mission_push_client, req, timeout_sec=timeout_s)
+            if result is not None:
+                if getattr(result, 'success', False):
+                    self.get_logger().info(f"[mission] Pushed {getattr(result, 'wp_transfered', 0)} waypoints successfully")
                     return True
                 else:
-                    self.get_logger().warn(f"[mission] Failed to push waypoints, transferred={result.wp_transfered}")
+                    self.get_logger().warn(f"[mission] Failed to push waypoints, transferred={getattr(result, 'wp_transfered', 0)}")
                     return False
             else:
-                self.get_logger().warn("[mission] Push waypoints timed out")
+                self.get_logger().warn("[mission] Push waypoints timed out (result is None)")
                 return False
+        except TimeoutError:
+            self.get_logger().warn("[mission] Push waypoints timed out")
+            return False
         except Exception as e:
             self.get_logger().error(f"[mission] Push waypoints exception: {e}")
             return False
@@ -1311,6 +1387,15 @@ class IsaacSimEnv(Node):
 
         if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
             raise InterruptedError("reset cancelled")
+
+        # PX4 需要先收到 setpoint 流才能允许 arm（安全机制）
+        # 在 arm 之前先发送一些 setpoint
+        self.get_logger().info("[reset] Publishing setpoints before arm (PX4 requirement)...")
+        for _ in range(30):
+            if getattr(self, "_reset_cancel_event", None) and self._reset_cancel_event.is_set():
+                raise InterruptedError("reset cancelled")
+            self.pub_position(0.0, 0.0, target_z)
+            spin_sleep(self, 20.0)
 
         self.arm_cmd.value = True
         while not self.current_state.armed:
@@ -1812,6 +1897,75 @@ class IsaacSimEnv(Node):
 
         self.raw_setpoint_pub.publish(target_position)
 
+    def pub_position_velocity(self, x: float, y: float, z: float,
+                               vx: float, vy: float, vz: float,
+                               yaw: float, yaw_rate: float):
+        """发送带速度前馈的设定点 (OFFBOARD模式)
+
+        参数坐标系: ENU (与Isaac Sim一致)
+        - 位置: (x, y, z) - East, North, Up
+        - 速度: (vx, vy, vz) - m/s
+        - yaw: 航向角 (弧度), ENU坐标系 (East=0, CCW正)
+        - yaw_rate: 航向角速率 (rad/s)
+
+        MAVROS会自动将FRAME_LOCAL_NED转换为PX4的NED坐标系，
+        但这里输入为ENU坐标，需要手动转换为NED。
+        转换: NED.x = ENU.y, NED.y = ENU.x, NED.z = -ENU.z
+        Yaw转换: NED_yaw = π/2 - ENU_yaw
+        """
+        import math
+
+        # 坐标系转换: ENU -> NED
+        ned_x = float(y)       # ENU.y -> NED.x (North)
+        ned_y = float(x)       # ENU.x -> NED.y (East)
+        ned_z = -float(z)      # ENU.z -> NED.z (Down)
+
+        ned_vx = float(vy)     # ENU.vy -> NED.vx
+        ned_vy = float(vx)     # ENU.vx -> NED.vy
+        ned_vz = -float(vz)    # ENU.vz -> NED.vz
+
+        # Yaw坐标系转换: ENU -> NED
+        # ENU: East=0 (X轴), CCW正 (逆时针)
+        # NED: North=0 (X轴), CW正 (顺时针)
+        # 转换公式: NED_yaw = π/2 - ENU_yaw
+        ned_yaw = 0.5 * math.pi - float(yaw)
+
+        # Yaw_rate方向取反: ENU CCW正 -> NED CW正
+        ned_yaw_rate = -float(yaw_rate)
+
+        # 构建 PositionTarget 消息
+        target = PositionTarget()
+        target.header.stamp = self.get_clock().now().to_msg()
+        target.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
+
+        # Type Mask: 使用位置、速度、yaw、yaw_rate，忽略加速度
+        # 位0-2: 忽略位置 -> 0 (使用位置)
+        # 位3-5: 忽略速度 -> 0 (使用速度)
+        # 位6-8: 忽略加速度 -> 111 (忽略)
+        # 位9: 忽略力 -> 1 (忽略)
+        # 位10: 忽略yaw -> 0 (使用yaw)
+        # 位11: 忽略yaw_rate -> 0 (使用yaw_rate)
+        # 0b0000_0011_1111_1000 = 0x03F8 = 1016
+        # 但 PositionTarget 使用 IGNORE 标志，设置为1表示忽略
+        target.type_mask = (
+            PositionTarget.IGNORE_AFX |
+            PositionTarget.IGNORE_AFY |
+            PositionTarget.IGNORE_AFZ
+        )  # 只忽略加速度，使用位置、速度、yaw、yaw_rate
+
+        target.position.x = ned_x
+        target.position.y = ned_y
+        target.position.z = ned_z
+
+        target.velocity.x = ned_vx
+        target.velocity.y = ned_vy
+        target.velocity.z = ned_vz
+
+        target.yaw = ned_yaw
+        target.yaw_rate = ned_yaw_rate
+
+        self.raw_setpoint_pub.publish(target)
+
     # ---------- 轨迹（可选：如果你要跑外部 JSON 轨迹） ----------
     def load_trajectory(self, file_path):
         try:
@@ -2128,6 +2282,168 @@ class IsaacSimEnv(Node):
                         x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
                         self.move_to_and_wait(x, y, z)
                 resp.update({"position": self.get_position()})
+            elif ctype == "arm_and_mission":
+                # 完整的 MISSION 模式流程：arm -> push waypoints -> start mission
+                # 用于跳过 OFFBOARD 模式的场景
+                pts = cmd.get("points") or cmd.get("waypoints") or []
+                timeout = float(cmd.get("timeout", 300.0))
+
+                if not pts:
+                    resp = {"ok": False, "error": "No waypoints provided"}
+                else:
+                    waypoints = []
+                    for pt in pts:
+                        if isinstance(pt, dict):
+                            x = float(pt.get("x", 0.0))
+                            y = float(pt.get("y", 0.0))
+                            z = float(pt.get("z", 0.0))
+                            waypoints.append((x, y, z))
+                        elif isinstance(pt, (list, tuple)) and len(pt) >= 3:
+                            waypoints.append((float(pt[0]), float(pt[1]), float(pt[2])))
+
+                    if not waypoints:
+                        resp = {"ok": False, "error": "No valid waypoints"}
+                    else:
+                        self.get_logger().info(f"[arm_and_mission] Starting with {len(waypoints)} waypoints")
+                        success = True
+                        error_msg = None
+
+                        # Step 1: 先上传航点（按 ROS1 示例的顺序，先 push 再 arm）
+                        self.get_logger().info("[arm_and_mission] Pushing waypoints first...")
+
+                        # 清除旧航点
+                        if not self.clear_mission():
+                            self.get_logger().warn("[arm_and_mission] Clear mission failed, continuing...")
+
+                        # 等待一段时间让mission service稳定
+                        self.get_logger().info("[arm_and_mission] Waiting for mission service to stabilize...")
+                        time.sleep(2.0)
+                        rclpy.spin_once(self, timeout_sec=0.1)
+
+                        # 尝试推送航点，最多重试3次
+                        push_success = False
+                        for push_attempt in range(3):
+                            self.get_logger().info(f"[arm_and_mission] Push attempt {push_attempt + 1}/3...")
+                            if self.push_mission(waypoints):
+                                push_success = True
+                                break
+                            else:
+                                self.get_logger().warn(f"[arm_and_mission] Push attempt {push_attempt + 1} failed, retrying...")
+                                time.sleep(1.0)
+                                rclpy.spin_once(self, timeout_sec=0.1)
+
+                        if not push_success:
+                            success = False
+                            error_msg = "Failed to push waypoints after 3 attempts"
+
+                        # Step 2: 发送 setpoint 流让 PX4 准备好
+                        if success:
+                            self.get_logger().info("[arm_and_mission] Publishing setpoints for PX4...")
+                            first_wp = waypoints[0]
+                            for _ in range(60):
+                                self.pub_position(first_wp[0], first_wp[1], first_wp[2])
+                                spin_sleep(self, 20.0)
+
+                        # Step 3: arm（先尝试标准 CommandBool，失败后尝试 CommandLong 强制解锁）
+                        if success and not self.current_state.armed:
+                            self.get_logger().info("[arm_and_mission] Arming vehicle...")
+                            arm_attempts = 0
+                            arm_success = False
+                            while not self.current_state.armed and arm_attempts < 30:
+                                # 持续发送 setpoint
+                                self.pub_position(first_wp[0], first_wp[1], first_wp[2])
+                                rclpy.spin_once(self, timeout_sec=0.05)
+
+                                # 先尝试标准 CommandBool arm
+                                self.arm_cmd.value = True
+                                try:
+                                    arm_resp = call_service_sync(self, self.arming_client, self.arm_cmd, timeout_sec=2.0)
+                                    arm_svc_success = getattr(arm_resp, 'success', False) if arm_resp else False
+                                    self.get_logger().info(f"[arm_and_mission] CommandBool arm response: success={arm_svc_success}")
+                                    if arm_svc_success:
+                                        # 等待 state 更新
+                                        for _ in range(20):
+                                            rclpy.spin_once(self, timeout_sec=0.1)
+                                            if self.current_state.armed:
+                                                self.get_logger().info("[arm_and_mission] Vehicle armed via CommandBool!")
+                                                arm_success = True
+                                                break
+                                        if arm_success:
+                                            break
+                                except Exception as e:
+                                    self.get_logger().warn(f"[arm_and_mission] CommandBool arm failed: {e}")
+
+                                # 如果 CommandBool 失败，尝试 CommandLong 强制解锁
+                                if not self.current_state.armed:
+                                    cmdlong_req = CommandLong.Request()
+                                    cmdlong_req.broadcast = False
+                                    cmdlong_req.command = 400  # MAV_CMD_COMPONENT_ARM_DISARM
+                                    cmdlong_req.confirmation = 0
+                                    cmdlong_req.param1 = 1.0  # 1=arm, 0=disarm
+                                    cmdlong_req.param2 = 21196.0  # Force arm (safety bypass)
+                                    cmdlong_req.param3 = 0.0
+                                    cmdlong_req.param4 = 0.0
+                                    cmdlong_req.param5 = 0.0
+                                    cmdlong_req.param6 = 0.0
+                                    cmdlong_req.param7 = 0.0
+
+                                    try:
+                                        cmd_resp = call_service_sync(self, self.cmdlong_client, cmdlong_req, timeout_sec=2.0)
+                                        if cmd_resp:
+                                            result = getattr(cmd_resp, 'result', -1)
+                                            cmd_success = getattr(cmd_resp, 'success', False)
+                                            self.get_logger().info(f"[arm_and_mission] CommandLong arm response: success={cmd_success}, result={result}")
+                                            if cmd_success:
+                                                for _ in range(20):
+                                                    rclpy.spin_once(self, timeout_sec=0.1)
+                                                    if self.current_state.armed:
+                                                        self.get_logger().info("[arm_and_mission] Vehicle armed via CommandLong!")
+                                                        arm_success = True
+                                                        break
+                                                if arm_success:
+                                                    break
+                                    except Exception as e:
+                                        self.get_logger().warn(f"[arm_and_mission] CommandLong arm failed: {e}")
+
+                                arm_attempts += 1
+                                time.sleep(0.5)
+                            if not self.current_state.armed:
+                                success = False
+                                error_msg = f"Failed to arm vehicle after {arm_attempts} attempts"
+
+                        # Step 4: 切换到 AUTO.MISSION 模式
+                        if success:
+                            self.get_logger().info("[arm_and_mission] Starting mission...")
+                            if not self.start_mission():
+                                success = False
+                                error_msg = "Failed to start mission mode"
+
+                        # Step 5: 等待任务完成
+                        if success:
+                            last_wp = waypoints[-1]
+                            start_time = time.time()
+                            completion_threshold = MOVE_REACH_THRESHOLD
+                            while time.time() - start_time < timeout:
+                                cur = self.current_pose.pose.position
+                                dist = math.sqrt((cur.x - last_wp[0])**2 + (cur.y - last_wp[1])**2 + (cur.z - last_wp[2])**2)
+                                if dist < completion_threshold:
+                                    self.get_logger().info(f"[arm_and_mission] Reached last waypoint (dist={dist:.2f}m)")
+                                    break
+                                rclpy.spin_once(self, timeout_sec=0.1)
+                                time.sleep(0.5)
+                            else:
+                                self.get_logger().warn(f"[arm_and_mission] Mission timeout after {timeout}s")
+                                success = False
+                                error_msg = "Mission timeout"
+
+                        resp.update({
+                            "success": success,
+                            "error": error_msg,
+                            "mode": "MISSION",
+                            "waypoints_count": len(waypoints),
+                            "position": self.get_position()
+                        })
+
             elif ctype == "execute_mission":
                 # 使用 MAVROS mission 模式执行航点任务
                 pts = cmd.get("points") or cmd.get("waypoints") or []
@@ -2139,7 +2455,14 @@ class IsaacSimEnv(Node):
                 else:
                     waypoints = []
                     for pt in pts:
-                        if isinstance(pt, (list, tuple)) and len(pt) >= 3:
+                        if isinstance(pt, dict):
+                            # 字典格式: {"x": ..., "y": ..., "z": ...}
+                            x = float(pt.get("x", 0.0))
+                            y = float(pt.get("y", 0.0))
+                            z = float(pt.get("z", 0.0))
+                            waypoints.append((x, y, z))
+                        elif isinstance(pt, (list, tuple)) and len(pt) >= 3:
+                            # 列表/元组格式: [x, y, z] 或 (x, y, z)
                             waypoints.append((float(pt[0]), float(pt[1]), float(pt[2])))
 
                     if use_mission_mode and _MISSION_AVAILABLE:
@@ -2180,6 +2503,40 @@ class IsaacSimEnv(Node):
                 # 查询 PX4 ready 状态（从仿真端获取）
                 ready = self._get_sim_px4_ready()
                 resp.update({"px4_ready": ready})
+            elif ctype == "get_mission_status":
+                # 查询当前任务状态
+                mode = self.current_state.mode if self.current_state else "UNKNOWN"
+                armed = self.current_state.armed if self.current_state else False
+                position = self.get_position()
+                # 判断任务状态
+                if mode == "AUTO.MISSION":
+                    mission_state = "executing"
+                elif mode == "AUTO.LAND" or mode == "AUTO.RTL":
+                    mission_state = "landing"
+                elif mode == "OFFBOARD":
+                    mission_state = "offboard"
+                else:
+                    mission_state = "idle"
+                resp.update({
+                    "mode": mode,
+                    "armed": armed,
+                    "position": position,
+                    "mission_state": mission_state,
+                    "current_waypoint": getattr(self, "_current_mission_waypoint", -1),
+                })
+            elif ctype == "setpoint":
+                # 速度前馈setpoint命令：位置+速度+yaw+yaw_rate
+                # 参数坐标系为ENU（与mavlink_sim_vehicle.py一致）
+                x = float(cmd.get("x", 0))
+                y = float(cmd.get("y", 0))
+                z = float(cmd.get("z", 0))
+                vx = float(cmd.get("vx", 0))
+                vy = float(cmd.get("vy", 0))
+                vz = float(cmd.get("vz", 0))
+                yaw = float(cmd.get("yaw", 0))
+                yaw_rate = float(cmd.get("yaw_rate", 0))
+                self.pub_position_velocity(x, y, z, vx, vy, vz, yaw, yaw_rate)
+                resp.update({"status": "success"})
             elif ctype == "shutdown":
                 self._shutdown_requested = True
                 resp.update({"message": "Shutdown requested"})
@@ -2505,6 +2862,7 @@ def main():
     parser.add_argument("--mavros-ns", dest="mavros_ns", type=str, default=None, help="ROS2 namespace for MAVROS (e.g., uav0)")
     parser.add_argument("--launch-file", dest="launch_file", type=str, default=None, help="Path to MAVROS launch file")
     parser.add_argument("--log-dir", dest="log_dir", type=str, default=None, help="Directory for log files")
+    parser.add_argument("--no-auto-reset", dest="no_auto_reset", action="store_true", help="Skip automatic reset (arm/takeoff) on startup")
     # 允许通过 --ros-args __ns:=uavX 的方式设置命名空间（由 launch_multi_rospy 传递）
     args = parser.parse_args()
 
@@ -2600,8 +2958,11 @@ def main():
         # except Exception as e:
         #     env.get_logger().error(f"Failed to configure parameters: {e}")
 
-        env.reset()
-        env.get_logger().info("Environment reset complete; switching to hover+HTTP mode.")
+        if args.no_auto_reset:
+            env.get_logger().info("Skipping auto-reset (--no-auto-reset). Waiting for HTTP commands...")
+        else:
+            env.reset()
+            env.get_logger().info("Environment reset complete; switching to hover+HTTP mode.")
         env.start_http_server()
         # Hover + HTTP commands loop (wait for external HTTP commands)
         try:

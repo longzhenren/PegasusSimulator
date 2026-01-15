@@ -48,3 +48,15 @@ backup/
 recordings/
 px4_logs/
 examples/launch/pegasus_uav_*.launch
+examples/trajectory_recordings/*
+LIBERO/*
+examples/recordings**
+examples/test**
+.gitignore
+examples/trajectory*
+examples/mavlink_test_output/*
+examples/real_trajectory_data/*
+examples/mission_analysis_demo/*
+examples/validation*
+json.tar
+kiro-reh-linux-x64.tar.gz

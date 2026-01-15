@@ -240,8 +240,8 @@ sudo sysctl -w net.ipv4.tcp_tw_reuse=1
 """
 
 # Imports to start Isaac Sim from this script
-import carb
 from isaacsim import SimulationApp
+import carb
 
 import sys, os
 import logging
@@ -513,7 +513,7 @@ class MultiUAVManager:
             ros2_ns = v.get("ros2_namespace", f"uav{vid}")
 
             # Configure vehicle sensors
-            camera = MonocularCamera(f"front_camera_{vid}", config={"depth": False, "frequency": 10.0, "resolution": self.camera_resolution})
+            camera = MonocularCamera(f"front_camera_{vid}", config={"depth": True, "frequency": 10.0, "resolution": self.camera_resolution})
             config_multirotor = MultirotorConfig()
             config_multirotor.graphical_sensors = [camera]
             if ROS2_ENABLE:
@@ -985,6 +985,67 @@ class PegasusApp:
                 carb.log_warn(f"HTTP all error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
                 return jsonify({"error": str(e), "endpoint": "all"}), 500
 
+        @app.route('/uav/<int:uav_id>/depth.png', methods=['GET'])
+        def depth_png(uav_id: int):
+            """获取深度图像（16位PNG格式）"""
+            try:
+                vehicle = self._get_vehicle(uav_id)
+                if vehicle is None:
+                    carb.log_warn(f"HTTP depth.png vehicle_missing uav_id={uav_id}")
+                    return jsonify({"error": f"Vehicle /World/uav{uav_id} not found"}), 404
+                cam = self._get_camera(vehicle)
+                if cam is None:
+                    carb.log_warn(f"HTTP depth.png camera_missing uav_id={uav_id}")
+                    return jsonify({"error": "Camera not found"}), 404
+                if not getattr(cam, 'depth_enabled', False):
+                    return jsonify({"error": "Depth not enabled for this camera"}), 400
+                depth_img, ts = cam.get_last_depth_with_timestamp()
+                if depth_img is None:
+                    carb.log_warn(f"HTTP depth.png no_depth uav_id={uav_id}")
+                    return jsonify({"error": "No depth image cached yet"}), 503
+                png_bytes, b64, w, h, raw_b64 = self._depth_to_png_bytes_and_b64(depth_img)
+                return Response(png_bytes, status=200, mimetype='image/png', headers={'Cache-Control': 'no-cache'})
+            except Exception as e:
+                carb.log_warn(f"HTTP depth.png error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                return jsonify({"error": str(e), "endpoint": "depth.png"}), 500
+
+        @app.route('/uav/<int:uav_id>/depth', methods=['GET'])
+        def depth(uav_id: int):
+            """获取深度图像（JSON格式，包含16位PNG base64和原始float32 base64）"""
+            try:
+                vehicle = self._get_vehicle(uav_id)
+                if vehicle is None:
+                    carb.log_warn(f"HTTP depth vehicle_missing uav_id={uav_id}")
+                    return jsonify({"error": f"Vehicle /World/uav{uav_id} not found"}), 404
+                cam = self._get_camera(vehicle)
+                if cam is None:
+                    carb.log_warn(f"HTTP depth camera_missing uav_id={uav_id}")
+                    return jsonify({"error": "Camera not found"}), 404
+                if not getattr(cam, 'depth_enabled', False):
+                    return jsonify({"error": "Depth not enabled for this camera"}), 400
+                depth_img, ts = cam.get_last_depth_with_timestamp()
+                if depth_img is None:
+                    carb.log_warn(f"HTTP depth no_depth uav_id={uav_id}")
+                    return jsonify({"error": "No depth image cached yet"}), 503
+                png_bytes, b64, w, h, raw_b64 = self._depth_to_png_bytes_and_b64(depth_img)
+                payload = {
+                    "uav_id": uav_id,
+                    "timestamp": ts,
+                    "width": w,
+                    "height": h,
+                    "encoding": "png16_base64",
+                    "mime": "image/png",
+                    "max_depth_m": 50.0,
+                    "data": b64,
+                    "data_url": "data:image/png;base64," + b64,
+                    "raw_float32_base64": raw_b64,
+                    "raw_dtype": "float32",
+                }
+                return jsonify(payload)
+            except Exception as e:
+                carb.log_warn(f"HTTP depth error uav_id={uav_id} err={e} trace={(traceback.format_exc() or '')[:400]}")
+                return jsonify({"error": str(e), "endpoint": "depth"}), 500
+
         @app.route('/uav/<int:uav_id>/reset', methods=['POST'])
         def reset_uav_route(uav_id: int):
             try:
@@ -1130,6 +1191,37 @@ class PegasusApp:
         else:
             h, w, c = arr.shape
         return png_bytes, b64, w, h, c
+
+    def _depth_to_png_bytes_and_b64(self, depth_img, max_depth=50.0):
+        """Convert depth image (float32, meters) to 16-bit PNG.
+
+        Args:
+            depth_img: Depth image in meters (float32)
+            max_depth: Maximum depth in meters for normalization (default 50m)
+
+        Returns:
+            (png_bytes, b64, width, height, raw_data_b64): PNG bytes, base64 PNG, dimensions, and raw float32 base64
+        """
+        arr = np.array(depth_img)
+        h, w = arr.shape[:2] if arr.ndim >= 2 else (0, 0)
+
+        # Save raw depth data as base64 encoded float32
+        raw_depth_b64 = base64.b64encode(arr.astype(np.float32).tobytes()).decode('ascii')
+
+        # Normalize depth to 0-65535 range for 16-bit PNG
+        # Replace inf/nan with max_depth
+        arr = np.where(np.isfinite(arr), arr, max_depth)
+        arr = np.clip(arr, 0.0, max_depth)
+        arr_normalized = (arr / max_depth * 65535.0).astype(np.uint16)
+
+        # Save as 16-bit PNG
+        pil_img = Image.fromarray(arr_normalized, mode='I;16')
+        buf = BytesIO()
+        pil_img.save(buf, format='PNG')
+        png_bytes = buf.getvalue()
+        b64 = base64.b64encode(png_bytes).decode('ascii')
+
+        return png_bytes, b64, w, h, raw_depth_b64
 
     def _get_vehicle(self, uav_id: int):
         from pegasus.simulator.logic.vehicle_manager import VehicleManager

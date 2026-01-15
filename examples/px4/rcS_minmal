@@ -180,6 +180,15 @@ param set-default COM_RC_IN_MODE 1
 # 仿真里 EKF GPS 高度要求放宽一点
 param set-default EKF2_REQ_GPS_H 0.5
 
+# 放宽EKF预检参数（解决仿真中的"velocity estimate error"和"height estimate not stable"）
+# EKF innovation thresholds for arming checks（使用param set强制设置）
+param set COM_ARM_EKF_HGT 1.0     # 高度创新阈值（默认0.5，放宽到1.0）
+param set COM_ARM_EKF_VEL 1.5     # 速度创新阈值（默认0.5，放宽到1.5）
+param set COM_ARM_EKF_POS 1.0     # 位置创新阈值（默认0.5，放宽到1.0）
+# EKF2 drift rate requirements
+param set EKF2_REQ_VDRIFT 0.8     # 垂直漂移率要求（默认0.5，放宽到0.8）
+param set EKF2_REQ_HDRIFT 0.5     # 水平漂移率要求（默认0.3，放宽到0.5）
+
 # Multi-EKF
 param set-default EKF2_MULTI_IMU 3
 param set-default SENS_IMU_MODE 0
@@ -192,17 +201,25 @@ param set-default MAV_PROTO_VER 2
 # 仅在需要时才启用 MC AT 控制（保持默认）
 param set-default -s MC_AT_EN 1
 
-# 失联时间随仿真时间缩放（保留，代价很小）
+# 失联时间设置（适配HTTP setpoint流的延迟）
+# COM_OF_LOSS_T: OFFBOARD丢失超时，HTTP调用有延迟，需设置足够长
+# 无条件设置基础值，确保即使PX4_SIM_SPEED_FACTOR未设置也有合理值
+param set COM_OF_LOSS_T 2.0       # OFFBOARD超时2秒（HTTP延迟容忍）
+param set COM_RC_LOSS_T 2.0       # RC丢失超时
+param set COM_DL_LOSS_T 15        # Datalink丢失超时
+
 if [ -n "$PX4_SIM_SPEED_FACTOR" ]; then
-    COM_DL_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 10" | bc)
+    # 根据仿真速度因子调整（更长的超时）
+    COM_DL_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 15" | bc)
     echo "COM_DL_LOSS_T set to $COM_DL_LOSS_T_LONGER"
     param set COM_DL_LOSS_T $COM_DL_LOSS_T_LONGER
 
-    COM_RC_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 0.5" | bc)
+    COM_RC_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 2.0" | bc)
     echo "COM_RC_LOSS_T set to $COM_RC_LOSS_T_LONGER"
     param set COM_RC_LOSS_T $COM_RC_LOSS_T_LONGER
 
-    COM_OF_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 0.5" | bc)
+    # OFFBOARD超时至少2秒，考虑HTTP延迟
+    COM_OF_LOSS_T_LONGER=$(echo "$PX4_SIM_SPEED_FACTOR * 2.0" | bc)
     echo "COM_OF_LOSS_T set to $COM_OF_LOSS_T_LONGER"
     param set COM_OF_LOSS_T $COM_OF_LOSS_T_LONGER
 
@@ -341,17 +358,53 @@ fi
 [ -e "$autostart_file".post ] && . "$autostart_file".post
 
 # ----------------------------------------------------------------------------
-# 12. 不启 replay / load_mon 等，以达到“极简 + 高并发”目的
+# 12. 不启 replay / load_mon 等，以达到"极简 + 高并发"目的
 # ----------------------------------------------------------------------------
 
 # 不再调用 load_mon start
 # 不再调用 battery_simulator start
-# Run script to start logging
-# set LOGGER_ARGS "-e -p vehicle_attitude -p vehicle_local_position actuator_outputs sensor_combined"
-set LOGGER_ARGS "-e -r 20 vehicle_attitude vehicle_local_position actuator_outputs sensor_combined"
-. ${R}etc/init.d/rc.logging
 
-tone_alarm start
+# ----------------------------------------------------------------------------
+# 13. Logger 配置 - 记录 ULG 飞行日志
+# ----------------------------------------------------------------------------
+# SDLOG_MODE:
+#   -1: 禁用日志
+#    0: 默认（arm 时开始）
+#    2: 从启动到关机持续记录（-f 标志，rc.logging 会自动添加）
+# SDLOG_PROFILE: 位掩码，控制记录哪些 topics
+#   1: DEFAULT - 包含 vehicle_attitude, vehicle_local_position, actuator_outputs, sensor_combined
+#   2: ESTIMATOR_REPLAY
+#   4: THERMAL_CALIBRATION
+#   8: SYSTEM_IDENTIFICATION
+#  16: HIGH_RATE
+#  32: DEBUG_TOPICS
+#  64: SENSOR_COMPARISON
+# 128: VISION_AND_AVOIDANCE
+#
+# 我们使用 SDLOG_MODE=2 (持续记录) + SDLOG_PROFILE=1|8 (DEFAULT + SYSTEM_IDENTIFICATION)
+# SYSTEM_IDENTIFICATION 包含动力学相关的额外数据
+
+# 设置 logger 参数
+param set-default SDLOG_MODE 2
+param set-default SDLOG_PROFILE 9
+
+# 直接启动 logger（绕过 rc.logging 中的语法问题）
+# 参数说明：
+#   -b 512: 512KB buffer
+#   -f: 持续记录直到关机（SDLOG_MODE=2）
+#   -r 50: 50Hz 采样率
+#   -t: 使用日期时间命名日志文件夹
+# 检查是否已运行，避免重复启动
+if ! logger status > /dev/null 2>&1
+then
+    logger start -b 512 -f -r 50 -t
+fi
+
+if ! tone_alarm status > /dev/null 2>&1
+then
+    tone_alarm start
+fi
+
 replay trystart
 
 # 通知 MAVLink 端“启动完成”

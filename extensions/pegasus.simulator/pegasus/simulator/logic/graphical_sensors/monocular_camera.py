@@ -12,11 +12,25 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 
 from isaacsim.sensors.camera.camera import Camera
 from omni.usd import get_stage_next_free_path
+import omni.timeline
 
 # Auxiliary scipy and numpy modules
 import numpy as np
 from scipy.spatial.transform import Rotation
 import time
+
+
+def get_sim_time() -> float:
+    """获取Isaac Sim模拟器时间（秒）
+
+    Returns:
+        float: 模拟器当前时间（秒），如果获取失败则返回系统时间
+    """
+    try:
+        timeline = omni.timeline.get_timeline_interface()
+        return timeline.get_current_time()
+    except Exception:
+        return time.time()
 
 
 class MonocularCamera(GraphicalSensor):
@@ -78,6 +92,9 @@ class MonocularCamera(GraphicalSensor):
         # Cache of last image and timestamp (updated on render updates)
         self._last_image = None
         self._last_image_ts = None
+        # Cache of last depth image (updated on render updates if depth enabled)
+        self._last_depth = None
+        self._last_depth_ts = None
         # Cache of last state snapshot aligned with last image
         self._last_state_snapshot = None
 
@@ -188,9 +205,21 @@ class MonocularCamera(GraphicalSensor):
             # Note: get_rgba returns last rendered frame; we cache RGB channels
             img = self._camera.get_rgba()[:, :, :3]
             self._last_image = img
-            ts = time.time()
+            # 使用模拟器时间而非系统时间，确保严格锁步
+            ts = get_sim_time()
             self._last_image_ts = ts
             self._state["timestamp"] = ts
+
+            # Capture and cache depth image if depth is enabled
+            if self._depth:
+                try:
+                    depth_img = self._camera.get_depth()
+                    self._last_depth = depth_img
+                    self._last_depth_ts = ts
+                    self._state["depth"] = depth_img
+                except Exception:
+                    pass  # Depth not available yet
+
             # Snapshot the vehicle state aligned with this image
             try:
                 self._last_state_snapshot = {
@@ -202,10 +231,6 @@ class MonocularCamera(GraphicalSensor):
                 }
             except Exception:
                 self._last_state_snapshot = None
-
-            # Check if we want to get the depth image
-            #if self._depth:
-            #    self._state["depth"] = self._camera.get_depth()
 
             if self._camera.get_lens_distortion_model() == "pinhole":
                 self._state["intrinsics"] = self._camera.get_intrinsics_matrix()
@@ -240,3 +265,26 @@ class MonocularCamera(GraphicalSensor):
             (dict | None): Dict with position, attitude, linear_velocity, angular_velocity, linear_acceleration.
         """
         return self._last_state_snapshot
+
+    def get_last_depth_with_timestamp(self):
+        """Return the last cached depth frame and its capture timestamp.
+
+        Returns:
+            (tuple[np.ndarray, float] | (None, None)): Cached depth image and timestamp if available.
+        """
+        return self._last_depth, self._last_depth_ts
+
+    def get_depth(self):
+        """Method that returns the current depth image from the camera.
+
+        Returns:
+            (np.ndarray | None) The current depth image from the camera, or None if depth is disabled.
+        """
+        return self._last_depth
+
+    @property
+    def depth_enabled(self):
+        """
+        (bool) Whether depth capture is enabled for this camera.
+        """
+        return self._depth

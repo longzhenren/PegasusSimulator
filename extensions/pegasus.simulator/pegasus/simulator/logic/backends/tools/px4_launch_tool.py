@@ -479,8 +479,8 @@ class PX4LaunchTool:
             # 1. 发送中断信号，让 PX4 执行清理逻辑（保存日志）
             self.px4_process.send_signal(signal.SIGINT)
             try:
-                # 2. 等待进程正常结束（最多等 10 秒）
-                self.px4_process.wait(timeout=10)
+                # 2. 等待进程正常结束（最多等 6 秒）
+                self.px4_process.wait(timeout=6)
                 ts_log(self._log_prefix, "PX4 exited gracefully")
             except subprocess.TimeoutExpired:
                 # 如果超时还没关掉，再强制杀掉
