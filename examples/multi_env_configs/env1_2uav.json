@@ -1,0 +1,23 @@
+{
+  "description": "Environment 1: UAV 2-3",
+  "vehicles": [
+    {
+      "vehicle_id": 2,
+      "ros2_namespace": "uav2",
+      "initial_position": [0.0, 0.0, 0.5],
+      "initial_orientation_euler_deg": [0.0, 0.0, 0.0],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "sim_speed_factor": 1.0
+    },
+    {
+      "vehicle_id": 3,
+      "ros2_namespace": "uav3",
+      "initial_position": [3.0, 0.0, 0.5],
+      "initial_orientation_euler_deg": [0.0, 0.0, 0.0],
+      "px4_autolaunch": true,
+      "px4_dir": "/home/user/PX4-Autopilot",
+      "sim_speed_factor": 1.0
+    }
+  ]
+}
