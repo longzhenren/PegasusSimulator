@@ -185,6 +185,110 @@ def ts_log(prefix: str, message: str, level: str = "INFO") -> str:
 
 PX4_PID_DIR = "/tmp/pegasus_px4_sitl"
 
+
+def cleanup_px4_residuals(vehicle_id: int = None, kill_processes: bool = True):
+    """
+    清理PX4残留文件和进程
+
+    【重要】解决 "PX4 server already running for instance X" 问题
+
+    清理内容：
+    1. PX4 锁文件 (/tmp/px4_instance_*, /tmp/px4-*)
+    2. PX4 临时目录 (/tmp/px4_*/)
+    3. 残留的 PX4 进程（可选）
+
+    Args:
+        vehicle_id: 如果指定，只清理该 UAV 的文件；否则清理所有
+        kill_processes: 是否杀死残留的 PX4 进程
+
+    Returns:
+        清理的文件/进程数量
+    """
+    import glob
+    cleaned_count = 0
+
+    # 1. 清理 PX4 锁文件
+    lock_patterns = [
+        "/tmp/px4_instance_*",
+        "/tmp/px4-*",
+    ]
+
+    if vehicle_id is not None:
+        # 只清理指定 UAV 的锁文件
+        lock_patterns = [
+            f"/tmp/px4_instance_{vehicle_id}_*",
+            f"/tmp/px4-{vehicle_id}*",
+        ]
+
+    for pattern in lock_patterns:
+        for lock_file in glob.glob(pattern):
+            try:
+                if os.path.isfile(lock_file):
+                    os.remove(lock_file)
+                    ts_log("[PX4Cleanup]", f"Removed lock file: {lock_file}")
+                    cleaned_count += 1
+                elif os.path.isdir(lock_file):
+                    shutil.rmtree(lock_file)
+                    ts_log("[PX4Cleanup]", f"Removed lock dir: {lock_file}")
+                    cleaned_count += 1
+            except Exception as e:
+                ts_log("[PX4Cleanup]", f"Failed to remove {lock_file}: {e}", "WARN")
+
+    # 2. 清理 PX4 PID 文件
+    if vehicle_id is not None:
+        pid_file = os.path.join(PX4_PID_DIR, f"px4_{vehicle_id}.pid")
+        if os.path.exists(pid_file):
+            try:
+                os.remove(pid_file)
+                ts_log("[PX4Cleanup]", f"Removed PID file: {pid_file}")
+                cleaned_count += 1
+            except Exception as e:
+                ts_log("[PX4Cleanup]", f"Failed to remove {pid_file}: {e}", "WARN")
+    else:
+        # 清理所有 PID 文件
+        for pid_file in glob.glob(os.path.join(PX4_PID_DIR, "px4_*.pid")):
+            try:
+                os.remove(pid_file)
+                ts_log("[PX4Cleanup]", f"Removed PID file: {pid_file}")
+                cleaned_count += 1
+            except Exception as e:
+                ts_log("[PX4Cleanup]", f"Failed to remove {pid_file}: {e}", "WARN")
+
+    # 3. 杀死残留的 PX4 进程
+    if kill_processes:
+        try:
+            import subprocess
+            # 查找所有 PX4 相关进程
+            result = subprocess.run(
+                ['pgrep', '-f', 'px4_sitl_default/bin/px4'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                for pid_str in pids:
+                    try:
+                        pid = int(pid_str.strip())
+                        if pid > 0:
+                            os.kill(pid, signal.SIGKILL)
+                            ts_log("[PX4Cleanup]", f"Killed orphan PX4 process: PID {pid}")
+                            cleaned_count += 1
+                    except (ValueError, ProcessLookupError):
+                        pass
+                    except Exception as e:
+                        ts_log("[PX4Cleanup]", f"Failed to kill PID {pid_str}: {e}", "WARN")
+        except FileNotFoundError:
+            ts_log("[PX4Cleanup]", "pgrep not found, skipping process cleanup", "WARN")
+        except subprocess.TimeoutExpired:
+            ts_log("[PX4Cleanup]", "Process cleanup timed out", "WARN")
+        except Exception as e:
+            ts_log("[PX4Cleanup]", f"Process cleanup error: {e}", "WARN")
+
+    if cleaned_count > 0:
+        ts_log("[PX4Cleanup]", f"Cleanup complete: {cleaned_count} items removed")
+
+    return cleaned_count
+
+
 def _get_default_log_dir():
     """获取默认日志目录，优先使用 logs/<session_ts>/px4/，否则用 /tmp"""
     session_ts = os.environ.get("PEGASUS_SESSION_TS")
@@ -355,6 +459,99 @@ class PX4LaunchTool:
             self._log_monitor_thread.join(timeout=2.0)
             self._log_monitor_thread = None
 
+    def _ensure_port_free(self, port: int) -> bool:
+        """
+        确保指定端口可用，仅杀死占用端口的 PX4 相关进程
+        
+        【重要】仅杀死 PX4 相关进程，避免误杀仿真器主进程：
+        - 只杀死进程名包含 "px4" 的进程
+        - 跳过 python/isaac/sim 相关进程
+        
+        Args:
+            port: 要检查的端口号
+            
+        Returns:
+            True 如果端口现在可用，False 如果仍被占用
+        """
+        import socket
+        import subprocess
+        
+        # 检查端口是否被占用
+        def is_port_in_use(p):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.bind(('127.0.0.1', p))
+                    return False
+                except OSError:
+                    return True
+        
+        if not is_port_in_use(port):
+            return True
+            
+        ts_log(self._log_prefix, f"Port {port} is in use, checking for orphan PX4 processes...")
+        
+        try:
+            # 使用 lsof 查找占用端口的进程
+            result = subprocess.run(
+                ['lsof', '-t', '-i', f'TCP:{port}'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                killed_any = False
+                for pid_str in pids:
+                    try:
+                        pid = int(pid_str.strip())
+                        if pid <= 0:
+                            continue
+                        
+                        # 获取进程命令行，检查是否是 PX4 进程
+                        try:
+                            with open(f"/proc/{pid}/cmdline", "r") as f:
+                                cmdline = f.read().replace('\x00', ' ').lower()
+                        except (FileNotFoundError, PermissionError):
+                            # 进程可能已经退出
+                            continue
+                        
+                        # 【关键】只杀死 PX4 相关进程，保护仿真器进程
+                        is_px4_process = 'px4' in cmdline or 'px4_sitl' in cmdline
+                        is_simulator = 'python' in cmdline or 'isaac' in cmdline or 'sim_vehicle' in cmdline
+                        
+                        if is_px4_process and not is_simulator:
+                            ts_log(self._log_prefix, f"Killing orphan PX4 process: PID {pid}")
+                            os.kill(pid, signal.SIGKILL)
+                            killed_any = True
+                        else:
+                            ts_log(self._log_prefix, f"Skipping non-PX4 process: PID {pid} (protected)")
+                            
+                    except (ValueError, ProcessLookupError):
+                        pass
+                    except Exception as e:
+                        ts_log(self._log_prefix, f"Failed to check/kill PID {pid_str}: {e}", "WARN")
+                
+                if killed_any:
+                    time.sleep(0.5)
+                    if not is_port_in_use(port):
+                        ts_log(self._log_prefix, f"Port {port} successfully freed")
+                        return True
+            
+            # 不再使用 fuser -k，避免误杀
+            if is_port_in_use(port):
+                ts_log(self._log_prefix, f"Port {port} still in use by non-PX4 process (OK for simulator)", "WARN")
+                return False
+            return True
+                
+        except FileNotFoundError:
+            ts_log(self._log_prefix, "lsof not found, skipping port cleanup", "WARN")
+        except subprocess.TimeoutExpired:
+            ts_log(self._log_prefix, "Port cleanup command timed out", "WARN")
+        except Exception as e:
+            ts_log(self._log_prefix, f"Port cleanup error: {e}", "WARN")
+        
+        return not is_port_in_use(port)
+
+
     def _save_logs(self):
         """
         因为 self.root_fs 是临时目录，在 cleanup 之前必须把日志挪出来
@@ -387,6 +584,10 @@ class PX4LaunchTool:
         self._log_file_path = self._generate_log_file_path()
         self._launch_count += 1
 
+        # 【关键】清理 PX4 锁文件和残留进程，解决 "PX4 server already running" 问题
+        ts_log(self._log_prefix, "Cleaning up PX4 residuals before launch...")
+        cleanup_px4_residuals(vehicle_id=self.vehicle_id, kill_processes=True)
+
         # 清理旧的 PID 文件（避免残留导致启动检测失败）
         pid_path = self.pid_file_path(self.vehicle_id)
         if os.path.exists(pid_path):
@@ -396,6 +597,10 @@ class PX4LaunchTool:
             except Exception as e:
                 ts_log(self._log_prefix, f"Failed to remove stale PID: {e}", "WARN")
                 ts_log(self._log_prefix, traceback.format_exc(), "WARN")
+
+        # 【新增】检查 MAVLink 端口是否可用，如被占用则杀死占用进程
+        mavlink_port = 4560 + self.vehicle_id
+        self._ensure_port_free(mavlink_port)
 
         # 打开日志文件用于输出
         try:

@@ -92,6 +92,7 @@ def parse_args():
     parser.add_argument("--no-images", action="store_true", help="Disable camera/image capture and related endpoints")
     parser.add_argument("--sim-port", type=int, default=8081, help="Simulation HTTP port")
     parser.add_argument("--ctrl-base-port", type=int, default=5009, help="Controller HTTP base port")
+    parser.add_argument("--physics-dt", type=float, default=1.0/200.0, help="Physics timestep (default: 1/200=0.005s)")
     return parser.parse_args()
 
 ARGS = parse_args()
@@ -165,9 +166,28 @@ import numpy as np
 
 from PIL import Image
 from flask import Flask, jsonify, request, Response
-from werkzeug.serving import make_server
+from werkzeug.serving import make_server, WSGIRequestHandler
 from scipy.spatial.transform import Rotation
 from pymavlink import mavutil
+
+
+def make_server_with_reuse(host: str, port: int, app, threaded: bool = True):
+    """Create a WSGI server with SO_REUSEADDR enabled.
+    
+    This prevents "Address already in use" errors on restart by allowing
+    the socket to be rebound immediately after the previous process exits.
+    """
+    from werkzeug.serving import BaseWSGIServer
+    import socketserver
+    
+    class ReuseAddrWSGIServer(BaseWSGIServer, socketserver.ThreadingMixIn if threaded else object):
+        """WSGI Server with SO_REUSEADDR enabled"""
+        allow_reuse_address = True
+        
+        def __init__(self, host, port, app):
+            super().__init__(host, port, app, handler=WSGIRequestHandler)
+    
+    return ReuseAddrWSGIServer(host, port, app)
 
 import omni.timeline
 import omni.usd
@@ -175,6 +195,12 @@ from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema
 
 # 配置 Pegasus 路径
 sys.path.insert(0, os.path.expanduser("~/PegasusSimulator-5.1/extensions/pegasus.simulator/"))
+
+# 【关键】仿真启动前清理 PX4 残留进程和锁文件
+# 解决 "PX4 server already running for instance X" 问题
+from pegasus.simulator.logic.backends.tools.px4_launch_tool import cleanup_px4_residuals
+print("[mavlink_sim_vehicle] Cleaning up PX4 residuals before simulation start...")
+cleanup_px4_residuals(vehicle_id=None, kill_processes=True)
 
 from pegasus.simulator.params import ROBOTS
 from pegasus.simulator.logic.graphical_sensors.monocular_camera import MonocularCamera
@@ -187,6 +213,9 @@ from isaacsim.core.api.world import World
 # 3. 业务逻辑代码
 # ==============================================================================
 
+# 全局World引用，用于获取仿真时间
+_GLOBAL_WORLD = None
+
 # 录制设置
 RECORD_ENABLE = False
 RECORD_FPS = 10.0
@@ -196,6 +225,10 @@ RECORD_DIR = os.path.join(os.path.dirname(__file__), "recordings")
 UAV_TRANSPARENCY_ENABLE = True
 UAV_TRANSPARENCY_ALPHA = 0.0
 DISABLE_UAV_UAV_COLLISION = True
+
+# MAVLink时间广播配置（用于控制器锁步同步）
+TIME_BROADCAST_ENABLE = True
+TIME_BROADCAST_PORT = 14555  # UDP端口，控制器监听此端口
 
 def ts_log(prefix: str, message: str, level: str = "INFO") -> str:
     """生成带时间戳的日志消息"""
@@ -208,14 +241,187 @@ def ts_log(prefix: str, message: str, level: str = "INFO") -> str:
 def get_sim_time() -> float:
     """获取Isaac Sim模拟器时间（秒）
 
+    Uses world.current_time which tracks the physics simulation time,
+    not omni.timeline which tracks the USD timeline for animations.
+
     Returns:
-        float: 模拟器当前时间（秒），如果获取失败则返回系统时间
+        float: 模拟器当前物理仿真时间（秒），如果获取失败则返回系统时间
     """
+    global _GLOBAL_WORLD
     try:
+        if _GLOBAL_WORLD is not None:
+            return _GLOBAL_WORLD.current_time
+        # Fallback to timeline if world is not set
         timeline = omni.timeline.get_timeline_interface()
         return timeline.get_current_time()
     except Exception:
         return time.time()
+
+
+# -------------------------
+# MAVLink Time Broadcaster
+# -------------------------
+class TimeBroadcaster:
+    """MAVLink UDP时间广播器，用于控制器锁步同步"""
+
+    def __init__(self, port: int = 14555):
+        self._port = port
+        self._socket = None
+        self._mav = None
+        self._last_broadcast_time = 0.0
+        self._min_interval = 0.001  # 最小广播间隔1ms
+
+    def start(self):
+        """启动广播器"""
+        import socket
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Allow socket address reuse to prevent "Address already in use" on restart
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # 创建MAVLink连接用于编码消息
+        self._mav = mavutil.mavlink.MAVLink(None)
+        self._mav.srcSystem = 1
+        self._mav.srcComponent = 1
+        ts_log("[TimeBroadcaster]", f"Started on UDP port {self._port}")
+
+    def broadcast(self, sim_time_sec: float):
+        """广播当前仿真时间"""
+        if self._socket is None:
+            return
+        # 节流：避免过于频繁的广播
+        if (sim_time_sec - self._last_broadcast_time) < self._min_interval:
+            return
+        self._last_broadcast_time = sim_time_sec
+        try:
+            # 使用SYSTEM_TIME消息广播时间
+            time_usec = int(sim_time_sec * 1e6)
+            msg = self._mav.system_time_encode(time_usec, int(sim_time_sec * 1000))
+            self._socket.sendto(msg.pack(self._mav), ("127.0.0.1", self._port))
+        except Exception:
+            pass
+
+    def stop(self):
+        """停止广播器"""
+        if self._socket:
+            self._socket.close()
+            self._socket = None
+
+
+# -------------------------
+# State Recorder for Offline Data Collection
+# -------------------------
+class StateRecorder:
+    """状态记录器，用于离线数据采集"""
+
+    def __init__(self, target_hz: float = 50.0):
+        self._target_hz = target_hz
+        self._min_interval = 1.0 / target_hz
+        self._lock = threading.Lock()
+        self._recording = False
+        self._records = []
+        self._last_record_time = 0.0
+        self._start_sim_time = 0.0
+        self._log_interval = 1.0  # 每秒输出一次日志
+
+    def start(self, start_sim_time: float = 0.0):
+        """开始记录"""
+        with self._lock:
+            self._records = []
+            self._recording = True
+            self._start_sim_time = start_sim_time
+            # 初始化为 start_sim_time - min_interval，确保第一次调用record()能立即记录
+            self._last_record_time = start_sim_time - self._min_interval - 0.001
+            self._last_log_time = start_sim_time
+        ts_log("[StateRecorder]", f"Started recording at sim_time={start_sim_time:.3f}s (target_hz={self._target_hz})")
+
+    def is_recording(self) -> bool:
+        with self._lock:
+            return self._recording
+
+    def set_metadata(self, traj_json: str = "", traj_name: str = "", ulg_path: str = "",
+                      position_offset: list = None, scale: float = 0.01, time_scale: float = 1.0):
+        """设置轨迹元数据
+        
+        Args:
+            traj_json: 轨迹JSON文件路径
+            traj_name: 轨迹名称
+            ulg_path: ULG文件路径
+            position_offset: [x, y, z] 位置偏移量 (Isaac start - JSON start)
+            scale: 轨迹缩放因子 (raw_logs -> meters)
+            time_scale: 时间缩放因子
+        """
+        with self._lock:
+            self._traj_json = traj_json
+            self._traj_name = traj_name
+            self._ulg_path = ulg_path
+            self._position_offset = position_offset if position_offset else [0.0, 0.0, 0.0]
+            self._scale = scale
+            self._time_scale = time_scale
+
+    def record(self, sim_time: float, uav_id: int, state, px4_state: Dict = None, 
+               cmd_in: tuple = None, cmd: tuple = None) -> bool:
+        """记录一帧状态数据
+        
+        Args:
+            sim_time: 仿真时间
+            uav_id: UAV ID
+            state: 车辆状态 (position, attitude, velocities, acceleration)
+            px4_state: PX4状态 (position, velocity)
+            cmd_in: 原始轨迹命令 (x, y, z)
+            cmd: 转换后的命令 (x, y, z)
+        """
+        with self._lock:
+            if not self._recording:
+                return False
+            # 节流
+            if (sim_time - self._last_record_time) < self._min_interval:
+                return False
+            self._last_record_time = sim_time
+            
+            step_idx = len(self._records)
+            
+            # 记录数据
+            record = {
+                "sim_time": sim_time,
+                "uav_id": uav_id,
+                "step_idx": step_idx,
+                "position": state.position.tolist(),
+                "attitude": state.attitude.tolist(),
+                "linear_velocity": state.linear_velocity.tolist(),
+                "angular_velocity": state.angular_velocity.tolist(),
+                "linear_acceleration": state.linear_acceleration.tolist(),
+                "cmd_in": cmd_in if cmd_in else (0.0, 0.0, 0.0),
+                "cmd": cmd if cmd else (0.0, 0.0, 0.0),
+            }
+            
+            if px4_state:
+                record["px4_position"] = px4_state.get("position", np.zeros(3)).tolist()
+                record["px4_velocity"] = px4_state.get("velocity", np.zeros(3)).tolist()
+            
+            self._records.append(record)
+            # 每秒输出日志
+            elapsed = sim_time - self._start_sim_time
+            if (sim_time - self._last_log_time) >= self._log_interval:
+                self._last_log_time = sim_time
+                pos = state.position
+                vel = state.linear_velocity
+                speed = (vel[0]**2 + vel[1]**2 + vel[2]**2)**0.5
+                ts_log(f"[UAV{uav_id}]", f"t={elapsed:.2f}s obs=({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f}) vel={speed:.2f}m/s")
+            return True
+
+    def stop(self) -> list:
+        """停止记录并返回所有数据"""
+        with self._lock:
+            self._recording = False
+            records = self._records.copy()
+            count = len(records)
+        ts_log("[StateRecorder]", f"Stopped recording, {count} records collected")
+        return records
+
+    def get_records(self) -> list:
+        """获取当前记录（不停止）"""
+        with self._lock:
+            return self._records.copy()
 
 
 # -------------------------
@@ -463,10 +669,80 @@ class MAVLinkController:
         self._flask_server = None
         self._setup_routes()
 
-        # 后台线程
-        self._running = False
-        self._heartbeat_thread = None
-        self._state_thread = None
+        # Telemetry Listener
+        self._telemetry_conn = None
+        self._telemetry_thread = None
+        self._telemetry_running = False
+        self._px4_state = {
+            "position": np.zeros(3), # NED
+            "velocity": np.zeros(3), # NED
+            "attitude": np.array([1.0, 0.0, 0.0, 0.0]) # w,x,y,z
+        }
+        
+        # Last setpoint storage (for recording to CSV)
+        self._last_setpoint = None  # Will store (cmd_in, cmd) tuples
+        self._setpoint_lock = threading.Lock()
+        
+        # Start telemetry listener
+        self._start_telemetry_listener()
+
+    def _start_telemetry_listener(self):
+        """Start thread to listen for PX4 telemetry"""
+        self._telemetry_running = True
+        self._telemetry_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
+        self._telemetry_thread.start()
+        
+    def _telemetry_loop(self):
+        """Receive PX4 telemetry (Position, Attitude)"""
+        # Listen on 14740 + id (PX4 sends to this port)
+        conn_str = f"udpin:0.0.0.0:{self._ctrl_local_port}"
+        ts_log(self._log_prefix, f"Listening for telemetry on {conn_str}")
+        
+        while self._telemetry_running:
+            try:
+                if self._telemetry_conn is None:
+                    self._telemetry_conn = mavutil.mavlink_connection(conn_str)
+                    self._telemetry_streams_requested = False
+                
+                msg = self._telemetry_conn.recv_match(blocking=True, timeout=1.0)
+                if not msg:
+                    continue
+                
+                # Request streams once we have a connection (on first heartbeat)
+                if not self._telemetry_streams_requested and msg.get_type() == 'HEARTBEAT':
+                    # Request data streams explicitly
+                    # LOCAL_POSITION_NED (32) @ 50Hz
+                    self._telemetry_conn.mav.command_long_send(
+                        self._telemetry_conn.target_system, self._telemetry_conn.target_component,
+                        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                        32, 20000, 0, 0, 0, 0, 0
+                    )
+                    # ATTITUDE (30) @ 50Hz  
+                    self._telemetry_conn.mav.command_long_send(
+                        self._telemetry_conn.target_system, self._telemetry_conn.target_component,
+                        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                        30, 20000, 0, 0, 0, 0, 0
+                    )
+                    self._telemetry_streams_requested = True
+                    ts_log(self._log_prefix, f"Requested LOCAL_POSITION_NED & ATTITUDE streams (target_system={self._telemetry_conn.target_system})")
+                    
+                if msg.get_type() == 'LOCAL_POSITION_NED':
+                    self._px4_state["position"] = np.array([msg.x, msg.y, msg.z])
+                    self._px4_state["velocity"] = np.array([msg.vx, msg.vy, msg.vz])
+                
+                elif msg.get_type() == 'ATTITUDE':
+                    # Euler to Quaternion (simplified) or just store Euler
+                    # Need utils for robust conversion if needed, but for now just logging
+                    pass
+
+            except Exception as e:
+                # ts_log(self._log_prefix, f"Telemetry error: {e}", "WARN")
+                time.sleep(1.0)
+                self._telemetry_conn = None
+
+    def get_px4_state(self):
+        """Get latest PX4 state"""
+        return self._px4_state
 
     def _get_mavlink_conn(self):
         """获取MAVLink连接（独立的UDP连接）"""
@@ -992,9 +1268,11 @@ class MAVLinkController:
             # ENU: East=0 (X轴), CCW正 (逆时针)
             # NED: North=0 (X轴), CW正 (顺时针)
             # 转换公式: NED_yaw = π/2 - ENU_yaw
-            # 这样 ENU_yaw=0 (East) -> NED_yaw=π/2 (East in NED)
-            # ENU_yaw=π/2 (North) -> NED_yaw=0 (North in NED)
-            ned_yaw = 0.5 * math.pi - yaw
+            #
+            # 【修正】：测试发现存在稳定的180度Yaw误差，说明Isaac Sim模型或坐标系定义
+            # 与PX4存在180度偏差（可能是机头朝向定义相反）。
+            # 因此在此增加180度偏移: ned_yaw = (π/2 - yaw) + π
+            ned_yaw = 0.5 * math.pi - yaw + math.pi
 
             # Yaw_rate方向取反: ENU CCW正 -> NED CW正
             ned_yaw_rate = -yaw_rate
@@ -1010,8 +1288,28 @@ class MAVLinkController:
                 ned_ax, ned_ay, ned_az,     # 加速度前馈
                 ned_yaw, ned_yaw_rate       # yaw, yaw_rate
             )
+            
+            # Store the setpoint for recording (ENU coordinates)
+            # cmd_in: raw input (position without offset, just the ENU setpoint sent)
+            # cmd: the actual command sent (same as cmd_in for now)
+            with self._setpoint_lock:
+                self._last_setpoint = {
+                    "cmd_in": (x, y, z),  # ENU position
+                    "cmd": (x, y, z),     # Same as input for now
+                    "timestamp": time.time()
+                }
         except Exception as e:
             ts_log(self._log_prefix, f"Velocity setpoint send error: {e}", "WARN")
+
+    def get_last_setpoint(self):
+        """Get the last setpoint command for recording
+        
+        Returns:
+            dict with 'cmd_in' (x,y,z), 'cmd' (x,y,z), 'timestamp' 
+            or None if no setpoint has been sent
+        """
+        with self._setpoint_lock:
+            return self._last_setpoint.copy() if self._last_setpoint else None
 
     def _handle_move_to_many(self, points: List) -> Response:
         """处理 move_to_many 命令"""
@@ -1545,8 +1843,8 @@ class MAVLinkController:
         """启动HTTP服务器和MAVLink连接"""
         self._running = True
 
-        # 启动HTTP服务器
-        self._flask_server = make_server(host, self.port, self.flask_app, threaded=True)
+        # 启动HTTP服务器 (使用SO_REUSEADDR避免端口占用问题)
+        self._flask_server = make_server_with_reuse(host, self.port, self.flask_app, threaded=True)
         thread = threading.Thread(target=self._flask_server.serve_forever, daemon=True)
         thread.start()
         ts_log(self._log_prefix, f"HTTP server started at http://{host}:{self.port}/")
@@ -1679,12 +1977,72 @@ class MAVLinkMultiUAVManager:
 
         self.world.reset()
 
-        # 创建MAVLink控制器
-        for vid, vehicle in self.vehicles.items():
-            port = self.ctrl_base_port + vid
-            ctrl = MAVLinkController(vid, vehicle, self.px4_backends[vid], port)
-            self.mavlink_controllers[vid] = ctrl
-            ctrl.start()
+        # 创建MAVLink控制器并分组启动PX4
+        # 分组大小：每组最多8个UAV，避免PX4进程同时启动导致阻塞
+        PX4_GROUP_SIZE = 8
+        # 动态超时：基础超时 + 每个UAV额外时间
+        BASE_TIMEOUT = 30.0
+        PER_UAV_TIMEOUT = 5.0
+
+        all_vids = sorted(self.vehicles.keys())
+        num_uavs = len(all_vids)
+        num_groups = (num_uavs + PX4_GROUP_SIZE - 1) // PX4_GROUP_SIZE
+
+        ts_log("[MAVLinkMultiUAVManager]", f"Starting {num_uavs} UAVs in {num_groups} group(s) (group_size={PX4_GROUP_SIZE})")
+
+        for group_idx in range(num_groups):
+            start_idx = group_idx * PX4_GROUP_SIZE
+            end_idx = min(start_idx + PX4_GROUP_SIZE, num_uavs)
+            group_vids = all_vids[start_idx:end_idx]
+            group_size = len(group_vids)
+
+            ts_log("[MAVLinkMultiUAVManager]", f"Group {group_idx+1}/{num_groups}: Starting UAVs {group_vids}")
+
+            # 创建并启动该组的MAVLink控制器
+            for vid in group_vids:
+                vehicle = self.vehicles[vid]
+                port = self.ctrl_base_port + vid
+                ctrl = MAVLinkController(vid, vehicle, self.px4_backends[vid], port)
+                self.mavlink_controllers[vid] = ctrl
+                ctrl.start()
+
+            # 动态计算该组的超时时间
+            group_timeout = BASE_TIMEOUT + group_size * PER_UAV_TIMEOUT
+
+            # 等待该组所有UAV的PX4进入ready_to_takeoff状态
+            ts_log("[MAVLinkMultiUAVManager]", f"Group {group_idx+1}: Waiting for PX4 ready (timeout={group_timeout:.1f}s)...")
+            wait_start = time.time()
+            ready_count = 0
+
+            while time.time() - wait_start < group_timeout:
+                ready_count = 0
+                for vid in group_vids:
+                    backend = self.px4_backends.get(vid)
+                    if backend and backend.px4_ready_to_takeoff:
+                        ready_count += 1
+
+                if ready_count >= group_size:
+                    elapsed = time.time() - wait_start
+                    ts_log("[MAVLinkMultiUAVManager]", f"Group {group_idx+1}: All {group_size} UAVs ready in {elapsed:.1f}s")
+                    break
+
+                # 每5秒输出一次进度
+                elapsed = time.time() - wait_start
+                if int(elapsed) % 5 == 0 and int(elapsed) > 0:
+                    ts_log("[MAVLinkMultiUAVManager]", f"Group {group_idx+1}: {ready_count}/{group_size} ready, waiting... ({elapsed:.0f}s)")
+
+                time.sleep(0.5)
+            else:
+                # 超时但继续执行
+                elapsed = time.time() - wait_start
+                ts_log("[MAVLinkMultiUAVManager]", f"Group {group_idx+1}: Timeout after {elapsed:.1f}s, {ready_count}/{group_size} ready. Continuing...", "WARN")
+
+            # 组间延迟，让系统稳定
+            if group_idx < num_groups - 1:
+                ts_log("[MAVLinkMultiUAVManager]", f"Group {group_idx+1} complete. Waiting 2s before next group...")
+                time.sleep(2.0)
+
+        ts_log("[MAVLinkMultiUAVManager]", f"All {num_uavs} UAVs initialized")
 
     def _configure_collision_filtering(self):
         """配置碰撞过滤"""
@@ -1751,12 +2109,19 @@ class MAVLinkSimApp:
     def __init__(self):
         self.timeline = omni.timeline.get_timeline_interface()
         self.pg = PegasusInterface()
-        self._images_enabled = bool(IMAGES_ENABLED)
+        self._images_enabled = not ARGS.no_images
+        self._active_save_dirs = {}
 
         if RENDER_THROTTLE:
-            self.pg.set_world_settings(rendering_dt=1.0 / max(RENDER_MAX_FPS, 0.1))
+            self.pg.set_world_settings(rendering_dt=1.0 / max(RENDER_MAX_FPS, 0.1), physics_dt=ARGS.physics_dt)
+        else:
+            self.pg.set_world_settings(physics_dt=ARGS.physics_dt)
         self.pg._world = World(**self.pg._world_settings)
         self.world = self.pg.world
+
+        # 设置全局World引用，用于get_sim_time()
+        global _GLOBAL_WORLD
+        _GLOBAL_WORLD = self.world
 
         # 加载配置
         cfg = self._load_config(ARGS.config)
@@ -1774,8 +2139,30 @@ class MAVLinkSimApp:
                 self._image_buffers[vid] = ImageRingBuffer(max_frames=10000, target_fps=20.0)
             ts_log("[MAVLinkSimApp]", f"Created image buffers for {len(self._image_buffers)} UAVs")
 
-        # HTTP服务器
+        # HTTP服务器 initialization
         self.flask_app = Flask(__name__)
+        self._state_recorders = {}
+        for vid in self.manager.vehicles.keys():
+            self._state_recorders[vid] = StateRecorder(target_hz=20.0)  # 20Hz采样
+            
+        # Safely get record_dir from ARGS or use global constant
+        if hasattr(ARGS, "record_dir"):
+            self._record_session_dir = ARGS.record_dir
+        else:
+            self._record_session_dir = RECORD_DIR
+            
+        self._record_last_ts_by_uav = {}
+        self._csv_agg_initialized_uav = set()
+        
+        self._record_runtime_enable = bool(RECORD_ENABLE) and self._images_enabled
+        if self._images_enabled:
+            os.makedirs(RECORD_DIR, exist_ok=True)
+            self._record_session_dir = os.path.join(RECORD_DIR, f"session_{int(time.time())}")
+            os.makedirs(self._record_session_dir, exist_ok=True)
+        elif self._record_session_dir:
+             # Even if images disabled, ensure record dir exists if provided
+             os.makedirs(self._record_session_dir, exist_ok=True)
+
         self._flask_server = None
         self._setup_routes()
         self._start_http_server(port=ARGS.sim_port)
@@ -1791,6 +2178,17 @@ class MAVLinkSimApp:
 
         self.stop_sim = False
         self._last_render_ts = 0.0
+
+        # 初始化MAVLink时间广播器
+        self._time_broadcaster = None
+        if TIME_BROADCAST_ENABLE:
+            self._time_broadcaster = TimeBroadcaster(port=TIME_BROADCAST_PORT)
+            self._time_broadcaster.start()
+
+        # 初始化状态记录器（每个UAV一个）- 20Hz采样
+        self._state_recorders: Dict[int, StateRecorder] = {}
+        for vid in self.manager.vehicles.keys():
+            self._state_recorders[vid] = StateRecorder(target_hz=20.0)
 
     def _load_config(self, path: str) -> dict:
         """加载配置文件"""
@@ -1820,6 +2218,29 @@ class MAVLinkSimApp:
 
             self.world.step(render=should_render)
 
+            # 广播仿真时间（用于控制器锁步同步）
+            if self._time_broadcaster:
+                self._time_broadcaster.broadcast(get_sim_time())
+
+            # 记录UAV状态（用于离线数据采集）
+            sim_time = get_sim_time()
+            for vid, recorder in self._state_recorders.items():
+                if recorder.is_recording():
+                    vehicle = self._get_vehicle(vid)
+                    ctrl = self.manager.mavlink_controllers.get(vid)
+                    px4_state = ctrl.get_px4_state() if ctrl else None
+                    
+                    if vehicle:
+                        # Get last setpoint command from controller for recording
+                        cmd_in = None
+                        cmd = None
+                        if ctrl:
+                            setpoint = ctrl.get_last_setpoint()
+                            if setpoint:
+                                cmd_in = setpoint.get("cmd_in")
+                                cmd = setpoint.get("cmd")
+                        recorder.record(sim_time, vid, vehicle.state, px4_state, cmd_in, cmd)
+
             if self._images_enabled:
                 try:
                     self._capture_to_buffers()
@@ -1843,7 +2264,8 @@ class MAVLinkSimApp:
         """启动HTTP服务器"""
         if self._flask_server is not None:
             return
-        self._flask_server = make_server(host, port, self.flask_app, threaded=True)
+        # 使用SO_REUSEADDR避免端口占用问题
+        self._flask_server = make_server_with_reuse(host, port, self.flask_app, threaded=True)
         self.http_thread = threading.Thread(target=self._flask_server.serve_forever, daemon=True)
         self.http_thread.start()
         carb.log_info(f"MAVLinkSimApp HTTP server started at http://{host}:{port}/")
@@ -1933,6 +2355,22 @@ class MAVLinkSimApp:
                 return jsonify({"recording": self._record_runtime_enable})
             return jsonify({"error": "Invalid path"}), 404
 
+        @app.route('/uav/<int:uav_id>/state_record/<cmd>', methods=['GET'])
+        def state_record_cmd(uav_id: int, cmd: str):
+            """状态记录控制API"""
+            recorder = self._state_recorders.get(uav_id)
+            if recorder is None:
+                return jsonify({"error": f"No recorder for uav{uav_id}"}), 404
+            if cmd == 'start':
+                recorder.start(get_sim_time())
+                return jsonify({"recording": True, "uav_id": uav_id})
+            elif cmd == 'stop':
+                records = recorder.stop()
+                return jsonify({"recording": False, "uav_id": uav_id, "count": len(records), "records": records})
+            elif cmd == 'status':
+                return jsonify({"recording": recorder.is_recording(), "uav_id": uav_id})
+            return jsonify({"error": "Invalid command"}), 400
+
         @app.route('/uav/<int:uav_id>/pose', methods=['GET'])
         def pose(uav_id: int):
             try:
@@ -2003,41 +2441,57 @@ class MAVLinkSimApp:
         @app.route('/uav/<int:uav_id>/all', methods=['GET'])
         def all_info(uav_id: int):
             try:
-                if not self._images_enabled:
-                    return jsonify({"error": "images_disabled"}), 404
                 vehicle = self._get_vehicle(uav_id)
                 if vehicle is None:
                     return jsonify({"error": f"Vehicle uav{uav_id} not found"}), 404
-                cam = self._get_camera(vehicle)
-                if cam is None:
-                    return jsonify({"error": "Camera not found"}), 404
-                img, ts_img = cam.get_last_image_with_timestamp()
-                if img is None:
-                    return jsonify({"error": "No image cached"}), 503
-                st_snap = cam.get_last_state_snapshot()
-                if st_snap is None:
-                    return jsonify({"error": "No pose snapshot cached"}), 503
-                png_bytes, b64, w, h, c = self._png_bytes_and_b64(img)
+                
+                # Default empty image data
+                img_data = {
+                    "timestamp": 0, "width": 0, "height": 0, "channels": 0,
+                    "encoding": "none", "mime": "none", "data": "", "data_url": ""
+                }
+                
+                # Current state for pose
+                st = vehicle.state
+                pose_data = {
+                    "timestamp": get_sim_time(),
+                    "position": st.position.tolist(),
+                    "attitude": st.attitude.tolist(),
+                    "linear_velocity": st.linear_velocity.tolist(),
+                    "angular_velocity": st.angular_velocity.tolist(),
+                    "linear_acceleration": st.linear_acceleration.tolist(),
+                }
+
+                if self._images_enabled:
+                    cam = self._get_camera(vehicle)
+                    if cam:
+                        img, ts_img = cam.get_last_image_with_timestamp()
+                        if img is not None:
+                            png_bytes, b64, w, h, c = self._png_bytes_and_b64(img)
+                            img_data = {
+                                "uav_id": uav_id,
+                                "timestamp": ts_img,
+                                "width": w, "height": h, "channels": c,
+                                "encoding": "png_base64",
+                                "mime": "image/png",
+                                "data": b64,
+                                "data_url": f"data:image/png;base64,{b64}",
+                            }
+                            st_snap = cam.get_last_state_snapshot()
+                            if st_snap:
+                                pose_data = {
+                                    "timestamp": ts_img,
+                                    "position": st_snap["position"].tolist(),
+                                    "attitude": st_snap["attitude"].tolist(),
+                                    "linear_velocity": st_snap["linear_velocity"].tolist(),
+                                    "angular_velocity": st_snap["angular_velocity"].tolist(),
+                                    "linear_acceleration": st_snap["linear_acceleration"].tolist(),
+                                }
+
                 return jsonify({
                     "uav_id": uav_id,
-                    "image": {
-                        "timestamp": ts_img,
-                        "width": w,
-                        "height": h,
-                        "channels": c,
-                        "encoding": "png_base64",
-                        "mime": "image/png",
-                        "data": b64,
-                        "data_url": f"data:image/png;base64,{b64}",
-                    },
-                    "pose": {
-                        "timestamp": ts_img,
-                        "position": st_snap["position"].tolist(),
-                        "attitude": st_snap["attitude"].tolist(),
-                        "linear_velocity": st_snap["linear_velocity"].tolist(),
-                        "angular_velocity": st_snap["angular_velocity"].tolist(),
-                        "linear_acceleration": st_snap["linear_acceleration"].tolist(),
-                    }
+                    "image": img_data,
+                    "pose": pose_data
                 })
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
@@ -2202,6 +2656,108 @@ class MAVLinkSimApp:
                 ts_log(f"[UAV{uav_id}]", traceback.format_exc(), "ERROR")
                 return jsonify({"status": "error", "message": str(e)}), 500
 
+        @app.route('/uav/<int:uav_id>/px4/kill', methods=['POST'])
+        def px4_kill(uav_id: int):
+            """停止PX4进程（不重启）
+
+            用于在teleport前停止PX4，避免EKF检测到位置跳变。
+            """
+            vehicle = self._get_vehicle(uav_id)
+            if vehicle is None:
+                return jsonify({"status": "error", "message": "UAV not found"}), 404
+
+            backend = self.manager.px4_backends.get(uav_id)
+            if backend is None:
+                return jsonify({"status": "error", "message": "Backend not found"}), 404
+
+            try:
+                ts_log(f"[UAV{uav_id}]", "PX4 kill: stopping PX4 process...")
+
+                # 杀死PX4进程
+                if backend.px4_tool is not None:
+                    try:
+                        backend.px4_tool.kill_px4_save()
+                        ts_log(f"[UAV{uav_id}]", "PX4 process killed successfully")
+                    except Exception as e:
+                        ts_log(f"[UAV{uav_id}]", f"Kill PX4 failed: {e}", "WARN")
+
+                # 重置标志
+                backend._received_first_actuator = False
+                backend._received_actuator = False
+                backend._is_running = False
+
+                # 关闭MAVLink连接
+                old_connection = backend._connection
+                backend._connection = None
+                if old_connection is not None:
+                    try:
+                        old_connection.close()
+                    except:
+                        pass
+
+                ts_log(f"[UAV{uav_id}]", "PX4 kill: completed")
+                return jsonify({
+                    "status": "success",
+                    "uav_id": uav_id,
+                    "message": "PX4 stopped"
+                })
+
+            except Exception as e:
+                ts_log(f"[UAV{uav_id}]", f"PX4 kill error: {e}", "ERROR")
+                return jsonify({"status": "error", "message": str(e)}), 500
+
+        @app.route('/uav/<int:uav_id>/px4/start', methods=['POST'])
+        def px4_start(uav_id: int):
+            """启动PX4进程
+
+            用于在teleport后启动PX4。
+            """
+            vehicle = self._get_vehicle(uav_id)
+            if vehicle is None:
+                return jsonify({"status": "error", "message": "UAV not found"}), 404
+
+            backend = self.manager.px4_backends.get(uav_id)
+            if backend is None:
+                return jsonify({"status": "error", "message": "Backend not found"}), 404
+
+            try:
+                ts_log(f"[UAV{uav_id}]", "PX4 start: starting PX4 process...")
+
+                # 等待端口释放
+                mavlink_port = backend.config.connection_baseport + backend._vehicle_id
+                from pegasus.simulator.logic.backends.px4_mavlink_backend import _wait_for_port_release
+                _wait_for_port_release(mavlink_port, timeout=10.0, interval=0.5)
+
+                # 创建MAVLink连接
+                ts_log(f"[UAV{uav_id}]", f"Creating MAVLink connection: {backend._connection_port}")
+                backend._connection = mavutil.mavlink_connection(backend._connection_port)
+
+                # 重置状态
+                backend._received_first_hearbeat = False
+                backend._received_first_actuator = False
+                backend._received_actuator = False
+                backend._current_utime = 0
+                backend._skip_large_dt_count = 10
+                backend._is_running = True
+
+                # 启动PX4进程
+                if backend.px4_tool is not None:
+                    backend.px4_tool.launch_px4()
+                    ts_log(f"[UAV{uav_id}]", "PX4 process launched")
+
+                ts_log(f"[UAV{uav_id}]", "PX4 start: completed")
+                return jsonify({
+                    "status": "success",
+                    "uav_id": uav_id,
+                    "message": "PX4 started"
+                })
+
+            except Exception as e:
+                ts_log(f"[UAV{uav_id}]", f"PX4 start error: {e}", "ERROR")
+                import traceback
+                ts_log(f"[UAV{uav_id}]", traceback.format_exc(), "ERROR")
+                return jsonify({"status": "error", "message": str(e)}), 500
+
         # ============================================
         # 图像环形缓冲区端点（异步采集用）
         # ============================================
@@ -2223,27 +2779,48 @@ class MAVLinkSimApp:
             如果指定save_dir，图像将直接保存到磁盘，大幅减少内存占用。
             """
             try:
-                if not self._images_enabled:
-                    return jsonify({"status": "error", "message": "images_disabled"}), 404
-                buffer = self._image_buffers.get(uav_id)
-                if buffer is None:
-                    return jsonify({"status": "error", "message": f"UAV {uav_id} buffer not found"}), 404
-
-                # 获取可选的save_dir参数
+                # 获取可选参数
                 data = request.json or {}
                 save_dir = data.get("save_dir", None)
+                traj_json = data.get("traj_json", "")
+                traj_name = data.get("traj_name", "")
+                ulg_path = data.get("ulg_path", "")
+                position_offset = data.get("position_offset", [0.0, 0.0, 0.0])
+                scale = data.get("scale", 0.01)  # For trajectory backfill
+                time_scale = data.get("time_scale", 1.0)  # For trajectory backfill
+                
+                # Store save_dir for retrieval at stop
+                if save_dir:
+                     self._active_save_dirs[uav_id] = save_dir
 
-                buffer.start_recording(save_dir=save_dir)
-                ts_log(f"[UAV{uav_id}]", f"Image buffer recording started (save_dir={save_dir})")
+                if self._images_enabled:
+                    buffer = self._image_buffers.get(uav_id)
+                    if buffer is None:
+                        # Log warning but continue for state recording
+                        ts_log(f"[UAV{uav_id}]", "Image buffer not found, skipping image recording", "WARN")
+                    else:
+                        buffer.start_recording(save_dir=save_dir)
+                
+                # Always start state recorder with metadata
+                state_recorder = self._state_recorders.get(uav_id)
+                if state_recorder:
+                    state_recorder.set_metadata(traj_json=traj_json, traj_name=traj_name, 
+                                                 ulg_path=ulg_path, position_offset=position_offset,
+                                                 scale=scale, time_scale=time_scale)
+                    state_recorder.start(get_sim_time())
+                    
+                ts_log(f"[UAV{uav_id}]", f"Buffer/State recording started (save_dir={save_dir}, traj={traj_name}, images={self._images_enabled})")
                 return jsonify({
                     "status": "success",
                     "uav_id": uav_id,
                     "recording": True,
                     "save_to_disk": save_dir is not None,
                     "save_dir": save_dir,
-                    "message": "Buffer recording started"
+                    "message": "Recording started"
                 })
             except Exception as e:
+                import traceback
+                ts_log(f"[UAV{uav_id}]", f"Buffer start error: {e}\n{traceback.format_exc()}", "ERROR")
                 return jsonify({"status": "error", "message": str(e)}), 500
 
         @app.route('/uav/<int:uav_id>/buffer/stop', methods=['POST'])
@@ -2270,21 +2847,48 @@ class MAVLinkSimApp:
             }
             """
             try:
-                if not self._images_enabled:
-                    return jsonify({"status": "error", "message": "images_disabled"}), 404
-                buffer = self._image_buffers.get(uav_id)
-                if buffer is None:
-                    return jsonify({"status": "error", "message": f"UAV {uav_id} buffer not found"}), 404
+                frames = []
+                save_dir = self._active_save_dirs.get(uav_id) # Retrieve stored save_dir
+                
+                # Check request options
+                data = request.json or {}
+                return_raw_observations = data.get("return_raw_observations", False)
+                
+                if self._images_enabled:
+                    buffer = self._image_buffers.get(uav_id)
+                    if buffer:
+                        # If images enabled, buffer might have a better source of truth, or same
+                        if not save_dir:
+                             save_dir = buffer.get_save_dir()
+                        frames = buffer.stop_recording()
+                        ts_log(f"[UAV{uav_id}]", f"Image buffer recording stopped, {len(frames)} frames/images collected")
 
-                frames = buffer.stop_recording()
-                ts_log(f"[UAV{uav_id}]", f"Image buffer recording stopped, {len(frames)} frames collected")
-
-                return jsonify({
+                # Stop state recorder and get records
+                state_recorder = self._state_recorders.get(uav_id)
+                num_states = 0
+                raw_observations = []
+                
+                if state_recorder:
+                    records = state_recorder.stop()
+                    num_states = len(records)
+                    
+                    if return_raw_observations:
+                        # Return raw observations for collector-side processing
+                        raw_observations = records
+                        ts_log(f"[UAV{uav_id}]", f"Returning {num_states} raw observations to collector")
+                
+                response = {
                     "status": "success",
                     "uav_id": uav_id,
                     "frame_count": len(frames),
-                    "frames": frames
-                })
+                    "state_count": num_states,
+                    "msg": "Buffer stopped"
+                }
+                
+                if return_raw_observations:
+                    response["raw_observations"] = raw_observations
+
+                return jsonify(response)
             except Exception as e:
                 return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -2332,46 +2936,74 @@ class MAVLinkSimApp:
         return None
 
     def _reset_uav(self, uav_id: int, position: list, yaw_deg: float = 0.0):
-        """重置UAV（直接执行）
-
-        注意：可能会产生 PhysX articulation cache 警告，但不影响实际功能。
-        """
+        """重置UAV位置（使用DC接口直接传送，参照8_camera_vehicle.py验证过的实现）"""
         try:
             vehicle = self._get_vehicle(uav_id)
             if vehicle is None:
                 return False, f"Vehicle uav{uav_id} not found"
 
+            import math
+            import carb
+            from omni.isaac.dynamic_control import _dynamic_control as dc_mod
+
+            # 获取DC接口（使用vehicle的接口）
             dc = vehicle.get_dc_interface()
-            stage_prefix = f"/World/uav{uav_id}"
+            stage_prefix = vehicle.prim_path if hasattr(vehicle, 'prim_path') else vehicle._stage_prefix
             body = dc.get_rigid_body(stage_prefix + "/body")
 
-            from omni.isaac.dynamic_control import _dynamic_control as dc_mod
-            new_pose = dc_mod.Transform()
-
+            # 构建位置 - 使用carb.Float3，fallback到其他方式
             try:
-                new_pose.p = carb.Float3(float(position[0]), float(position[1]), float(position[2]))
-            except:
-                new_pose.p = [float(position[0]), float(position[1]), float(position[2])]
+                p = carb.Float3(float(position[0]), float(position[1]), float(position[2]))
+            except Exception:
+                try:
+                    from pxr import Gf
+                    p = Gf.Vec3f(float(position[0]), float(position[1]), float(position[2]))
+                except Exception:
+                    p = [float(position[0]), float(position[1]), float(position[2])]
 
+            # 构建四元数 - yaw转quaternion [x, y, z, w]
             yaw = math.radians(float(yaw_deg))
             cy = math.cos(yaw * 0.5)
             sy = math.sin(yaw * 0.5)
             try:
-                new_pose.r = carb.Float4(0.0, 0.0, sy, cy)
-            except:
-                new_pose.r = [0.0, 0.0, sy, cy]
+                q = carb.Float4(0.0, 0.0, sy, cy)
+            except Exception:
+                q = [0.0, 0.0, sy, cy]
+
+            # 构建Transform并设置位置
+            new_pose = dc_mod.Transform()
+            new_pose.p = p
+            try:
+                new_pose.r = q
+            except Exception:
+                try:
+                    new_pose.r = carb.Float4(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+                except Exception:
+                    if isinstance(q, (list, tuple)) and len(q) == 4:
+                        new_pose.r = carb.Float4(float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+                    else:
+                        new_pose.r = carb.Float4(0.0, 0.0, 0.0, 1.0)
 
             dc.set_rigid_body_pose(body, new_pose)
 
+            # 清零速度
             try:
                 zero = carb.Float3(0.0, 0.0, 0.0)
-            except:
-                zero = [0.0, 0.0, 0.0]
+            except Exception:
+                try:
+                    from pxr import Gf
+                    zero = Gf.Vec3f(0.0, 0.0, 0.0)
+                except Exception:
+                    zero = [0.0, 0.0, 0.0]
             dc.set_rigid_body_linear_velocity(body, zero)
             dc.set_rigid_body_angular_velocity(body, zero)
 
+            ts_log("[SIM]", f"[UAV{uav_id}] Teleported via DC to ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}) yaw={yaw_deg:.1f}")
             return True, "ok"
+
         except Exception as e:
+            import traceback
+            ts_log("[SIM]", f"Reset error for UAV{uav_id}: {e}\n{traceback.format_exc()}", "ERROR")
             return False, str(e)
 
     def _png_bytes_and_b64(self, img):
