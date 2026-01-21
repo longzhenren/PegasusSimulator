@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 # Full trajectory collection with auto-restart monitor
 #
 # This script runs the complete data collection with automatic restart

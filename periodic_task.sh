@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 
 # Function to handle cleanup on script exit or end of cycle
 cleanup() {

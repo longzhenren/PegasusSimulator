@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 | File: ui_delegate.py
 | Author: Marcelo Jacinto (marcelo.jacinto@tecnico.ulisboa.pt)

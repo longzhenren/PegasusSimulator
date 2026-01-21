@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 UAV State Manager - PX4 + MAVROS 联合状态机
 

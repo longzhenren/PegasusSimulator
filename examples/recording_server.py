@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 HTTP 网关与录制服务器（recording_server.py）
 

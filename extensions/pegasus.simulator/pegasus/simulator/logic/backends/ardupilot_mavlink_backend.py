@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 | File: ardupilot_mavlink_backend.py
 | Author: Tomer Tip (tomerT1212@gmail.com)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 # -*- coding: utf-8 -*-
 """
 简易轨迹采集器 - 完全照搬原版mavlink_trajectory_collector控制逻辑
@@ -43,8 +44,13 @@ def ts_log(prefix: str, msg: str, level: str = "INFO") -> None:
 
 def _http_json(method: str, url: str, payload: Optional[Dict] = None, timeout: float = 30.0) -> Tuple[int, Dict]:
     """HTTP JSON请求 (照搬原版)"""
-    data = json.dumps(payload).encode("utf-8") if payload else None
-    headers = {"Content-Type": "application/json"} if payload else {}
+    # 【修复】即使payload是空字典也要设置Content-Type，避免415错误
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+    else:
+        data = None
+        headers = {}
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
@@ -81,6 +87,21 @@ def cleanup_px4_completely(uav_id: int = None) -> int:
 
     【关键】解决 "PX4 server already running" 问题
     只清理锁文件，不删除临时目录（仿真端需要它们）
+
+    Args:
+        uav_id: 如果指定，只清理该UAV的文件；否则清理所有
+
+    Returns:
+        清理的文件数量
+    """
+    return cleanup_px4_lock_files_only(uav_id)
+
+
+def cleanup_px4_lock_files_only(uav_id: int = None) -> int:
+    """
+    只清理PX4锁文件（不删除临时目录）
+
+    【关键】解决 "PX4 server already running" 问题
 
     Args:
         uav_id: 如果指定，只清理该UAV的文件；否则清理所有
@@ -323,21 +344,23 @@ def run_collector(uav_id: int, json_path: Path, out_dir: Path, scale: float,
     time_listener = None
 
     try:
-        # ========== 0. 彻底清理PX4进程和锁文件 ==========
-        # 【关键】必须彻底清理，否则EKF坐标系会累积偏移
-        ts_log(f"[UAV{uav_id}]", "Step 0: Complete PX4 cleanup (kill + lock files + tmp dirs)...")
+        # ========== 0. Kill PX4 + 清理锁文件 + 重建临时目录（彻底清除EKF状态）==========
+        # 【关键修复】使用/px4/full_reset API来完全重置EKF状态，解决坐标漂移问题
+        ts_log(f"[UAV{uav_id}]", "Step 0: Kill PX4 + cleanup lock files + rebuild temp dir...")
 
-        # 先通过HTTP API尝试优雅关闭
+        # 首先使用/px4/kill停止PX4进程
         code, resp = _http_json("POST", f"{image_base}/uav/{uav_id}/px4/kill", payload={}, timeout=30.0)
         if code == 200:
-            ts_log(f"[UAV{uav_id}]", f"PX4 HTTP kill: {resp.get('message', 'success')}")
+            ts_log(f"[UAV{uav_id}]", f"PX4 kill: {resp.get('message', 'success')}")
         else:
-            ts_log(f"[UAV{uav_id}]", f"PX4 HTTP kill failed: code={code}, resp={resp}", "WARN")
+            ts_log(f"[UAV{uav_id}]", f"PX4 kill failed: code={code}, resp={resp}", "WARN")
 
-        # 然后进行彻底清理（杀进程 + 删锁文件 + 删临时目录）
-        # 这确保PX4下次启动时EKF完全从新位置初始化
-        cleanup_count = cleanup_px4_completely(uav_id)
-        ts_log(f"[UAV{uav_id}]", f"PX4 complete cleanup done: {cleanup_count} items removed")
+        # 清理锁文件（仅清理锁文件，不重建临时目录）
+        cleanup_count = cleanup_px4_lock_files_only(uav_id)
+        ts_log(f"[UAV{uav_id}]", f"Lock file cleanup: {cleanup_count} items")
+
+        # 等待端口释放
+        time.sleep(0.5)
 
         # ========== 1. Teleport UAV (PX4不运行时进行) ==========
         GROUND_Z = 0.06  # Ground level for teleport
@@ -390,13 +413,34 @@ def run_collector(uav_id: int, json_path: Path, out_dir: Path, scale: float,
         ts_log(f"[UAV{uav_id}]", "Step 2: Waiting 2s for physics to settle...")
         time.sleep(2.0)
 
-        # ========== 3. 启动PX4进程 ==========
+        # ========== 3. 启动PX4进程（先重建临时目录清除EKF状态）==========
+        # 【关键修复】在启动PX4前重建临时目录，彻底清除EKF状态
+        # 这是解决多轨迹采集时坐标漂移问题的核心步骤
         ts_log(f"[UAV{uav_id}]", "Step 3: Starting PX4 process...")
-        code, resp = _http_json("POST", f"{image_base}/uav/{uav_id}/px4/start", payload={}, timeout=30.0)
+
+        # 首先调用/px4/rebuild_temp API重建临时目录（清除EKF状态）
+        code, resp = _http_json("POST", f"{image_base}/uav/{uav_id}/px4/rebuild_temp", payload={}, timeout=10.0)
         if code == 200:
-            ts_log(f"[UAV{uav_id}]", f"PX4 started: {resp.get('message', 'success')}")
+            ts_log(f"[UAV{uav_id}]", f"PX4 temp dir rebuilt: {resp.get('message', 'success')}")
         else:
-            ts_log(f"[UAV{uav_id}]", f"PX4 start failed: code={code}, resp={resp}", "ERROR")
+            ts_log(f"[UAV{uav_id}]", f"PX4 temp dir rebuild failed (non-critical): code={code}", "WARN")
+
+        px4_start_success = False
+        for attempt in range(3):
+            code, resp = _http_json("POST", f"{image_base}/uav/{uav_id}/px4/start", payload={}, timeout=30.0)
+            if code == 200:
+                ts_log(f"[UAV{uav_id}]", f"PX4 started: {resp.get('message', 'success')}")
+                px4_start_success = True
+                break
+            else:
+                ts_log(f"[UAV{uav_id}]", f"PX4 start failed (attempt {attempt+1}/3): code={code}", "WARN")
+                if attempt < 2:
+                    # 重试前清理锁文件并等待
+                    cleanup_px4_completely(uav_id)
+                    time.sleep(2.0)
+
+        if not px4_start_success:
+            ts_log(f"[UAV{uav_id}]", f"PX4 start failed after 3 attempts, skipping trajectory", "ERROR")
             return
 
         # ========== 4. 阻塞等待PX4 ready ==========
@@ -423,7 +467,22 @@ def run_collector(uav_id: int, json_path: Path, out_dir: Path, scale: float,
         time.sleep(2.0)
         ts_log(f"[UAV{uav_id}]", "Waited 2s for PX4 EKF to stabilize")
 
-        # position_offset应该非常小（接近0），因为我们teleport到了轨迹起点
+        # 【关键修复】发送SET_GPS_GLOBAL_ORIGIN命令强制重置EKF原点
+        # 这确保每条轨迹的EKF原点与当前GPS位置一致，避免坐标漂移
+        code, resp = _http_json("POST", f"{image_base}/uav/{uav_id}/px4/set_ekf_origin", payload={}, timeout=10.0)
+        if code == 200:
+            ts_log(f"[UAV{uav_id}]", f"EKF origin set: {resp.get('message', 'success')}")
+        else:
+            ts_log(f"[UAV{uav_id}]", f"Set EKF origin failed (non-critical): code={code}", "WARN")
+
+        # 【关键修复】PX4使用LOCAL_NED坐标系，原点是当前起飞位置
+        # 发送给PX4的坐标应该是相对于轨迹起点的偏移量，而不是Isaac Sim绝对坐标
+        #
+        # traj_origin: 轨迹起点坐标，用于将轨迹坐标转换为相对坐标
+        # position_offset: Isaac实际位置与轨迹起点的微小差异（teleport误差，通常<1cm）
+        traj_origin = [traj_start['x'], traj_start['y'], traj_start['z']]
+
+        # position_offset: Isaac当前位置 - 轨迹起点（应该很小，约几mm）
         position_offset = [
             current_pos[0] - traj_start['x'],
             current_pos[1] - traj_start['y'],
@@ -437,13 +496,15 @@ def run_collector(uav_id: int, json_path: Path, out_dir: Path, scale: float,
 
         ts_log(f"[UAV{uav_id}]", f"Actual start: ({current_pos[0]:.2f},{current_pos[1]:.2f},{current_pos[2]:.2f})")
         ts_log(f"[UAV{uav_id}]", f"Traj start: ({traj_start['x']:.2f},{traj_start['y']:.2f},{traj_start['z']:.2f})")
-        ts_log(f"[UAV{uav_id}]", f"Offset for PX4 cmds: XY=({position_offset[0]:.3f},{position_offset[1]:.3f}), Z=0 (absolute)")
+        ts_log(f"[UAV{uav_id}]", f"Traj origin for PX4: ({traj_origin[0]:.2f},{traj_origin[1]:.2f},{traj_origin[2]:.2f})")
+        ts_log(f"[UAV{uav_id}]", f"Teleport offset: XY=({position_offset[0]:.3f},{position_offset[1]:.3f})")
 
-        # Takeoff target
+        # Takeoff target - 使用相对坐标（相对于起飞位置）
+        # 起飞时目标是原地悬停在轨迹起点高度，所以XY相对偏移为0+teleport误差
         takeoff_target = [
-            traj_start['x'] + position_offset[0],
-            traj_start['y'] + position_offset[1],
-            TARGET_ALT
+            position_offset[0],  # 相对X = 0 + teleport误差
+            position_offset[1],  # 相对Y = 0 + teleport误差
+            TARGET_ALT           # 绝对高度
         ]
 
         # ========== 2. 检查当前高度 ==========
@@ -668,13 +729,14 @@ def run_collector(uav_id: int, json_path: Path, out_dir: Path, scale: float,
         wait_start = time.time()
         hold_setpoint_count = 0
         while time_listener.get_time() <= 0 and time.time() - wait_start < 10.0:
-            # 发送保持位置的 setpoint (使用轨迹起点)
+            # 发送保持位置的 setpoint (使用相对坐标，起点处相对偏移为0)
             try:
                 state = smoother.get_full_state(0)  # 获取轨迹起点状态
+                # 相对坐标：state - traj_origin + position_offset
+                hold_rel_x = state['x'] - traj_origin[0] + position_offset[0]
+                hold_rel_y = state['y'] - traj_origin[1] + position_offset[1]
                 sender.send_pva(
-                    state['x'] + position_offset[0],
-                    state['y'] + position_offset[1],
-                    state['z'],
+                    hold_rel_x, hold_rel_y, state['z'],
                     0, 0, 0,  # 速度为0
                     0, 0, 0,  # 加速度为0
                     state['yaw'], 0
@@ -732,11 +794,15 @@ def run_collector(uav_id: int, json_path: Path, out_dir: Path, scale: float,
             az_scaled = state['az'] * (time_scale ** 2)
             
             # Send via MAVLink UDP (no HTTP for setpoints per user request)
+            # 【关键修复】发送相对于轨迹起点的坐标，而不是绝对坐标
+            # PX4 LOCAL_NED 坐标系原点是起飞位置，所以需要用 (state - traj_origin + position_offset)
+            rel_x = state['x'] - traj_origin[0] + position_offset[0]
+            rel_y = state['y'] - traj_origin[1] + position_offset[1]
+            rel_z = state['z']  # Z使用绝对高度（从地面算起）
+
             try:
                 sender.send_pva(
-                    state['x'] + position_offset[0],  # Add offset for X
-                    state['y'] + position_offset[1],  # Add offset for Y
-                    state['z'],  # Z: use absolute altitude from trajectory
+                    rel_x, rel_y, rel_z,
                     vx_scaled, vy_scaled, vz_scaled,
                     ax_scaled, ay_scaled, az_scaled,
                     state['yaw'], state['yaw_rate'] * time_scale
@@ -747,9 +813,7 @@ def run_collector(uav_id: int, json_path: Path, out_dir: Path, scale: float,
                 try:
                     time.sleep(0.01)
                     sender.send_pva(
-                        state['x'] + position_offset[0],
-                        state['y'] + position_offset[1],
-                        state['z'],
+                        rel_x, rel_y, rel_z,
                         vx_scaled, vy_scaled, vz_scaled,
                         ax_scaled, ay_scaled, az_scaled,
                         state['yaw'], state['yaw_rate'] * time_scale

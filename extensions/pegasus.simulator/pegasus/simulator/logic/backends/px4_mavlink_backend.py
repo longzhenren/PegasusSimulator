@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 # Copyright (c) 2024-2026 amurzzb@gmail.com
 # Licensed under the MIT License
 """
@@ -225,6 +226,8 @@ __all__ = ["PX4MavlinkBackend", "PX4MavlinkBackendConfig", "ts_log", "_wait_for_
 
 import carb
 import time
+import os
+import sys
 import traceback
 import numpy as np
 from datetime import datetime
@@ -264,9 +267,14 @@ def ts_log(prefix: str, message: str, level: str = "INFO") -> str:
 
 
 def _is_port_in_use(port: int) -> bool:
-    """检查端口是否被占用"""
+    """检查端口是否被占用
+    
+    Uses SO_REUSEADDR to match the same socket options that will be used
+    when actually binding the socket for connections.
+    """
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(('127.0.0.1', port))
             return False
@@ -293,6 +301,95 @@ def _wait_for_port_release(port: int, timeout: float = 30.0, interval: float = 0
         time.sleep(interval)
     return False
 
+
+def _kill_port_occupants(port: int, log_prefix: str = "[PortCleanup]") -> bool:
+    """
+    杀死占用指定端口的 PX4 相关进程
+    
+    用于启动前清理可能残留的僵尸 PX4 进程。
+    
+    【重要】仅杀死 PX4 相关进程，避免误杀仿真器主进程：
+    - 只杀死进程名包含 "px4" 的进程
+    - 跳过 python/isaac/sim 相关进程
+    
+    Args:
+        port: 要清理的端口号
+        log_prefix: 日志前缀
+        
+    Returns:
+        True 如果成功清理（或端口本来就空闲），False 如果清理失败
+    """
+    import subprocess
+    import signal
+    
+    if not _is_port_in_use(port):
+        return True
+        
+    ts_log(log_prefix, f"Port {port} is in use, checking for orphan PX4 processes...")
+    
+    try:
+        # 使用 lsof 查找占用端口的进程
+        result = subprocess.run(
+            ['lsof', '-t', '-i', f'TCP:{port}'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            killed_any = False
+            for pid_str in pids:
+                try:
+                    pid = int(pid_str.strip())
+                    if pid <= 0:
+                        continue
+                    
+                    # 获取进程命令行，检查是否是 PX4 进程
+                    try:
+                        with open(f"/proc/{pid}/cmdline", "r") as f:
+                            cmdline = f.read().replace('\x00', ' ').lower()
+                    except (FileNotFoundError, PermissionError):
+                        # 进程可能已经退出
+                        continue
+                    
+                    # 【关键】只杀死 PX4 相关进程，保护仿真器进程
+                    # PX4 进程通常包含：px4, px4_sitl, px4-commander 等
+                    is_px4_process = 'px4' in cmdline or 'px4_sitl' in cmdline
+                    # 保护仿真器进程：python, isaac, sim_vehicle 等
+                    is_simulator = 'python' in cmdline or 'isaac' in cmdline or 'sim_vehicle' in cmdline
+                    
+                    if is_px4_process and not is_simulator:
+                        ts_log(log_prefix, f"Killing orphan PX4 process: PID {pid}")
+                        os.kill(pid, signal.SIGKILL)
+                        killed_any = True
+                    else:
+                        ts_log(log_prefix, f"Skipping non-PX4 process: PID {pid} (protected)")
+                        
+                except (ValueError, ProcessLookupError):
+                    pass
+                except Exception as e:
+                    ts_log(log_prefix, f"Failed to check/kill PID {pid_str}: {e}", "WARN")
+            
+            if killed_any:
+                # 等待端口释放
+                time.sleep(0.5)
+                if not _is_port_in_use(port):
+                    ts_log(log_prefix, f"Port {port} successfully freed")
+                    return True
+        
+        # 注意：不再使用 fuser -k，因为它会无差别杀死所有占用进程
+        # 如果端口仍被占用但不是 PX4 进程，则返回 False 让调用者处理
+        if _is_port_in_use(port):
+            ts_log(log_prefix, f"Port {port} still in use by non-PX4 process (OK for simulator)", "WARN")
+            return False
+        return True
+            
+    except FileNotFoundError:
+        ts_log(log_prefix, "lsof not found, skipping port cleanup", "WARN")
+    except subprocess.TimeoutExpired:
+        ts_log(log_prefix, "Port cleanup command timed out", "WARN")
+    except Exception as e:
+        ts_log(log_prefix, f"Port cleanup error: {e}", "WARN")
+    
+    return not _is_port_in_use(port)
 
 class SensorSource:
     """ The binary codes to signal which simulated data is being sent through mavlink
@@ -826,6 +923,12 @@ class PX4MavlinkBackend(Backend):
         # Launch the PX4 in the background if needed
         if self.px4_tool is None:
             carb.log_info(f"{self._log_prefix} Attempting to launch PX4 in background process")
+            
+            # 【新增】启动前清理可能残留的僵尸 PX4 进程
+            # 杀死占用 MAVLink TCP 端口的任何进程
+            mavlink_port = self.config.connection_baseport + self._vehicle_id
+            _kill_port_occupants(mavlink_port, self._log_prefix)
+            
             self.px4_tool = PX4LaunchTool(self.px4_dir, self._vehicle_id, self.px4_vehicle_model, self.config.sim_speed_factor, log_dir=self._px4_log_dir)
             if self.px4_autolaunch:
                 # If a pid file exists, verify the process is alive; otherwise relaunch
@@ -1086,6 +1189,68 @@ class PX4MavlinkBackend(Backend):
         """For now does nothing. Here for compatibility purposes only
         """
         return
+
+    def reset_sensor_state_for_teleport(self):
+        """
+        【关键】Teleport前必须调用此方法重置传感器状态缓存
+
+        解决问题：Teleport后EKF检测到位置突变导致的漂移或初始化失败
+
+        原因分析：
+        1. Teleport只移动物理刚体位置（通过DC接口）
+        2. _sensor_data缓存仍保持旧位置的GPS/IMU数据
+        3. PX4重启后收到旧位置的传感器数据，与新位置冲突
+        4. EKF检测到位置突变，拒绝初始化或产生漂移
+
+        此方法会：
+        1. 重建_sensor_data对象（清除所有GPS/IMU/Baro缓存）
+        2. 重置仿真时间戳（_current_utime = 0）
+        3. 重置lockstep相关标志
+        4. 设置跳过大dt计数器（处理物理暂停期间的时间跳变）
+
+        调用时序：
+        1. 调用 /px4/kill 停止PX4
+        2. 调用此方法重置传感器状态 ←
+        3. 执行Teleport移动物理刚体
+        4. 等待物理稳定
+        5. 调用 /px4/start 启动PX4（EKF从新位置初始化）
+        """
+        ts_log(self._log_prefix, "=== Resetting sensor state for teleport ===")
+
+        # 1. 完全重建传感器数据对象（清除所有缓存）
+        # 这确保GPS位置、IMU数据、气压计等全部归零
+        old_sensor = self._sensor_data
+        self._sensor_data = SensorMsg()
+        ts_log(self._log_prefix, f"SensorMsg reset: GPS({old_sensor.latitude_deg},{old_sensor.longitude_deg}) -> (0,0)")
+
+        # 2. 重置仿真时间戳
+        # PX4期望时间从0开始，否则检测到"Time jump"
+        self._current_utime = 0
+        ts_log(self._log_prefix, "Reset _current_utime = 0")
+
+        # 3. 重置lockstep相关标志
+        self._received_first_actuator = False
+        self._received_actuator = False
+
+        # 4. 设置跳过大dt计数器
+        # 因为teleport期间物理可能暂停，恢复后第一个dt可能很大
+        self._skip_large_dt_count = 10
+        ts_log(self._log_prefix, "Set _skip_large_dt_count = 10")
+
+        # 5. 重置rotor输入
+        self._rotor_data.zero_input_reference()
+        if hasattr(self, '_input_reference'):
+            self._input_reference.fill(0.0)
+
+        # 6. 重置heartbeat标志（PX4重启后需要重新握手）
+        self._received_first_hearbeat = False
+        self._last_heartbeat_sent_time = 0
+        self._last_waiting_heartbeat_log_time = 0
+
+        # 7. 重置armed状态
+        self._armed = False
+
+        ts_log(self._log_prefix, "=== Sensor state reset complete ===")
 
     @property
     def px4_ready_to_takeoff(self) -> bool:

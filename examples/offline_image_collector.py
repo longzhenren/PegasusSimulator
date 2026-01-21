@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 离线图像采集器（offline_image_collector.py）
 
@@ -144,7 +145,7 @@ class PoseData:
     position: np.ndarray  # [x, y, z]
     attitude: np.ndarray  # [w, x, y, z] 四元数
     timestamp: float = 0.0
-    waypoint_idx: int = 0
+    step_idx: int = 0  # step_idx from CSV
 
 
 def load_poses_from_csv(csv_path: str) -> List[PoseData]:
@@ -172,16 +173,16 @@ def load_poses_from_csv(csv_path: str) -> List[PoseData]:
                 att_y = float(row.get('obs_att_y', 0))
                 att_z = float(row.get('obs_att_z', 0))
 
-                # 读取可选字段
-                timestamp = float(row.get('image_timestamp_s', 0))
-                waypoint_idx = int(row.get('waypoint_idx', i))
+                # 读取时间戳 (新格式使用 sim_time)
+                timestamp = float(row.get('sim_time', row.get('image_timestamp_s', 0)))
+                step_idx = int(row.get('step_idx', i))
 
                 pose = PoseData(
                     index=i,
                     position=np.array([pos_x, pos_y, pos_z]),
                     attitude=np.array([att_w, att_x, att_y, att_z]),
                     timestamp=timestamp,
-                    waypoint_idx=waypoint_idx
+                    step_idx=step_idx
                 )
                 poses.append(pose)
             except (ValueError, KeyError) as e:
@@ -190,6 +191,46 @@ def load_poses_from_csv(csv_path: str) -> List[PoseData]:
 
     ts_log("[CSV]", f"Loaded {len(poses)} poses from {csv_path}")
     return poses
+
+
+def load_camera_params_from_metadata(csv_path: str) -> Dict[str, Any]:
+    """从metadata.json加载相机参数
+    
+    Args:
+        csv_path: CSV文件路径 (metadata.json应在同目录)
+    
+    Returns:
+        相机参数字典 {resolution, fov, offset, rotation}
+    """
+    csv_dir = Path(csv_path).parent
+    metadata_path = csv_dir / "metadata.json"
+    
+    default_params = {
+        "resolution": [1280, 720],
+        "fov": 90.0,
+        "offset": [0.3, 0.0, 0.0],
+        "rotation": [0.0, 0.0, 180.0]
+    }
+    
+    if not metadata_path.exists():
+        ts_log("[Metadata]", f"No metadata.json found at {metadata_path}, using defaults")
+        return default_params
+    
+    try:
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        camera = metadata.get("camera", {})
+        params = {
+            "resolution": camera.get("resolution", default_params["resolution"]),
+            "fov": camera.get("fov", default_params["fov"]),
+            "offset": camera.get("offset", default_params["offset"]),
+            "rotation": camera.get("rotation", default_params["rotation"])
+        }
+        ts_log("[Metadata]", f"Loaded camera params from {metadata_path}")
+        return params
+    except Exception as e:
+        ts_log("[Metadata]", f"Failed to load metadata.json: {e}, using defaults", "WARN")
+        return default_params
 
 
 def compute_camera_pose(
@@ -324,7 +365,7 @@ class OfflineImageCollector:
             "body_position": pose.position.tolist(),
             "body_attitude": pose.attitude.tolist(),
             "timestamp": pose.timestamp,
-            "waypoint_idx": pose.waypoint_idx
+            "step_idx": pose.step_idx
         }
 
         # 获取深度图像（如果启用）
@@ -398,7 +439,7 @@ class OfflineImageCollector:
                     "body_pos_y": result["body_position"][1],
                     "body_pos_z": result["body_position"][2],
                     "timestamp": result["timestamp"],
-                    "waypoint_idx": result["waypoint_idx"]
+                    "step_idx": result["step_idx"]
                 }
                 metadata_list.append(metadata)
 
@@ -428,6 +469,44 @@ def save_metadata_csv(metadata_list: List[Dict], output_path: str):
     ts_log("[Collector]", f"Metadata saved to {output_path}")
 
 
+def update_csv_with_image_paths(csv_path: str, image_paths: Dict[int, str]):
+    """更新原始CSV文件的image_path字段
+    
+    Args:
+        csv_path: CSV文件路径
+        image_paths: {step_idx: image_path} 映射
+    """
+    if not image_paths:
+        return
+    
+    # 读取原始CSV
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+    
+    # 确保有image_path字段
+    if 'image_path' not in fieldnames:
+        ts_log("[CSV]", "No image_path column in CSV, skipping update")
+        return
+    
+    # 更新image_path
+    updated_count = 0
+    for row in rows:
+        step_idx = int(row.get('step_idx', -1))
+        if step_idx in image_paths:
+            row['image_path'] = image_paths[step_idx]
+            updated_count += 1
+    
+    # 写回CSV
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    
+    ts_log("[CSV]", f"Updated {updated_count} image_path entries in {csv_path}")
+
+
 def main():
     """主函数"""
     ts_log("[Main]", "Starting Offline Image Collector")
@@ -454,6 +533,15 @@ def main():
     ts_log("[Main]", f"USD: {usd_path}")
     ts_log("[Main]", f"Output: {output_dir}")
 
+    # 加载相机参数 (优先使用命令行参数，否则从metadata.json加载)
+    camera_params = load_camera_params_from_metadata(csv_path)
+    resolution = tuple(ARGS.resolution) if ARGS.resolution != [640, 480] else tuple(camera_params["resolution"])
+    fov = ARGS.fov if ARGS.fov != 90.0 else camera_params["fov"]
+    camera_offset = np.array(ARGS.camera_offset) if ARGS.camera_offset != [0.3, 0.0, 0.0] else np.array(camera_params["offset"])
+    camera_rotation = np.array(ARGS.camera_rotation) if ARGS.camera_rotation != [0.0, 0.0, 180.0] else np.array(camera_params["rotation"])
+    
+    ts_log("[Main]", f"Camera: resolution={resolution}, fov={fov}, offset={camera_offset}, rotation={camera_rotation}")
+
     # 加载位姿数据
     poses = load_poses_from_csv(csv_path)
     if not poses:
@@ -463,11 +551,11 @@ def main():
     # 创建采集器
     collector = OfflineImageCollector(
         usd_path=usd_path,
-        resolution=tuple(ARGS.resolution),
-        fov=ARGS.fov,
+        resolution=resolution,
+        fov=fov,
         enable_depth=ARGS.depth,
-        camera_offset=np.array(ARGS.camera_offset),
-        camera_rotation=np.array(ARGS.camera_rotation)
+        camera_offset=camera_offset,
+        camera_rotation=camera_rotation
     )
 
     # 初始化
@@ -485,6 +573,10 @@ def main():
     # 保存元数据
     metadata_path = os.path.join(output_dir, "metadata.csv")
     save_metadata_csv(metadata_list, metadata_path)
+    
+    # 更新原始CSV的image_path字段
+    image_paths = {m["index"]: m["image_path"] for m in metadata_list}
+    update_csv_with_image_paths(csv_path, image_paths)
 
     ts_log("[Main]", "Done!")
     return 0

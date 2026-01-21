@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 MAVLink系统验证测试脚本
 

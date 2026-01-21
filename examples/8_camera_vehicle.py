@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 Pegasus 仿真应用（8_camera_vehicle.py）
 

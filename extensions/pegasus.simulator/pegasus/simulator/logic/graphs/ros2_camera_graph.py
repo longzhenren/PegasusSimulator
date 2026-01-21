@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 | File: ros2_camera.py
 | License: BSD-3-Clause. Copyright (c) 2023, Micah Nye. All rights reserved.

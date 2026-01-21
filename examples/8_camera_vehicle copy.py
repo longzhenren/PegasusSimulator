@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 | File: 8_camera_vehicle.py
 | License: BSD-3-Clause. Copyright (c) 2024, Marcelo Jacinto. All rights reserved.

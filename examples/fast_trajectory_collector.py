@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 # Copyright (c) 2024-2026
 # Licensed under the MIT License
 """

@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 # 单机多轨迹连续测试 - 验证 kill→teleport→start 流程
 
 TRAJ_DIR="/home/user/PegasusSimulator-5.1/examples/real_trajectory_data/train_data/extracted_json_files"

@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 import psutil
 
 # 定义要查找并终止的进程名称

@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 | File: fast_controller.py
 | Author: Updated based on controller.md

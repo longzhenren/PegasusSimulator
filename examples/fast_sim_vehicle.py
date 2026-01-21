@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 纯Python仿真环境（fast_sim_vehicle.py）
 

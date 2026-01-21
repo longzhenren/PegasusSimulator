@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 坐标转换验证脚本 (verify_coordinate_transform.py)
 

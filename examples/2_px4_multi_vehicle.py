@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 | File: 2_px4_multi_vehicle.py
 | Author: Marcelo Jacinto (marcelo.jacinto@tecnico.ulisboa.pt)

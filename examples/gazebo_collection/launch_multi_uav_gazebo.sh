@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 #
 # Multi-UAV PX4 SITL + Gazebo Launch Script
 # ==========================================

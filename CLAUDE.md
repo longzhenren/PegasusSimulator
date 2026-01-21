@@ -10,7 +10,7 @@ cd /home/user/PegasusSimulator-5.1/examples
 或直接运行：
 ```bash
 cd /home/user/PegasusSimulator-5.1/examples
-~/.local/share/ov/pkg/isaac-sim-4.2.0/python.sh mavlink_sim_vehicle.py --headless
+~/isaacsim-5.1.0/python.sh mavlink_sim_vehicle.py --headless --no-images
 ```
 
 ### 2. 运行单机多轨迹测试

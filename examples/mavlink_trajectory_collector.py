@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 # Copyright (c) 2024-2026
 # Licensed under the MIT License
 """
@@ -113,6 +114,7 @@ import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+import socket
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -367,9 +369,9 @@ def _http_json(
             obj = json.loads(raw.decode("utf-8")) if raw else {"error": str(e)}
         except Exception:
             obj = {"error": raw.decode("utf-8", errors="replace")}
-        return int(getattr(e, "code", 500) or 500), obj
-
-
+        return e.code, obj
+    except (urllib.error.URLError, Exception) as e:
+        return 500, {"error": str(e)}
 def _iter_json_files(input_dir: Path, pattern: str) -> List[Path]:
     """扫描JSON轨迹文件"""
     files = sorted([Path(p) for p in glob.glob(str(input_dir / pattern))])
@@ -480,20 +482,30 @@ def _transform_points(
 ) -> List[TrajPoint]:
     """坐标变换
 
-    轨迹数据是绝对坐标，只需应用scale:
-    - x, y, z 直接乘以scale
-    - 如果z_down=True，翻转z符号（用于ENU转NED）
+    轨迹数据是相对于init_pos的相对坐标，需要：
+    1. 缩放: x, y, z 乘以scale
+    2. 偏移: 加上base_x/y/z（即init_pos经过scale后的值）
+    3. Z方向: 如果z_down=True，翻转z符号
 
-    注意：base_x/y/z参数保留但不再使用（轨迹本身就是绝对坐标）
+    Args:
+        pts: 轨迹点列表（相对坐标）
+        scale: 缩放因子（如0.01将厘米转换为米）  
+        base_x/y/z: init_pos的原始坐标（未缩放）
+        z_down: 是否翻转z轴
     """
     out: List[TrajPoint] = []
+    # 计算偏移量（init_pos缩放后的值）
+    offset_x = base_x * scale
+    offset_y = base_y * scale
+    offset_z = base_z * scale
+    
     for p in pts:
-        x = p.x * scale
-        y = p.y * scale
+        x = offset_x + p.x * scale
+        y = offset_y + p.y * scale
         if z_down:
-            z = -p.z * scale  # ENU to NED: flip z sign
+            z = offset_z - p.z * scale  # ENU to NED: flip z sign relative to init
         else:
-            z = p.z * scale   # Keep ENU z
+            z = offset_z + p.z * scale   # Keep ENU z relative to init
         out.append(TrajPoint(x, y, z, p.roll_deg, p.yaw_deg, p.pitch_deg))
     return out
 
@@ -750,6 +762,263 @@ def _fetch_sim_time(image_base: str, timeout: float = 1.0) -> Optional[float]:
     code, obj = _http_json("GET", url, payload=None, timeout=timeout)
     if 200 <= code < 300 and isinstance(obj, dict):
         return obj.get("sim_time")
+    return None
+
+
+class SimTimeListener:
+    """MAVLink UDP时间监听器，用于非阻塞接收仿真时间"""
+
+    def __init__(self, port: int = 14555):
+        self._port = port
+        self._socket = None
+        self._thread = None
+        self._running = False
+        self._current_time = 0.0
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._last_update = 0.0
+
+    def start(self):
+        """启动监听器"""
+        import socket
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # SO_REUSEPORT allows multiple sockets to bind to the same port
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        self._socket.bind(("0.0.0.0", self._port))
+        self._socket.settimeout(0.1)  # 100ms超时，用于检查停止标志
+        self._running = True
+        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._thread.start()
+        ts_log("[TimeListener]", f"Started on UDP port {self._port}")
+
+    def _listen_loop(self):
+        """监听循环"""
+        from pymavlink import mavutil
+        mav = mavutil.mavlink.MAVLink(None)
+        while self._running:
+            try:
+                data, _ = self._socket.recvfrom(1024)
+                msgs = mav.parse_buffer(data)
+                if msgs:
+                    for msg in msgs:
+                        if msg.get_type() == "SYSTEM_TIME":
+                            sim_time = msg.time_unix_usec / 1e6
+                            with self._condition:
+                                self._current_time = sim_time
+                                self._last_update = time.time()
+                                self._condition.notify_all()
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+    def get_time(self) -> float:
+        """获取当前仿真时间（非阻塞）"""
+        with self._lock:
+            return self._current_time
+
+    def wait_for_advance(self, last_time: float, timeout: float = 1.0) -> float:
+        """等待仿真时间推进（阻塞直到时间变化或超时）"""
+        deadline = time.time() + timeout
+        with self._condition:
+            while self._current_time <= last_time:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return self._current_time
+                self._condition.wait(timeout=remaining)
+            return self._current_time
+
+    def stop(self):
+        """停止监听器"""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if self._socket:
+            # Proper socket shutdown sequence for clean resource release
+            try:
+                self._socket.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass  # Socket may already be closed
+            try:
+                self._socket.close()
+            except Exception:
+                pass
+            self._socket = None
+
+
+class MavlinkSetpointSender:
+    """UDP MAVLink Setpoint 发送器
+
+    直接通过 UDP 发送 SET_POSITION_TARGET_LOCAL_NED 消息到 PX4，
+    绕过 HTTP 层以减少通信延迟（预计从 50ms 降至 <5ms）。
+
+    注意: 坐标系转换与 mavlink_sim_vehicle.py 中的 _send_velocity_setpoint 一致
+    ENU (Isaac Sim) -> NED (PX4):
+    - ned_x = enu_y, ned_y = enu_x, ned_z = -enu_z
+    - ned_yaw = π/2 - enu_yaw
+    """
+
+    def __init__(self, uav_id: int, px4_port_base: int = 14580):
+        """
+        Args:
+            uav_id: UAV ID (0-based)
+            px4_port_base: PX4 onboard MAVLink 端口基址 (默认 14580)
+        """
+        self.uav_id = uav_id
+        self.px4_port = px4_port_base + uav_id
+        self._conn = None
+        self._lock = threading.Lock()
+        self._log_prefix = f"[SetpointSender UAV{uav_id}]"
+
+    def connect(self) -> bool:
+        """建立 MAVLink UDP 连接"""
+        try:
+            from pymavlink import mavutil
+            # udpout: 我们发送到 PX4 的端口
+            conn_str = f"udpout:127.0.0.1:{self.px4_port}"
+            self._conn = mavutil.mavlink_connection(
+                conn_str,
+                source_system=255,  # GCS system ID
+                source_component=0
+            )
+            ts_log(self._log_prefix, f"Connected to PX4 via UDP {conn_str}")
+            
+            # Tune PX4 parameters for high-speed tracking
+            # 增加水平速度限制 (默认12 -> 20)
+            self.set_param("MPC_XY_VEL_MAX", 20.0)
+            # 增加最大倾斜角 (默认45 -> 60)
+            self.set_param("MPC_TILTMAX_AIR", 60.0)
+            # 增加位置控制P增益 (默认0.95 -> 1.5)
+            # 这会让无人机更积极地修正位置误差，但可能导致过冲
+            self.set_param("MPC_XY_P", 1.5)
+            # 增加Z轴P增益 (默认1.0 -> 1.5)
+            self.set_param("MPC_Z_P", 1.5)
+            
+            return True
+        except Exception as e:
+            ts_log(self._log_prefix, f"Connect failed: {e}", "ERROR")
+            return False
+
+    def set_param(self, param_id: str, param_value: float) -> bool:
+        """设置 PX4 参数"""
+        if self._conn is None: return False
+        try:
+            from pymavlink import mavutil
+            # 发送参数设置命令
+            self._conn.mav.param_set_send(
+                self.uav_id + 1,  # Target System
+                1,                # Target Component
+                param_id.encode('utf-8'),
+                param_value,
+                mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+            )
+            ts_log(self._log_prefix, f"Set param {param_id} = {param_value}")
+            return True
+        except Exception as e:
+            ts_log(self._log_prefix, f"Failed to set param {param_id}: {e}", "WARN")
+            return False
+
+    def send_pva_setpoint(self, x: float, y: float, z: float,
+                          vx: float, vy: float, vz: float,
+                          ax: float, ay: float, az: float,
+                          yaw: float, yaw_rate: float) -> bool:
+        """发送 PVA setpoint (位置+速度+加速度前馈)
+
+        Args:
+            x, y, z: 位置 (ENU 坐标系, 米)
+            vx, vy, vz: 速度 (m/s)
+            ax, ay, az: 加速度 (m/s²)
+            yaw: 航向角 (弧度, ENU: East=0, CCW正)
+            yaw_rate: 航向角速率 (rad/s)
+
+        Returns:
+            True if sent successfully
+        """
+        with self._lock:
+            if self._conn is None:
+                return False
+
+            try:
+                from pymavlink import mavutil
+
+                # type_mask = 0x0000: 使用全部 PVA + yaw + yaw_rate
+                type_mask = 0x0000
+                target_sys = self.uav_id + 1
+                target_comp = 1
+
+                # ENU -> NED 转换
+                ned_x = y
+                ned_y = x
+                ned_z = -z
+
+                ned_vx = vy
+                ned_vy = vx
+                ned_vz = -vz
+
+                ned_ax = ay
+                ned_ay = ax
+                ned_az = -az
+
+                # Yaw坐标系转换: ENU -> NED
+                # ENU: East=0 (X轴), CCW正 (逆时针)
+                # NED: North=0 (X轴), CW正 (顺时针)
+                # 转换公式: NED_yaw = π/2 - ENU_yaw
+                # 
+                # 【修正】：测试发现存在稳定的180度Yaw误差，说明Isaac Sim模型或坐标系定义
+                # 与PX4存在180度偏差（可能是机头朝向定义相反）。
+                # 因此在此增加180度偏移: ned_yaw = (π/2 - yaw) + π
+                ned_yaw = 0.5 * math.pi - yaw + math.pi
+
+                # 归一化到 [-pi, pi]
+                while ned_yaw > math.pi:
+                    ned_yaw -= 2.0 * math.pi
+                while ned_yaw < -math.pi:
+                    ned_yaw += 2.0 * math.pi
+
+                # Yaw_rate方向取反: ENU CCW正 -> NED CW正
+                ned_yaw_rate = -yaw_rate
+
+                self._conn.mav.set_position_target_local_ned_send(
+                    0,  # time_boot_ms
+                    target_sys,
+                    target_comp,
+                    mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                    type_mask,
+                    ned_x, ned_y, ned_z,
+                    ned_vx, ned_vy, ned_vz,
+                    ned_ax, ned_ay, ned_az,
+                    ned_yaw, ned_yaw_rate
+                )
+                return True
+            except Exception as e:
+                ts_log(self._log_prefix, f"Send setpoint failed: {e}", "WARN")
+                return False
+
+    def close(self):
+        """关闭连接"""
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
+
+def _state_record_start(image_base: str, uav_id: int, timeout: float = 5.0) -> bool:
+    """启动状态记录"""
+    url = f"{image_base}/uav/{uav_id}/state_record/start"
+    code, _ = _http_json("GET", url, payload=None, timeout=timeout)
+    return 200 <= code < 300
+
+
+def _state_record_stop(image_base: str, uav_id: int, timeout: float = 30.0) -> Optional[List[Dict]]:
+    """停止状态记录并获取数据"""
+    url = f"{image_base}/uav/{uav_id}/state_record/stop"
+    code, obj = _http_json("GET", url, payload=None, timeout=timeout)
+    if 200 <= code < 300 and isinstance(obj, dict):
+        return obj.get("records", [])
     return None
 
 
@@ -1012,8 +1281,10 @@ class Worker:
         collect_images: bool,
         print_lock: threading.Lock,
         status_log_path: Path,
+        shared_time_listener: "SimTimeListener" = None,
     ):
         self.uav_id = int(uav_id)
+        self.shared_time_listener = shared_time_listener
         self.control_base = _build_controller_base(control_base, self.uav_id).rstrip("/")
         self.image_base = image_base.rstrip("/")
         self.out_dir = out_dir
@@ -1028,12 +1299,17 @@ class Worker:
         self.skip_existing = bool(skip_existing)
         self.use_mission = bool(use_mission)
         self.time_scale = float(time_scale)
+        self.time_tracker = None  # Will be set in _process_one
         self.collect_images = bool(collect_images)
         self.print_lock = print_lock
         self.status_log_path = status_log_path
 
         # 坐标对齐
         self._origin_offset: Optional[Tuple[float, float, float]] = None
+
+        # UDP MAVLink Setpoint 发送器（绕过 HTTP 以减少延迟）
+        self._setpoint_sender: Optional[MavlinkSetpointSender] = None
+        self._use_udp_setpoint = True  # 默认启用 UDP 发送
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         with self.print_lock:
@@ -1081,7 +1357,18 @@ class Worker:
             ok = _sim_move_uav(self.image_base, self.uav_id, ground_pos, reset_yaw, timeout=10.0)
             if not ok:
                 self._log(f"Step 1 WARNING: sim_move_uav failed", "WARN")
-            time.sleep(0.5)  # 等待物理稳定
+            if not ok:
+                self._log(f"Step 1 WARNING: sim_move_uav failed", "WARN")
+            
+            # Use simulation time for stabilization wait
+            if self.time_tracker:
+                start_sim_time = self.time_tracker.get_time()
+                target_sim_time = start_sim_time + 2.0
+                self._log(f"Step 1: Waiting 2.0s sim time for stabilization (start={start_sim_time:.2f}, target={target_sim_time:.2f})")
+                self.time_tracker.wait_for_advance(target_sim_time, timeout=10.0)
+            else:
+                self._log(f"Step 1: Time tracker not available, using wall clock sleep", "WARN")
+                time.sleep(2.0)  # Fallback to wall clock
         else:
             self._log(f"Step 1: Skipped (no position specified)")
 
@@ -1344,21 +1631,35 @@ class Worker:
             # 写入CSV（不再包含ulg_path列）
             _write_csv(rows, csv_path)
 
+            # 复制原始JSON文件
+            try:
+                import shutil
+                shutil.copy2(json_path, traj_dir / json_path.name)
+            except Exception as e:
+                self._log(f"[UAV{self.uav_id}] failed to copy source JSON: {e}", "WARN")
+
             # 计算轨迹持续时间
             duration_s = time.time() - traj_start_ts
+            avg_fps = len(rows) / duration_s if duration_s > 0 else 0.0
 
             # 生成metadata.json
             metadata = {
                 "traj_name": traj_name,
                 "traj_json": _relative_path(json_path, self.out_dir),
+                "original_json_name": json_path.name,
                 "uav_id": self.uav_id,
                 "start_timestamp": traj_start_ts,
-                "duration_s": round(duration_s, 3),
+                "duration_s": duration_s,
                 "total_frames": len(rows),
+                "avg_fps": avg_fps,
                 "time_scale": self.time_scale,
                 "scale": self.scale,
+                "z_down": self.z_down,
                 "control_mode": "mission" if self.use_mission else "offboard",
                 "ulg_path": ulg_path_str,
+                # avg_tracking_error is not defined in the provided context, assuming it's defined elsewhere
+                # or will be added by the user.
+                # "avg_tracking_error": avg_error,
             }
             metadata_path.parent.mkdir(parents=True, exist_ok=True)
             with metadata_path.open("w", encoding="utf-8") as f:
@@ -1412,19 +1713,35 @@ class Worker:
                 init_pose = info.get("pose", {})
             else:
                 init_pose = _fetch_pose_only(self.image_base, self.uav_id, timeout=self.image_timeout) or {}
-            uav_init_pos = init_pose.get("position", [0, 0, 0])
+            uav_init_pos_sim = init_pose.get("position", [0, 0, 0])  # Isaac Sim物理位置
             sim_start_ts = float(init_pose.get("timestamp", time.time()))  # 获取仿真时间戳
         except Exception:
-            uav_init_pos = [0, 0, 0]
+            uav_init_pos_sim = [0, 0, 0]
             sim_start_ts = time.time()  # 回退到系统时间
 
         self._log(f"[UAV{self.uav_id}] initial sim timestamp: {sim_start_ts:.3f}")
+
+        # *** 关键修复：获取PX4 EKF位置用于偏移计算 ***
+        # PX4的位置估计可能与Isaac Sim物理位置不同（特别是teleport后）
+        # 必须使用PX4位置来计算偏移，否则setpoint命令会发到错误位置
+        uav_init_pos = uav_init_pos_sim  # 默认使用Isaac Sim位置
+        try:
+            code, resp = _http_json("POST", f"{self.control_base}/command",
+                                    payload={"cmd": "get_position"}, timeout=5.0)
+            if 200 <= code < 300 and isinstance(resp, dict) and "position" in resp:
+                px4_pos = resp["position"]
+                if isinstance(px4_pos, (list, tuple)) and len(px4_pos) >= 3:
+                    uav_init_pos = [float(px4_pos[0]), float(px4_pos[1]), float(px4_pos[2])]
+                    self._log(f"[UAV{self.uav_id}] using PX4 EKF position for offset: ({uav_init_pos[0]:.2f}, {uav_init_pos[1]:.2f}, {uav_init_pos[2]:.2f})")
+                    self._log(f"[UAV{self.uav_id}] Isaac Sim position was: ({uav_init_pos_sim[0]:.2f}, {uav_init_pos_sim[1]:.2f}, {uav_init_pos_sim[2]:.2f})")
+        except Exception as e:
+            self._log(f"[UAV{self.uav_id}] failed to get PX4 position, using Isaac Sim position: {e}", "WARN")
 
         # 计算轨迹偏移
         # 重要：XY偏移在地面计算，Z偏移在起飞后计算
         traj_start = smoother.get_position(0.0)
 
-        # XY偏移：将轨迹XY原点移到UAV当前XY位置
+        # XY偏移：将轨迹XY原点移到UAV当前XY位置（使用PX4 EKF位置）
         # Z偏移：初始设为0，等起飞到正确高度后再计算
         # 因为在地面时计算Z偏移会导致 TARGET_ALT 被压低到地面高度！
         self._origin_offset = (
@@ -1433,7 +1750,7 @@ class Worker:
             0.0  # Z偏移初始为0，起飞后再更新
         )
         self._log(f"[UAV{self.uav_id}] initial trajectory offset: XY=({self._origin_offset[0]:.4f}, {self._origin_offset[1]:.4f})m, Z=0 (will update after takeoff)")
-        self._log(f"[UAV{self.uav_id}] UAV pos=({uav_init_pos[0]:.2f}, {uav_init_pos[1]:.2f}, {uav_init_pos[2]:.2f}), traj_start=({traj_start[0]:.2f}, {traj_start[1]:.2f}, {traj_start[2]:.2f})")
+        self._log(f"[UAV{self.uav_id}] PX4 pos=({uav_init_pos[0]:.2f}, {uav_init_pos[1]:.2f}, {uav_init_pos[2]:.2f}), traj_start=({traj_start[0]:.2f}, {traj_start[1]:.2f}, {traj_start[2]:.2f})")
 
         # 辅助函数：应用偏移到位置
         def apply_offset(x, y, z):
@@ -1650,15 +1967,11 @@ class Worker:
             if not buffer_started:
                 self._log(f"[UAV{self.uav_id}] WARNING: Failed to start image buffer, falling back to sync mode", "WARN")
 
-        # 控制循环50Hz（仿真端独立以20Hz缓存图像）
-        CONTROL_HZ = 50.0
-        control_dt = 1.0 / CONTROL_HZ  # 0.02s
-
         # 时间前瞻补偿 (Lookahead) - 用于补偿通信延迟和控制滞后
         # 基础前瞻时间根据 time_scale 缩放（变慢时前瞻时间变小）
-        BASE_LOOKAHEAD = 0.1  # 100ms 基础前瞻
-        LOOKAHEAD_TIME = BASE_LOOKAHEAD / self.time_scale
-        self._log(f"[UAV{self.uav_id}] lookahead time: {LOOKAHEAD_TIME*1000:.0f}ms (base={BASE_LOOKAHEAD*1000:.0f}ms, scale={self.time_scale:.2f})")
+        BASE_LOOKAHEAD = 0.2  # 200ms 基础前瞻
+        LOOKAHEAD_TIME = BASE_LOOKAHEAD / 1 # self.time_scale
+        self._log(f"[UAV{self.uav_id}] lookahead time: {LOOKAHEAD_TIME*1000:.0f}ms (base={BASE_LOOKAHEAD*1000:.0f}ms, scale=1)") # scale={self.time_scale:.2f})")
 
         # 严格锁步模式：直接使用模拟器时间，不进行本地预测
         # 这确保控制循环与仿真时间严格同步
@@ -1668,7 +1981,7 @@ class Worker:
         FINAL_DIST_THRESHOLD = 0.3  # 位置阈值（米）
         FINAL_VEL_THRESHOLD = 0.1   # 速度阈值（m/s）
         in_final_mode = False
-        final_mode_start = None
+        final_mode_start_sim = 0.0  # 使用仿真时间记录进入FINAL模式的时刻
 
         # 缓存当前观测状态（初始化为aligned_start）
         current_obs_pos = list(aligned_start)
@@ -1682,49 +1995,93 @@ class Worker:
         obs_fetch_interval = 5  # 每5次循环获取一次位姿（10Hz观测足够）
         loop_counter = 0
 
-        self._log(f"[UAV{self.uav_id}] starting 50Hz control loop with ASYNC image buffering (duration={total_duration:.1f}s)")
+        # 使用共享的时间监听器（如果提供）
+        time_listener = self.shared_time_listener
+        if time_listener is None:
+            # 回退：创建独立的监听器（单UAV模式）
+            time_listener = SimTimeListener(port=14555)
+            time_listener.start()
+
+        # 等待监听器收到第一个时间消息
+        self._log(f"[UAV{self.uav_id}] waiting for simulator time broadcast...")
+        wait_start = time.time()
+        while time_listener.get_time() <= 0 and (time.time() - wait_start) < 30.0:
+            time.sleep(0.1)
+        initial_listener_time = time_listener.get_time()
+        if initial_listener_time <= 0:
+            self._log(f"[UAV{self.uav_id}] WARNING: No time broadcast received, falling back to HTTP polling", "WARN")
+            use_mavlink_time = False
+        else:
+            use_mavlink_time = True
+            self._log(f"[UAV{self.uav_id}] received initial time: {initial_listener_time:.3f}s")
+
+        # 启动状态记录（离线数据采集）
+        _state_record_start(self.image_base, self.uav_id, timeout=5.0)
+        self._log(f"[UAV{self.uav_id}] state recording started")
+
+        # 锁步同步参数 - 使用监听器收到的时间作为基准
+        if use_mavlink_time:
+            last_cmd_sim_ts = initial_listener_time
+            sim_start_ts = initial_listener_time  # 更新起始时间
+        else:
+            last_cmd_sim_ts = sim_start_ts
+        last_log_second = -1  # 上次输出日志的仿真秒数（用于每秒输出一次）
+
+        self._log(f"[UAV{self.uav_id}] starting LOCKSTEP control loop (duration={total_duration:.1f}s, sim_start={sim_start_ts:.3f}s)")
+
+        # 初始化 UDP MAVLink Setpoint 发送器（绕过 HTTP 以减少延迟）
+        if self._use_udp_setpoint:
+            self._setpoint_sender = MavlinkSetpointSender(self.uav_id)
+            if self._setpoint_sender.connect():
+                self._log(f"[UAV{self.uav_id}] UDP setpoint sender connected (port 14580+{self.uav_id})")
+            else:
+                self._log(f"[UAV{self.uav_id}] UDP setpoint sender failed, fallback to HTTP", "WARN")
+                self._setpoint_sender = None
 
         pose_samples: List[Dict[str, Any]] = []
+
+        timeout_count = 0
         try:
             while True:
-                loop_start = time.time()
                 loop_counter += 1
 
-                # === 获取位姿观测（轻量级，不获取图像） ===
+                # === 获取仿真时间 ===
+                if use_mavlink_time:
+                    current_sim_ts = time_listener.wait_for_advance(last_cmd_sim_ts, timeout=1.0)
+                else:
+                    # HTTP回退模式
+                    new_ts = _fetch_sim_time(self.image_base, timeout=0.1)
+                    current_sim_ts = new_ts if new_ts and new_ts > 0 else last_cmd_sim_ts
+                    time.sleep(0.02)  # 50Hz
+
+                # 计算仿真经过时间
+                elapsed = current_sim_ts - sim_start_ts
+
+                # 检查是否有时间推进
+                if current_sim_ts <= last_cmd_sim_ts:
+                    timeout_count += 1
+                    if timeout_count % 10 == 0:
+                        self._log(f"[UAV{self.uav_id}] waiting for time advance... (current={current_sim_ts:.3f}, last={last_cmd_sim_ts:.3f})")
+                    continue
+
+                timeout_count = 0
+                # 更新上次命令时间
+                last_cmd_sim_ts = current_sim_ts
+                last_sim_ts = current_sim_ts
+
+                # === 获取位姿观测（仅用于FINAL模式判断，数据由仿真器离线记录） ===
                 if loop_counter % obs_fetch_interval == 0:
                     try:
                         pose_info = _fetch_pose_only(self.image_base, self.uav_id, timeout=0.05)
                         if pose_info is not None:
-                            new_sim_ts = float(pose_info.get("timestamp", 0))
                             new_pos = pose_info.get("position", None)
                             new_vel = pose_info.get("linear_velocity", None)
-
-                            if new_sim_ts > 0:
-                                last_sim_ts = new_sim_ts
                             if new_pos is not None and len(new_pos) >= 3:
                                 current_obs_pos = new_pos
                             if new_vel is not None and len(new_vel) >= 3:
                                 current_obs_vel = new_vel
-                            if not self.collect_images:
-                                pose_samples.append({
-                                    "timestamp": float(new_sim_ts) if new_sim_ts > 0 else float(time.time()),
-                                    "pose": {
-                                        "position": (pose_info.get("position") or [0, 0, 0])[:3],
-                                        "attitude": (pose_info.get("attitude") or [0, 0, 0, 1])[:4],
-                                        "linear_velocity": (pose_info.get("linear_velocity") or [0, 0, 0])[:3],
-                                        "angular_velocity": (pose_info.get("angular_velocity") or [0, 0, 0])[:3],
-                                        "linear_acceleration": (pose_info.get("linear_acceleration") or [0, 0, 0])[:3],
-                                    }
-                                })
                     except Exception:
-                        pass  # 保持上次有效的观测值
-
-                # 严格锁步：直接使用从仿真端获取的模拟器时间
-                # 不进行本地时间预测，确保与仿真时间严格同步
-                current_sim_ts = last_sim_ts
-
-                # 计算仿真经过时间
-                elapsed = current_sim_ts - sim_start_ts
+                        pass
 
                 # 获取轨迹终点状态
                 end_state = smoother.get_full_state(total_duration)
@@ -1734,7 +2091,7 @@ class Worker:
                 if elapsed > total_duration:
                     if not in_final_mode:
                         in_final_mode = True
-                        final_mode_start = time.time()
+                        final_mode_start_sim = current_sim_ts  # 使用仿真时间
                         self._log(f"[UAV{self.uav_id}] entering FINAL mode (trajectory complete)")
 
                     dist_to_final = math.sqrt(
@@ -1764,14 +2121,19 @@ class Worker:
                         self._log(f"[UAV{self.uav_id}] FINAL reached: dist={dist_to_final:.3f}m, vel={current_speed:.3f}m/s")
                         break
 
-                    if time.time() - final_mode_start > 10.0:
+                    # 使用仿真时间判断超时（10秒仿真时间）
+                    final_elapsed_sim = current_sim_ts - final_mode_start_sim
+                    if final_elapsed_sim > 10.0:
                         self._log(f"[UAV{self.uav_id}] FINAL timeout: dist={dist_to_final:.3f}m, vel={current_speed:.3f}m/s", "WARN")
                         break
 
-                    if int(time.time() - final_mode_start) > int(time.time() - final_mode_start - control_dt):
+                    # 每秒仿真时间输出一次日志
+                    final_second = int(final_elapsed_sim)
+                    if final_second > last_log_second:
+                        last_log_second = final_second
                         self._log(f"[UAV{self.uav_id}] FINAL mode: dist={dist_to_final:.3f}m, vel={current_speed:.3f}m/s")
 
-                    time.sleep(control_dt)
+                    # 不再使用 time.sleep，锁步轮询已在循环开头处理
                     continue
 
                 # === 正常轨迹跟踪 (PVA + Lookahead) ===
@@ -1784,19 +2146,28 @@ class Worker:
                 state_now = smoother.get_full_state(t_now)
                 aligned_pos_now = apply_offset(state_now['x'], state_now['y'], state_now['z'])
 
-                # 发送PVA控制setpoint
-                cmd = {
-                    "cmd": "setpoint",
-                    "x": aligned_pos_cmd[0], "y": aligned_pos_cmd[1], "z": aligned_pos_cmd[2],
-                    "vx": state_cmd['vx'], "vy": state_cmd['vy'], "vz": state_cmd['vz'],
-                    "afx": state_cmd['ax'], "afy": state_cmd['ay'], "afz": state_cmd['az'],
-                    "yaw": state_cmd['yaw'],
-                    "yaw_rate": state_cmd['yaw_rate']
-                }
-                try:
-                    _http_json("POST", f"{self.control_base}/command", payload=cmd, timeout=0.5)
-                except Exception:
-                    pass
+                # 发送PVA控制setpoint (使用 UDP 直接发送以减少延迟)
+                if self._use_udp_setpoint and self._setpoint_sender is not None:
+                    self._setpoint_sender.send_pva_setpoint(
+                        aligned_pos_cmd[0], aligned_pos_cmd[1], aligned_pos_cmd[2],
+                        state_cmd['vx'], state_cmd['vy'], state_cmd['vz'],
+                        state_cmd['ax'], state_cmd['ay'], state_cmd['az'],
+                        state_cmd['yaw'], state_cmd['yaw_rate']
+                    )
+                else:
+                    # 回退到 HTTP（兼容模式）
+                    cmd = {
+                        "cmd": "setpoint",
+                        "x": aligned_pos_cmd[0], "y": aligned_pos_cmd[1], "z": aligned_pos_cmd[2],
+                        "vx": state_cmd['vx'], "vy": state_cmd['vy'], "vz": state_cmd['vz'],
+                        "afx": state_cmd['ax'], "afy": state_cmd['ay'], "afz": state_cmd['az'],
+                        "yaw": state_cmd['yaw'],
+                        "yaw_rate": state_cmd['yaw_rate']
+                    }
+                    try:
+                        _http_json("POST", f"{self.control_base}/command", payload=cmd, timeout=0.5)
+                    except Exception:
+                        pass
 
                 # 计算跟踪误差
                 tracking_error = math.sqrt(
@@ -1807,17 +2178,22 @@ class Worker:
                 error_sum += tracking_error
                 error_count += 1
 
-                # 每秒输出一次误差日志
-                if loop_counter % 50 == 0:
-                    self._log(f"[UAV{self.uav_id}] t={t_now:.2f}s Error={tracking_error:.3f}m obs=({current_obs_pos[0]:.2f},{current_obs_pos[1]:.2f},{current_obs_pos[2]:.2f})")
+                # 每秒仿真时间输出一次进度日志（obs由仿真器端输出）
+                current_second = int(elapsed)
+                if current_second > last_log_second:
+                    last_log_second = current_second
+                    self._log(f"[UAV{self.uav_id}] t={t_now:.2f}s")
 
-                # 控制循环节拍
-                loop_elapsed = time.time() - loop_start
-                sleep_time = control_dt - loop_elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                # 锁步模式：不使用wall clock sleep，时间同步由MAVLink监听器处理
 
         finally:
+            # 停止时间监听器
+            time_listener.stop()
+
+            # 停止状态记录并获取离线数据
+            self._log(f"[UAV{self.uav_id}] stopping state recording...")
+            state_records = _state_record_stop(self.image_base, self.uav_id, timeout=30.0)
+
             if self.collect_images:
                 self._log(f"[UAV{self.uav_id}] stopping image buffer and processing frames...")
                 buffered_frames = _buffer_stop(self.image_base, self.uav_id, timeout=120.0)
@@ -1830,12 +2206,14 @@ class Worker:
                 else:
                     self._log(f"[UAV{self.uav_id}] WARNING: No buffered frames received", "WARN")
             else:
-                if pose_samples:
-                    self._process_pose_samples(
-                        pose_samples, smoother, json_path, traj_dir, rows, apply_offset, total_duration
+                # 使用离线状态数据
+                if state_records:
+                    self._log(f"[UAV{self.uav_id}] processing {len(state_records)} offline state records...")
+                    self._process_offline_state_records(
+                        state_records, smoother, json_path, traj_dir, rows, apply_offset, total_duration, sim_start_ts
                     )
                 else:
-                    self._log(f"[UAV{self.uav_id}] WARNING: No pose samples collected", "WARN")
+                    self._log(f"[UAV{self.uav_id}] WARNING: No state records collected", "WARN")
 
         # 输出最终统计
         avg_error = error_sum / max(error_count, 1)
@@ -2045,6 +2423,141 @@ class Worker:
 
             except Exception as e:
                 self._log(f"[UAV{self.uav_id}] frame {i} processing error: {e}", "WARN")
+
+    def _process_offline_state_records(
+        self,
+        records: List[Dict],
+        smoother: TrajectorySmoother,
+        json_path: Path,
+        traj_dir: Path,
+        rows: List[Dict],
+        apply_offset,
+        total_duration: float,
+        sim_start_ts: float,
+    ) -> None:
+        """处理离线状态记录数据"""
+        if not records:
+            return
+
+        # 计算统计信息
+        error_sum = 0.0
+        error_count = 0
+
+        for i, record in enumerate(records):
+            try:
+                ts = float(record.get("sim_time", 0.0))
+                pos = record.get("position", [0, 0, 0])
+                att = record.get("attitude", [0, 0, 0, 1])
+                lv = record.get("linear_velocity", [0, 0, 0])
+                av = record.get("angular_velocity", [0, 0, 0])
+                la = record.get("linear_acceleration", [0, 0, 0])
+
+                relative_t = ts - sim_start_ts
+                is_final_mode = relative_t > float(total_duration)
+
+                sample_state = smoother.get_full_state(min(relative_t, total_duration), for_control=False)
+                sample_pos = apply_offset(sample_state['x'], sample_state['y'], sample_state['z'])
+
+                # 计算跟踪误差
+                tracking_error = math.sqrt(
+                    (pos[0] - sample_pos[0])**2 +
+                    (pos[1] - sample_pos[1])**2 +
+                    (pos[2] - sample_pos[2])**2
+                )
+                error_sum += tracking_error
+                error_count += 1
+
+                if is_final_mode:
+                    sample_state['vx'] = 0.0
+                    sample_state['vy'] = 0.0
+                    sample_state['vz'] = 0.0
+                    sample_state['yaw_rate'] = 0.0
+
+                p_in = TrajPoint(
+                    sample_state['x'], sample_state['y'], sample_state['z'],
+                    math.degrees(sample_state['roll']),
+                    math.degrees(sample_state['yaw']),
+                    math.degrees(sample_state['pitch'])
+                )
+                p_cmd = TrajPoint(
+                    sample_pos[0], sample_pos[1], sample_pos[2],
+                    math.degrees(sample_state['roll']),
+                    math.degrees(sample_state['yaw']),
+                    math.degrees(sample_state['pitch'])
+                )
+
+                cmd_velocity = {
+                    'vx': sample_state['vx'],
+                    'vy': sample_state['vy'],
+                    'vz': sample_state['vz'],
+                    'yaw': sample_state['yaw'],
+                    'yaw_rate': sample_state['yaw_rate']
+                }
+                if is_final_mode:
+                    cmd_velocity['vx'] = 0.0
+                    cmd_velocity['vy'] = 0.0
+                    cmd_velocity['vz'] = 0.0
+                    cmd_velocity['yaw_rate'] = 0.0
+
+                aligned_obs = self._apply_alignment((pos[0], pos[1], pos[2]))
+
+                rows.append({
+                    "traj_json": _relative_path(json_path, self.out_dir),
+                    "traj_name": _safe_name(json_path),
+                    "uav_id": self.uav_id,
+                    "step_idx": i,
+                    "cmd_in_x": p_in.x,
+                    "cmd_in_y": p_in.y,
+                    "cmd_in_z": p_in.z,
+                    "cmd_in_roll_deg": p_in.roll_deg,
+                    "cmd_in_yaw_deg": p_in.yaw_deg,
+                    "cmd_in_pitch_deg": p_in.pitch_deg,
+                    "cmd_x": p_cmd.x,
+                    "cmd_y": p_cmd.y,
+                    "cmd_z": p_cmd.z,
+                    "cmd_roll_deg": p_cmd.roll_deg,
+                    "cmd_yaw_deg": p_cmd.yaw_deg,
+                    "cmd_pitch_deg": p_cmd.pitch_deg,
+                    "image_timestamp_s": ts,
+                    "image_path": "",
+                    "obs_pos_x": pos[0],
+                    "obs_pos_y": pos[1],
+                    "obs_pos_z": pos[2],
+                    "obs_aligned_x": aligned_obs[0],
+                    "obs_aligned_y": aligned_obs[1],
+                    "obs_aligned_z": aligned_obs[2],
+                    "origin_offset_x": self._origin_offset[0] if self._origin_offset else 0.0,
+                    "origin_offset_y": self._origin_offset[1] if self._origin_offset else 0.0,
+                    "origin_offset_z": self._origin_offset[2] if self._origin_offset else 0.0,
+                    "obs_att_w": att[0] if len(att) >= 4 else None,
+                    "obs_att_x": att[1] if len(att) >= 4 else None,
+                    "obs_att_y": att[2] if len(att) >= 4 else None,
+                    "obs_att_z": att[3] if len(att) >= 4 else None,
+                    "obs_linvel_x": lv[0],
+                    "obs_linvel_y": lv[1],
+                    "obs_linvel_z": lv[2],
+                    "obs_angvel_x": av[0],
+                    "obs_angvel_y": av[1],
+                    "obs_angvel_z": av[2],
+                    "obs_linacc_x": la[0],
+                    "obs_linacc_y": la[1],
+                    "obs_linacc_z": la[2],
+                    "cmd_vx": cmd_velocity.get('vx', 0.0),
+                    "cmd_vy": cmd_velocity.get('vy', 0.0),
+                    "cmd_vz": cmd_velocity.get('vz', 0.0),
+                    "cmd_yaw_rad": cmd_velocity.get('yaw', 0.0),
+                    "cmd_yaw_rate": cmd_velocity.get('yaw_rate', 0.0),
+                    "is_final_mode": is_final_mode,
+                    "relative_time_s": relative_t,
+                    "tracking_error": tracking_error,
+                })
+            except Exception as e:
+                self._log(f"[UAV{self.uav_id}] state record {i} processing error: {e}", "WARN")
+
+        # 输出统计信息
+        if error_count > 0:
+            avg_error = error_sum / error_count
+            self._log(f"[UAV{self.uav_id}] offline data: {len(rows)} samples, avg_error={avg_error:.3f}m")
 
     def _process_pose_samples(
         self,

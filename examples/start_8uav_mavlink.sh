@@ -1,4 +1,5 @@
 #!/bin/bash
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 # 8-UAV MAVLink仿真启动脚本
 # 使用方法: ./start_8uav_mavlink.sh [--headless]
 

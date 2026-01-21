@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """可视化轨迹数据，检查问题"""
 import pandas as pd
 import matplotlib.pyplot as plt

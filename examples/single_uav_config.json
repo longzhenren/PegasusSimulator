@@ -1,0 +1,19 @@
+{
+  "world_settings": {
+    "latitude": 47.397742,
+    "longitude": 8.545594,
+    "altitude": 488.0
+  },
+  "vehicles": [
+    {
+      "vehicle_id": 0,
+      "vehicle_name": "iris_0",
+      "vehicle_model": "iris",
+      "initial_position": [0.0, 0.0, 0.07],
+      "initial_orientation_euler_deg": [0.0, 0.0, 0.0],
+      "ros2_namespace": "uav0",
+      "px4_autolaunch": true,
+      "sim_speed_factor": 2.0
+    }
+  ]
+}

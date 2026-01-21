@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 import os
 import json
 from typing import Any, Dict, List, Tuple

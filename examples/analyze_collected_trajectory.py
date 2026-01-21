@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 # -*- coding: utf-8 -*-
 """
 轨迹跟随效果分析脚本

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 Visualize collected trajectory data - comparing commanded vs actual positions
 with velocity arrows showing direction of movement

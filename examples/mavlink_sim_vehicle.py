@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 MAVLink直接控制仿真环境（mavlink_sim_vehicle.py）
 
@@ -2658,9 +2659,15 @@ class MAVLinkSimApp:
 
         @app.route('/uav/<int:uav_id>/px4/kill', methods=['POST'])
         def px4_kill(uav_id: int):
-            """停止PX4进程（不重启）
+            """停止PX4进程并重置传感器状态（用于Teleport前）
 
-            用于在teleport前停止PX4，避免EKF检测到位置跳变。
+            【关键】此API会同时重置传感器状态缓存，确保Teleport后PX4能正确初始化EKF
+
+            调用时序：
+            1. 调用此API停止PX4 + 重置传感器状态
+            2. 执行Teleport移动物理刚体
+            3. 等待物理稳定
+            4. 调用 /px4/start 启动PX4（EKF从新位置初始化）
             """
             vehicle = self._get_vehicle(uav_id)
             if vehicle is None:
@@ -2681,21 +2688,16 @@ class MAVLinkSimApp:
                     except Exception as e:
                         ts_log(f"[UAV{uav_id}]", f"Kill PX4 failed: {e}", "WARN")
 
-                # 重置标志
-                backend._received_first_actuator = False
-                backend._received_actuator = False
+                # 【关键】重置传感器状态缓存
+                # 这确保Teleport后PX4不会收到旧位置的GPS/IMU数据
+                ts_log(f"[UAV{uav_id}]", "Resetting sensor state for teleport...")
+                backend.reset_sensor_state_for_teleport()
+
+                # 重置运行标志，但保持MAVLink连接活跃
+                # 【注意】不关闭MAVLink连接，避免TCP TIME_WAIT导致端口占用问题
                 backend._is_running = False
 
-                # 关闭MAVLink连接
-                old_connection = backend._connection
-                backend._connection = None
-                if old_connection is not None:
-                    try:
-                        old_connection.close()
-                    except:
-                        pass
-
-                ts_log(f"[UAV{uav_id}]", "PX4 kill: completed")
+                ts_log(f"[UAV{uav_id}]", "PX4 kill: completed (MAVLink connection preserved)")
                 return jsonify({
                     "status": "success",
                     "uav_id": uav_id,
@@ -2704,6 +2706,210 @@ class MAVLinkSimApp:
 
             except Exception as e:
                 ts_log(f"[UAV{uav_id}]", f"PX4 kill error: {e}", "ERROR")
+                return jsonify({"status": "error", "message": str(e)}), 500
+
+        @app.route('/uav/<int:uav_id>/px4/full_reset', methods=['POST'])
+        def px4_full_reset(uav_id: int):
+            """完全重置PX4 backend（包括EKF状态）
+
+            【关键】解决多轨迹采集时EKF坐标系累积偏移问题
+
+            此API会：
+            1. 彻底杀死该UAV的PX4进程
+            2. 清理该UAV的锁文件和临时目录（仅该UAV，不影响其他飞机）
+            3. 重置所有EKF相关状态标志
+            4. 关闭MAVLink连接
+
+            调用此API后，需要调用 /px4/start 来重新启动PX4。
+            PX4重启后会从当前位置重新初始化EKF。
+
+            多机隔离保证：
+            - 只清理 vehicle_id 对应的锁文件和临时目录
+            - 只杀死该UAV的PX4进程（通过PID文件或px4_tool）
+            - 不影响其他UAV的PX4进程和状态
+            """
+            vehicle = self._get_vehicle(uav_id)
+            if vehicle is None:
+                return jsonify({"status": "error", "message": "UAV not found"}), 404
+
+            backend = self.manager.px4_backends.get(uav_id)
+            if backend is None:
+                return jsonify({"status": "error", "message": "Backend not found"}), 404
+
+            try:
+                ts_log(f"[UAV{uav_id}]", "=" * 50)
+                ts_log(f"[UAV{uav_id}]", "PX4 FULL RESET: Starting complete reset...")
+                ts_log(f"[UAV{uav_id}]", "=" * 50)
+
+                import os
+                import signal
+                import glob
+                import shutil
+
+                # Step 1: 杀死该UAV的PX4进程
+                ts_log(f"[UAV{uav_id}]", "Step 1: Killing PX4 process for this UAV only...")
+                if backend.px4_tool is not None:
+                    try:
+                        backend.px4_tool.kill_px4_save()
+                        ts_log(f"[UAV{uav_id}]", "PX4 process killed via px4_tool")
+                    except Exception as e:
+                        ts_log(f"[UAV{uav_id}]", f"Kill via px4_tool failed: {e}", "WARN")
+
+                # 通过PID文件杀死（备份方案）
+                pid_file = f"/tmp/pegasus_px4_pids/px4_{uav_id}.pid"
+                if os.path.exists(pid_file):
+                    try:
+                        with open(pid_file, "r") as f:
+                            pid = int(f.read().strip() or "0")
+                        if pid > 0:
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                                ts_log(f"[UAV{uav_id}]", f"Killed PX4 via PID file (pid={pid})")
+                            except ProcessLookupError:
+                                ts_log(f"[UAV{uav_id}]", f"PX4 process (pid={pid}) already dead")
+                        os.remove(pid_file)
+                        ts_log(f"[UAV{uav_id}]", "Removed PID file")
+                    except Exception as e:
+                        ts_log(f"[UAV{uav_id}]", f"PID file cleanup failed: {e}", "WARN")
+
+                # Step 2: 重置backend状态标志（在关闭连接之前）
+                ts_log(f"[UAV{uav_id}]", "Step 2: Resetting backend state flags...")
+                backend._received_first_hearbeat = False
+                backend._received_first_actuator = False
+                backend._received_actuator = False
+                backend._is_running = False
+                backend._current_utime = 0
+                backend._armed = False
+                # 重置rotor数据
+                if hasattr(backend, '_input_reference'):
+                    backend._input_reference.fill(0.0)
+
+                # Step 3: 关闭MAVLink连接
+                ts_log(f"[UAV{uav_id}]", "Step 3: Closing MAVLink connection...")
+                old_connection = backend._connection
+                backend._connection = None
+                if old_connection is not None:
+                    try:
+                        old_connection.close()
+                        ts_log(f"[UAV{uav_id}]", "MAVLink connection closed")
+                    except Exception as e:
+                        ts_log(f"[UAV{uav_id}]", f"Close MAVLink failed: {e}", "WARN")
+
+                # 等待进程完全退出
+                import time
+                time.sleep(0.5)
+
+                # Step 4: 清理该UAV的锁文件（仅该UAV的）
+                ts_log(f"[UAV{uav_id}]", "Step 4: Cleaning lock files for this UAV only...")
+                cleaned_count = 0
+
+                # 锁文件模式（只匹配该UAV）
+                lock_patterns = [
+                    f"/tmp/px4_instance_{uav_id}_*",
+                    f"/tmp/px4-{uav_id}*",
+                    f"/tmp/px4_lock-{uav_id}",
+                ]
+
+                for pattern in lock_patterns:
+                    for lock_file in glob.glob(pattern):
+                        try:
+                            if os.path.isfile(lock_file):
+                                os.remove(lock_file)
+                                ts_log(f"[UAV{uav_id}]", f"Removed lock file: {lock_file}")
+                                cleaned_count += 1
+                        except Exception as e:
+                            ts_log(f"[UAV{uav_id}]", f"Failed to remove {lock_file}: {e}", "WARN")
+
+                # Step 5: 【关键】重建PX4临时目录，清除EKF状态
+                # 这是解决EKF坐标漂移的核心步骤！
+                ts_log(f"[UAV{uav_id}]", "Step 5: Rebuilding PX4 temp directory (clear EKF state)...")
+                if backend.px4_tool is not None:
+                    try:
+                        backend.px4_tool.rebuild_temp_directory()
+                        ts_log(f"[UAV{uav_id}]", "PX4 temp directory rebuilt successfully")
+                    except Exception as e:
+                        ts_log(f"[UAV{uav_id}]", f"Rebuild temp directory failed: {e}", "WARN")
+                else:
+                    ts_log(f"[UAV{uav_id}]", "px4_tool is None, skipping temp directory rebuild", "WARN")
+
+                # Step 6: 等待端口释放
+                mavlink_port = backend.config.connection_baseport + uav_id
+                ts_log(f"[UAV{uav_id}]", f"Step 6: Waiting for port {mavlink_port} to be released...")
+                from pegasus.simulator.logic.backends.px4_mavlink_backend import _wait_for_port_release
+                if _wait_for_port_release(mavlink_port, timeout=10.0, interval=0.5):
+                    ts_log(f"[UAV{uav_id}]", f"Port {mavlink_port} released")
+                else:
+                    ts_log(f"[UAV{uav_id}]", f"Port {mavlink_port} release timeout", "WARN")
+
+                ts_log(f"[UAV{uav_id}]", "=" * 50)
+                ts_log(f"[UAV{uav_id}]", f"PX4 FULL RESET: Complete! Cleaned {cleaned_count} items")
+                ts_log(f"[UAV{uav_id}]", "=" * 50)
+
+                return jsonify({
+                    "status": "success",
+                    "uav_id": uav_id,
+                    "message": "PX4 full reset complete",
+                    "cleaned_items": cleaned_count
+                })
+
+            except Exception as e:
+                ts_log(f"[UAV{uav_id}]", f"PX4 full reset error: {e}", "ERROR")
+                import traceback
+                ts_log(f"[UAV{uav_id}]", traceback.format_exc(), "ERROR")
+                return jsonify({"status": "error", "message": str(e)}), 500
+
+        @app.route('/uav/<int:uav_id>/px4/rebuild_temp', methods=['POST'])
+        def px4_rebuild_temp(uav_id: int):
+            """重建PX4临时目录（清除EKF状态）
+
+            【关键】解决多轨迹采集时EKF坐标系累积偏移问题
+
+            此API会重建PX4临时目录，彻底清除EKF状态文件，
+            使得PX4下次启动时从当前位置重新初始化EKF原点。
+
+            调用时机：
+            - 在teleport之后、/px4/start之前调用
+            - 确保每条轨迹采集都从干净的EKF状态开始
+
+            注意：此API仅重建临时目录，不影响PX4进程状态。
+            如果PX4正在运行，应先调用/px4/kill停止它。
+            """
+            vehicle = self._get_vehicle(uav_id)
+            if vehicle is None:
+                return jsonify({"status": "error", "message": "UAV not found"}), 404
+
+            backend = self.manager.px4_backends.get(uav_id)
+            if backend is None:
+                return jsonify({"status": "error", "message": "Backend not found"}), 404
+
+            try:
+                ts_log(f"[UAV{uav_id}]", "PX4 rebuild temp: rebuilding temp directory...")
+
+                if backend.px4_tool is not None:
+                    result = backend.px4_tool.rebuild_temp_directory()
+                    if result:
+                        ts_log(f"[UAV{uav_id}]", "PX4 temp directory rebuilt successfully")
+                        return jsonify({
+                            "status": "success",
+                            "uav_id": uav_id,
+                            "message": "PX4 temp directory rebuilt (EKF state cleared)"
+                        })
+                    else:
+                        return jsonify({
+                            "status": "error",
+                            "message": "rebuild_temp_directory returned False"
+                        }), 500
+                else:
+                    ts_log(f"[UAV{uav_id}]", "px4_tool is None, cannot rebuild temp directory", "WARN")
+                    return jsonify({
+                        "status": "error",
+                        "message": "px4_tool is None"
+                    }), 404
+
+            except Exception as e:
+                ts_log(f"[UAV{uav_id}]", f"PX4 rebuild temp error: {e}", "ERROR")
+                import traceback
+                ts_log(f"[UAV{uav_id}]", traceback.format_exc(), "ERROR")
                 return jsonify({"status": "error", "message": str(e)}), 500
 
         @app.route('/uav/<int:uav_id>/px4/start', methods=['POST'])
@@ -2723,21 +2929,49 @@ class MAVLinkSimApp:
             try:
                 ts_log(f"[UAV{uav_id}]", "PX4 start: starting PX4 process...")
 
-                # 等待端口释放
-                mavlink_port = backend.config.connection_baseport + backend._vehicle_id
-                from pegasus.simulator.logic.backends.px4_mavlink_backend import _wait_for_port_release
-                _wait_for_port_release(mavlink_port, timeout=10.0, interval=0.5)
+                # 导入所需模块
+                from pegasus.simulator.logic.backends.px4_mavlink_backend import SensorMsg
 
-                # 创建MAVLink连接
-                ts_log(f"[UAV{uav_id}]", f"Creating MAVLink connection: {backend._connection_port}")
-                backend._connection = mavutil.mavlink_connection(backend._connection_port)
+                # 【关键】彻底重置传感器状态缓存
+                # 这确保PX4重启后不会收到旧位置的传感器数据，让EKF从当前位置重新初始化
+                ts_log(f"[UAV{uav_id}]", "Resetting sensor data cache (GPS/IMU/Baro)...")
+                backend._sensor_data = SensorMsg()
 
-                # 重置状态
+                # 重置rotor输入
+                if hasattr(backend, '_input_reference'):
+                    backend._input_reference.fill(0.0)
+
+                # 【注意】不重新创建MAVLink连接，复用现有连接避免TCP TIME_WAIT问题
+                # 检查连接是否存在
+                if backend._connection is None:
+                    ts_log(f"[UAV{uav_id}]", "MAVLink connection not found, creating new one...")
+                    mavlink_port = backend.config.connection_baseport + backend._vehicle_id
+                    max_retries = 30  # 增加重试次数到30秒
+                    for retry in range(max_retries):
+                        try:
+                            backend._connection = mavutil.mavlink_connection(
+                                backend._connection_port,
+                                source_system=1,
+                                source_component=1
+                            )
+                            ts_log(f"[UAV{uav_id}]", f"MAVLink connection created successfully")
+                            break
+                        except OSError as e:
+                            if e.errno == 98 and retry < max_retries - 1:
+                                ts_log(f"[UAV{uav_id}]", f"Port {mavlink_port} busy, waiting... (retry {retry+1}/{max_retries})")
+                                time.sleep(1.0)
+                            else:
+                                raise
+                else:
+                    ts_log(f"[UAV{uav_id}]", "Reusing existing MAVLink connection")
+
+                # 重置所有状态标志
                 backend._received_first_hearbeat = False
                 backend._received_first_actuator = False
                 backend._received_actuator = False
                 backend._current_utime = 0
                 backend._skip_large_dt_count = 10
+                backend._armed = False
                 backend._is_running = True
 
                 # 启动PX4进程
@@ -2754,6 +2988,100 @@ class MAVLinkSimApp:
 
             except Exception as e:
                 ts_log(f"[UAV{uav_id}]", f"PX4 start error: {e}", "ERROR")
+                import traceback
+                ts_log(f"[UAV{uav_id}]", traceback.format_exc(), "ERROR")
+                return jsonify({"status": "error", "message": str(e)}), 500
+
+        @app.route('/uav/<int:uav_id>/px4/set_ekf_origin', methods=['POST'])
+        def px4_set_ekf_origin(uav_id: int):
+            """通过MAVLink发送SET_GPS_GLOBAL_ORIGIN命令强制重置EKF原点
+
+            【关键】解决多轨迹采集时EKF坐标系累积偏移问题
+
+            此API会向PX4发送SET_GPS_GLOBAL_ORIGIN MAVLink命令，
+            将EKF的GPS原点设置为当前UAV的真实位置。
+
+            请求体（可选）：
+            {
+                "latitude": 47.397742,   // 可选，默认使用当前位置
+                "longitude": 8.545594,   // 可选，默认使用当前位置
+                "altitude": 488.0        // 可选，默认使用当前位置
+            }
+
+            调用时机：
+            - 在PX4 ready之后、起飞之前调用
+            - 确保EKF从当前位置初始化原点
+            """
+            vehicle = self._get_vehicle(uav_id)
+            if vehicle is None:
+                return jsonify({"status": "error", "message": "UAV not found"}), 404
+
+            backend = self.manager.px4_backends.get(uav_id)
+            if backend is None:
+                return jsonify({"status": "error", "message": "Backend not found"}), 404
+
+            try:
+                # 获取请求参数
+                data = request.json or {}
+
+                # 获取当前UAV位置作为默认值
+                # 使用仿真器的真实位置
+                current_state = vehicle.state
+                if current_state:
+                    default_lat = current_state.position[0] if hasattr(current_state, 'position') else 47.397742
+                    default_lon = current_state.position[1] if hasattr(current_state, 'position') else 8.545594
+                    default_alt = current_state.position[2] if hasattr(current_state, 'position') else 0.0
+                else:
+                    # 使用PX4默认的home位置（苏黎世）
+                    default_lat = 47.397742
+                    default_lon = 8.545594
+                    default_alt = 488.0
+
+                # 从传感器数据获取GPS位置（如果可用）
+                if hasattr(backend, '_sensor_data') and backend._sensor_data:
+                    sensor = backend._sensor_data
+                    if sensor.latitude_deg != -999 and sensor.latitude_deg != 0:
+                        # 传感器数据是 degE7 格式
+                        default_lat = sensor.latitude_deg / 10000000.0
+                        default_lon = sensor.longitude_deg / 10000000.0
+                        default_alt = sensor.altitude / 1000.0  # mm to m
+
+                latitude = data.get("latitude", default_lat)
+                longitude = data.get("longitude", default_lon)
+                altitude = data.get("altitude", default_alt)
+
+                ts_log(f"[UAV{uav_id}]", f"Setting EKF origin to: lat={latitude:.6f}, lon={longitude:.6f}, alt={altitude:.1f}m")
+
+                # 检查MAVLink连接
+                if backend._connection is None:
+                    return jsonify({"status": "error", "message": "MAVLink connection not available"}), 500
+
+                # 发送SET_GPS_GLOBAL_ORIGIN命令
+                # 参数格式：latitude/longitude in degE7, altitude in mm
+                lat_e7 = int(latitude * 10000000)
+                lon_e7 = int(longitude * 10000000)
+                alt_mm = int(altitude * 1000)
+
+                backend._connection.mav.set_gps_global_origin_send(
+                    target_system=1,  # PX4 system ID
+                    latitude=lat_e7,
+                    longitude=lon_e7,
+                    altitude=alt_mm
+                )
+
+                ts_log(f"[UAV{uav_id}]", f"SET_GPS_GLOBAL_ORIGIN sent: ({lat_e7}, {lon_e7}, {alt_mm})")
+
+                return jsonify({
+                    "status": "success",
+                    "uav_id": uav_id,
+                    "message": "EKF origin set",
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "altitude": altitude
+                })
+
+            except Exception as e:
+                ts_log(f"[UAV{uav_id}]", f"Set EKF origin error: {e}", "ERROR")
                 import traceback
                 ts_log(f"[UAV{uav_id}]", traceback.format_exc(), "ERROR")
                 return jsonify({"status": "error", "message": str(e)}), 500

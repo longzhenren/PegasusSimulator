@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 轨迹可视化脚本 - 带任务点标注 (plot_trajectory_with_waypoints.py)
 

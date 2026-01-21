@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 # Copyright (c) 2024-2026 amurzzb@gmail.com
 # Licensed under the MIT License
 """
@@ -255,14 +256,26 @@ def cleanup_px4_residuals(vehicle_id: int = None, kill_processes: bool = True):
                 ts_log("[PX4Cleanup]", f"Failed to remove {pid_file}: {e}", "WARN")
 
     # 3. 杀死残留的 PX4 进程
+    # 【修复】多机场景下，只杀死指定vehicle_id的PX4进程，避免误杀其他UAV的进程
     if kill_processes:
         try:
             import subprocess
-            # 查找所有 PX4 相关进程
-            result = subprocess.run(
-                ['pgrep', '-f', 'px4_sitl_default/bin/px4'],
-                capture_output=True, text=True, timeout=5
-            )
+
+            if vehicle_id is not None:
+                # 【关键修复】只查找指定instance的PX4进程
+                # PX4启动参数中使用 -i {vehicle_id}，所以匹配 "-i {vehicle_id}" 或 "-i{vehicle_id}"
+                search_pattern = f'px4_sitl_default/bin/px4.*-i\\s*{vehicle_id}\\b'
+                result = subprocess.run(
+                    ['pgrep', '-f', search_pattern],
+                    capture_output=True, text=True, timeout=5
+                )
+            else:
+                # 清理所有PX4进程（仅在全局清理时使用）
+                result = subprocess.run(
+                    ['pgrep', '-f', 'px4_sitl_default/bin/px4'],
+                    capture_output=True, text=True, timeout=5
+                )
+
             if result.stdout.strip():
                 pids = result.stdout.strip().split('\n')
                 for pid_str in pids:
@@ -270,7 +283,10 @@ def cleanup_px4_residuals(vehicle_id: int = None, kill_processes: bool = True):
                         pid = int(pid_str.strip())
                         if pid > 0:
                             os.kill(pid, signal.SIGKILL)
-                            ts_log("[PX4Cleanup]", f"Killed orphan PX4 process: PID {pid}")
+                            if vehicle_id is not None:
+                                ts_log("[PX4Cleanup]", f"Killed PX4 process for UAV{vehicle_id}: PID {pid}")
+                            else:
+                                ts_log("[PX4Cleanup]", f"Killed orphan PX4 process: PID {pid}")
                             cleaned_count += 1
                     except (ValueError, ProcessLookupError):
                         pass
@@ -670,6 +686,59 @@ class PX4LaunchTool:
         # 重置 ready 状态
         self._set_ready_to_takeoff(False)
         ts_log(self._log_prefix, "PX4 process killed")
+
+    def rebuild_temp_directory(self):
+        """
+        【关键】完全重建PX4临时目录，清除所有EKF状态
+
+        此方法用于解决多轨迹采集时EKF坐标漂移问题。
+
+        问题原因：
+        1. PX4 EKF将GPS原点信息保存在临时目录中
+        2. 即使杀死PX4进程，临时目录中的状态文件仍然存在
+        3. 新PX4进程启动时读取旧状态，导致坐标系偏移
+
+        解决方案：
+        1. 删除旧的临时目录（包含所有EKF状态文件）
+        2. 创建新的临时目录
+        3. PX4启动时将从干净状态开始，EKF从当前位置初始化原点
+
+        调用时机：
+        - 在teleport之后、PX4启动之前调用
+        - 确保每次轨迹采集都从干净的EKF状态开始
+        """
+        ts_log(self._log_prefix, "=== Rebuilding PX4 temp directory (clear EKF state) ===")
+
+        try:
+            # 1. 保存旧目录路径用于日志
+            old_path = self.root_fs.name if self.root_fs else "None"
+            ts_log(self._log_prefix, f"Old temp dir: {old_path}")
+
+            # 2. 清理旧临时目录
+            if self.root_fs is not None:
+                try:
+                    self.root_fs.cleanup()
+                    ts_log(self._log_prefix, "Old temp dir cleaned up")
+                except Exception as e:
+                    ts_log(self._log_prefix, f"Cleanup old temp dir failed: {e}", "WARN")
+
+            # 3. 创建新的临时目录
+            self.root_fs = tempfile.TemporaryDirectory(prefix=f"px4_{self.vehicle_id}_")
+            ts_log(self._log_prefix, f"New temp dir created: {self.root_fs.name}")
+
+            # 4. 重置 ready 状态
+            self._set_ready_to_takeoff(False)
+
+            # 5. 重置启动计数（可选，让日志文件名更清晰）
+            # self._launch_count = 0  # 不重置，保持日志文件的连续性
+
+            ts_log(self._log_prefix, "=== Temp directory rebuild complete ===")
+            return True
+
+        except Exception as e:
+            ts_log(self._log_prefix, f"Rebuild temp directory failed: {e}", "ERROR")
+            ts_log(self._log_prefix, traceback.format_exc(), "ERROR")
+            return False
 
     def kill_px4_save(self):
         """

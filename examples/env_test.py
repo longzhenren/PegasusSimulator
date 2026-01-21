@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 longzhenren (amurzzb@gmail.com)
 """
 测试环境服务器的客户端
 用于测试env_server.py的reset和step接口

@@ -1,17 +1,11 @@
     pkill -9 -f "px4_sitl_default/bin/px4"; python mavlink_sim_vehicle.py \
-      --config multi_uav_config_1.json --headless --no-images --sim-port 8081 --ctrl-base-port 5009
-
-      pkill -9 -f "px4_sitl_default/bin/px4"; python mavlink_sim_vehicle.py \
-      --config multi_uav_config_4.json \
-    --usd /home/user/Downloads/export/flattened.usd \
-      --sim-port 8081 \
-      --ctrl-base-port 5009
-
-      sleep 180 && python mavlink_trajectory_collector.py \
+      --config multi_uav_config_8.json --headless --no-images --sim-port 8081 --ctrl-base-port 5009
+      
+      sleep 120 && python mavlink_trajectory_collector.py \
       --input-dir ~/uav-data/drone/uav-flow-sim/train_data/extracted_json_files/ \
-      --out-dir ~/uav-data/recordings-01151005 \
-      --config multi_uav_config_1.json \
-      --uav-ids "0" \
+      --out-dir ~/uav-data/recordings-01170030 \
+      --config multi_uav_config_8.json \
+      --uav-ids "0,1,2,3,4,5,6,7" \
       --time-scale 2.5 \
       --no-skip --no-images \
       --scale 0.01
