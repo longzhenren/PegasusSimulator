@@ -49,6 +49,21 @@ Default configuration values:
 - Compression thresholds
 - Buffer sizes
 
+### Logging Utilities (`pegasus.simulator.common.logging_utils`)
+
+Centralized logging and statistics:
+- `NetworkLogger`: Console and file logging with timestamps
+- `ConnectionStats`: Track messages, bandwidth, errors, uptime
+- Automatic log rotation and formatting
+
+### Connection Manager (`pegasus.simulator.common.connection_manager`)
+
+Enhanced connection management:
+- Automatic reconnection with configurable retry logic
+- Connection state tracking (DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING, FAILED)
+- Error handling with callbacks
+- Thread-safe operations
+
 ## Usage Example
 
 ```python

@@ -54,6 +54,14 @@ link_app.bat
 
 ## 使用方法
 
+### 环境配置
+
+**首次使用前，建议运行环境检测：**
+```bash
+cd scripts
+python check_environment.py
+```
+
 ### 基本使用
 
 1. **启动网络模式仿真**（Windows端）：
@@ -146,6 +154,8 @@ pegasus-simulator-windows/
 │               │       └── message_handler.py
 │               ├── ui/                  # UI组件
 │               └── parser/              # 配置解析器
+├── scripts/                    # 配置和检测脚本
+│   └── check_environment.py    # 环境检测
 └── examples/
     └── 1_px4_single_vehicle_network.py  # 网络模式示例
 ```

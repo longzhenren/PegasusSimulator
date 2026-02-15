@@ -17,6 +17,29 @@ Check the provided documentation [here](https://pegasussimulator.github.io/Pegas
 
 ## Latest Updates
 
+### 🚀 Distributed Architecture (win-linux branch)
+
+A new **distributed architecture** is now available on the `win-linux` branch! This version splits Pegasus Simulator into separate Windows (Isaac Sim) and Linux (PX4/ROS2/MAVLink) components that communicate over the network.
+
+**Key Features:**
+- **Cross-host simulation**: Run Isaac Sim on Windows and control backends on Linux
+- **ROS2 remote access**: Automatic configuration for ROS2 cross-host communication
+- **Network communication layer**: TCP-based protocol with MessagePack serialization
+- **Stability improvements**: Enhanced error handling, logging, and auto-reconnection
+- **Environment detection**: Scripts to verify system configuration
+
+**Quick Start:**
+```bash
+# Switch to distributed architecture branch
+git checkout win-linux
+
+# See README_DISTRIBUTED.md for detailed instructions
+```
+
+For more details, see [README_DISTRIBUTED.md](README_DISTRIBUTED.md).
+
+---
+
 ⚠️ For users of versions prior to v5.1.0:
 A new command line tool named `isaac_run` is now used to launch Isaac Sim. **This is a function that should be added to your .bashrc or .zshrc file during the installation of Isaac Sim.** See [Installation Instructions](https://pegasussimulator.github.io/PegasusSimulator/source/setup/installation.html) for more details.
 
@@ -24,6 +47,7 @@ This was done to simplify the launching of Isaac Sim from the terminal with ROS2
 
 Please refer to the updated documentation for more details.
 
+* **2026-02-15**: Distributed architecture released on `win-linux` branch with cross-host simulation support
 * **2025-10-26**: Pegasus Simulator v5.1.0 is released for Isaac 5.1.0. This version is **NOT** compatible with older versions of Isaac Sim. The Ardupilot experimental interface was not tested in this version. This update had an initial open-source contribution from [Victor Kallenbach](https://github.com/HO4X).
 * **2025-10-25**: Pegasus Simulator v4.5.1 is released for Isaac 4.5.0. This version is **NOT** compatible with older versions of Isaac Sim. The Ardupilot experimental interface was fixed and improved by [Seunghwan Jo](https://github.com/SwiftGust) and [Tomer Tiplitsky](https://github.com/TomerTip).
 * **2025-07-20**: Pegasus Simulator v4.5.0 is released for Isaac 4.5.0. This version is **NOT** compatible with older versions of Isaac Sim. The Ardupilot experimental interface was not tested in this version.

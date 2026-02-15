@@ -72,6 +72,22 @@ pip install rclpy
 
 ## 使用方法
 
+### 环境配置
+
+**首次使用前，建议运行环境检测：**
+```bash
+cd scripts
+python check_environment.py --windows-host <Windows机器IP>
+```
+
+**配置ROS2远程访问（如果使用ROS2）：**
+```bash
+cd scripts
+./setup_ros2_network.sh 0 0  # domain_id=0, localhost_only=0
+sudo ./configure_firewall.sh
+source ~/.ros2_network_config/setup_env.sh
+```
+
 ### 基本使用
 
 1. **启动Windows端仿真**（在Windows机器上）：
@@ -189,6 +205,11 @@ pegasus-simulator-linux/
 │           ├── simulator_proxy.py
 │           ├── message_handler.py
 │           └── backend_runner.py
+├── scripts/                    # 配置和检测脚本
+│   ├── check_environment.py    # 环境检测
+│   ├── setup_ros2_network.sh   # ROS2网络配置
+│   ├── configure_firewall.sh   # 防火墙配置
+│   └── ros2_domain_config.py   # ROS2 domain管理
 └── examples/
     ├── run_px4_backend.py
     ├── run_ardupilot_backend.py
