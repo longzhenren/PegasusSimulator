@@ -6,14 +6,14 @@ Linux端的Pegasus Simulator，运行PX4/ArduPilot/ROS2控制后端。
 
 这是Pegasus Simulator的Linux端，负责：
 - 运行PX4/ArduPilot SITL或ROS2控制后端
-- 从Windows端接收传感器数据和状态
+- 从仿真端（Windows或Linux）接收传感器数据和状态
 - 处理飞行控制逻辑
-- 发送控制命令到Windows端
+- 发送控制命令到仿真端
 
 ## 架构
 
 ```
-Windows (远程)                    Linux (本端)
+仿真端 (Windows/Linux)           控制端 (Linux)
 ┌─────────────────┐              ┌─────────────────┐
 │  Isaac Sim      │              │  PX4/ROS2       │
 │  仿真环境        │   TCP/IP     │  控制后端        │
@@ -77,7 +77,7 @@ pip install rclpy
 **首次使用前，建议运行环境检测：**
 ```bash
 cd scripts
-python check_environment.py --windows-host <Windows机器IP>
+python check_environment.py --windows-host <仿真端IP>
 ```
 
 **配置ROS2远程访问（如果使用ROS2）：**
@@ -90,30 +90,38 @@ source ~/.ros2_network_config/setup_env.sh
 
 ### 基本使用
 
-1. **启动Windows端仿真**（在Windows机器上）：
+1. **启动仿真端**（在Windows或Linux机器上）：
+
+**Windows**:
 ```bash
 cd pegasus-simulator-windows/examples
 python 1_px4_single_vehicle_network.py
 ```
 
-2. **启动Linux端后端**（在Linux机器上）：
+**Linux**:
+```bash
+cd pegasus-simulator-windows/examples
+isaac_run 1_px4_single_vehicle_network.py
+```
+
+2. **启动控制端后端**（在Linux机器上）：
 
 **PX4后端**:
 ```bash
 cd examples
-python run_px4_backend.py --server-host <Windows机器IP>
+python run_px4_backend.py --server-host <仿真端IP>
 ```
 
 **ArduPilot后端**:
 ```bash
 cd examples
-python run_ardupilot_backend.py --server-host <Windows机器IP>
+python run_ardupilot_backend.py --server-host <仿真端IP>
 ```
 
 **ROS2后端**:
 ```bash
 cd examples
-python run_ros2_backend.py --server-host <Windows机器IP>
+python run_ros2_backend.py --server-host <仿真端IP>
 ```
 
 ### 命令行参数
@@ -121,8 +129,8 @@ python run_ros2_backend.py --server-host <Windows机器IP>
 所有示例脚本支持以下参数：
 
 ```bash
---server-host <IP>      # Windows主机IP地址（必需）
---server-port <PORT>    # Windows主机端口（默认：5555）
+--server-host <IP>      # 仿真端IP地址（必需）
+--server-port <PORT>    # 仿真端端口（默认：5555）
 --vehicle-id <ID>       # 车辆ID（默认：0）
 ```
 
@@ -233,13 +241,13 @@ pegasus-simulator-linux/
 ### 数据流
 
 ```
-Windows → Linux:
+仿真端 → 控制端:
 - STATE_UPDATE (每个物理步)
 - SENSOR_UPDATE (传感器更新时)
 - GRAPHICAL_SENSOR_UPDATE (图形传感器更新时)
 - HEARTBEAT (每秒)
 
-Linux → Windows:
+控制端 → 仿真端:
 - CONTROL_COMMAND (控制更新时)
 - HEARTBEAT (每秒)
 ```
@@ -260,6 +268,13 @@ Linux → Windows:
 - 类似PX4后端，但使用ArduPilot特定的消息格式
 - 支持ArduPilot的SITL协议
 
+### SimulatorProxy
+
+连接到仿真端（Windows或Linux）：
+- 通过TCP连接到仿真端
+- 接收传感器数据和状态，发送控制命令
+- 实现重连机制和心跳检测
+
 ### ROS2Backend
 
 发布传感器数据到ROS2话题：
@@ -273,13 +288,13 @@ Linux → Windows:
 
 ### 连接问题
 
-**问题**: 无法连接到Windows端
+**问题**: 无法连接到仿真端
 
 **解决方案**:
-1. 确认Windows端正在运行并监听端口5555
-2. 检查网络连接：`ping <Windows_IP>`
-3. 检查防火墙设置
-4. 尝试使用telnet测试连接：`telnet <Windows_IP> 5555`
+1. 确认仿真端正在运行并监听端口5555
+2. 检查网络连接：`ping <仿真端IP>`
+3. 检查防火墙设置（仿真端需要开放端口5555）
+4. 尝试使用telnet测试连接：`telnet <仿真端IP> 5555`
 
 ### MAVLink连接问题
 
@@ -323,11 +338,11 @@ px4_config = PX4MavlinkBackendConfig({
 运行多个后端实例，每个使用不同的vehicle_id和端口：
 
 ```bash
-# 车辆1
-python run_px4_backend.py --server-host 192.168.1.100 --vehicle-id 0 --mavlink-port 4560
+# 车辆1（连接到仿真端）
+python run_px4_backend.py --server-host <仿真端IP> --vehicle-id 0 --mavlink-port 4560
 
-# 车辆2
-python run_px4_backend.py --server-host 192.168.1.100 --vehicle-id 1 --mavlink-port 4570
+# 车辆2（连接到仿真端）
+python run_px4_backend.py --server-host <仿真端IP> --vehicle-id 1 --mavlink-port 4570
 ```
 
 ## 依赖项

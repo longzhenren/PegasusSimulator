@@ -1,19 +1,21 @@
-# Pegasus Simulator - Windows Side
+# Pegasus Simulator - Simulation Side
 
-Windows端的Pegasus Simulator，运行Isaac Sim仿真环境。
+仿真端的 Pegasus Simulator，运行 Isaac Sim 物理仿真和图形渲染。**支持 Windows 和 Linux 环境**。
 
 ## 概述
 
-这是Pegasus Simulator的Windows端，负责：
-- 运行Isaac Sim物理仿真和图形渲染
-- 模拟车辆动力学和传感器
-- 通过网络发送传感器数据和状态到Linux端
-- 从Linux端接收控制命令
+这是 Pegasus Simulator 的仿真端，负责：
+- 运行 Isaac Sim 物理引擎和图形渲染
+- 车辆动力学和传感器仿真
+- 通过网络发送传感器数据和状态到控制端
+- 从控制端接收控制命令
+
+**注意**：虽然目录名为 `pegasus-simulator-windows`，但本包**同时支持 Windows 和 Linux 环境**。
 
 ## 架构
 
 ```
-Windows (本端)                    Linux (远程)
+仿真端 (Windows/Linux)            控制端 (Linux)
 ┌─────────────────┐              ┌─────────────────┐
 │  Isaac Sim      │              │  PX4/ROS2       │
 │  仿真环境        │   TCP/IP     │  控制后端        │
@@ -25,9 +27,19 @@ Windows (本端)                    Linux (远程)
 
 ### 前置要求
 
-1. **Isaac Sim**: 需要安装NVIDIA Isaac Sim 2023.1或更高版本
-2. **Python**: Python 3.7+（通常由Isaac Sim提供）
-3. **pegasus-common**: 共享包
+**Windows 环境：**
+1. **Windows 10/11**: 64位系统
+2. **NVIDIA GPU**: RTX 系列或 Quadro 系列
+3. **NVIDIA 驱动**: 最新版本
+4. **Isaac Sim**: 通过 Omniverse Launcher 安装
+
+**Linux 环境：**
+1. **Ubuntu 20.04 或 22.04**: 推荐 22.04
+2. **NVIDIA GPU**: RTX 系列推荐
+3. **NVIDIA 驱动**: 525+
+4. **Isaac Sim**: 通过 Omniverse Launcher 安装
+5. **内存**: 16GB+ RAM
+6. **磁盘空间**: 50GB+
 
 ### 安装步骤
 
@@ -37,19 +49,22 @@ cd ../pegasus-common
 pip install -e .
 ```
 
-2. 安装Windows端：
+2. 安装仿真端：
 ```bash
 cd pegasus-simulator-windows
 pip install -e .
 ```
 
-3. 链接扩展到Isaac Sim：
-```bash
-# Windows
-link_app.bat
+3. 链接扩展到 Isaac Sim：
 
-# 或者手动链接
-# 将 extensions/pegasus.simulator 目录链接到 Isaac Sim 的扩展目录
+**Windows**:
+```bash
+link_app.bat
+```
+
+**Linux**:
+```bash
+./link_app.sh
 ```
 
 ## 使用方法
@@ -64,17 +79,24 @@ python check_environment.py
 
 ### 基本使用
 
-1. **启动网络模式仿真**（Windows端）：
+1. **启动仿真端**：
+
+**Windows**:
 ```bash
 cd examples
 python 1_px4_single_vehicle_network.py
 ```
 
-2. **启动控制后端**（Linux端）：
+**Linux**:
 ```bash
-# 在Linux机器上运行
-cd pegasus-simulator-linux/examples
-python run_px4_backend.py --server-host <Windows机器IP> --server-port 5555
+cd examples
+isaac_run 1_px4_single_vehicle_network.py
+```
+
+2. **启动控制端**（在 Linux 机器上）：
+```bash
+cd ../pegasus-simulator-linux/examples
+python run_px4_backend.py --server-host <仿真端IP>
 ```
 
 ### 配置NetworkBackend

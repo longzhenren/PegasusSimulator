@@ -22,7 +22,8 @@ Check the provided documentation [here](https://pegasussimulator.github.io/Pegas
 A new **distributed architecture** is now available on the `win-linux` branch! This version splits Pegasus Simulator into separate Windows (Isaac Sim) and Linux (PX4/ROS2/MAVLink) components that communicate over the network.
 
 **Key Features:**
-- **Cross-host simulation**: Run Isaac Sim on Windows and control backends on Linux
+- **Cross-host simulation**: Run Isaac Sim on Windows or Linux, control backends on Linux
+- **Multi-platform support**: Simulation side supports both Windows and Linux environments
 - **ROS2 remote access**: Automatic configuration for ROS2 cross-host communication
 - **Network communication layer**: TCP-based protocol with MessagePack serialization
 - **Stability improvements**: Enhanced error handling, logging, and auto-reconnection
